@@ -88,7 +88,7 @@ export function mapIdentityToUser(
   const email = (claims.email || '').trim().toLowerCase();
   const groups = (claims.groups || []).map((g) => g.toLowerCase());
 
-  const users = store.getUsers();
+  const users = store.getUsers().filter((u) => u.isActive);
   const wadera = users.find((u) => u.handle === 'wadera') ?? null;
   const walter = users.find((u) => u.handle === 'walter') ?? null;
 
@@ -100,7 +100,6 @@ export function mapIdentityToUser(
     email === 'pstopa@skyday.eu' ||
     email === 'wadera@skyday.eu'
   ) {
-    // Sync actual email if Authentik supplies one
     return wadera;
   }
 
@@ -115,6 +114,14 @@ export function mapIdentityToUser(
   ) {
     return walter;
   }
+
+  // Match any additional registered OIDC/hybrid user by handle or email
+  const matched = users.find(
+    (u) =>
+      u.authProvider !== 'local' &&
+      ((uname && u.handle.toLowerCase() === uname) || (email && u.email.toLowerCase() === email))
+  );
+  if (matched) return matched;
 
   // Fallback group-based mapping only for authorized human trust tiers
   if (groups.includes('trust-human-owner')) return wadera;
@@ -179,6 +186,7 @@ export function registerAuthRoutes(app: FastifyInstance, store: FinanceStore, cf
       via,
       authMode: cfg.authMode,
       oidcConfigured: Boolean(cfg.clientId && cfg.clientSecret),
+      localLoginEnabled: true,
       loginUrl: '/api/auth/oidc/login',
       user: user
         ? {
@@ -186,10 +194,64 @@ export function registerAuthRoutes(app: FastifyInstance, store: FinanceStore, cf
             handle: user.handle,
             displayName: user.displayName,
             defaultCurrency: user.defaultCurrency,
+            locale: user.locale,
+            isAdmin: user.isAdmin,
           }
         : null,
-      devUsers: cfg.authMode === 'dev' ? store.getUsers().map((u) => ({ handle: u.handle, displayName: u.displayName })) : undefined,
+      devUsers:
+        cfg.authMode === 'dev'
+          ? store
+              .getUsers()
+              .filter((u) => u.isActive)
+              .map((u) => ({ handle: u.handle, displayName: u.displayName }))
+          : undefined,
     };
+  });
+
+  // Local Account Login (for external invited users such as Brother / Friends without homelab Authentik SSO)
+  app.post('/api/auth/local/login', async (req, reply) => {
+    const body = (req.body || {}) as { identifier?: string; username?: string; password?: string };
+    const ident = String(body.identifier || body.username || '').trim();
+    const password = String(body.password || '');
+    if (!ident || !password) {
+      return reply.code(400).send({ error: 'Username/email and password are required' });
+    }
+    const authenticatedUser = store.authenticateLocalUser(ident, password);
+    if (!authenticatedUser) {
+      return reply.code(401).send({ error: 'Invalid credentials or local login not set for this account' });
+    }
+
+    const sessToken = signPayload(
+      { uid: authenticatedUser.id, loginVia: 'local', exp: Date.now() + 14 * 86400_000 },
+      cfg.sessionSecret
+    );
+    reply.setCookie(SESSION_COOKIE, sessToken, {
+      path: '/',
+      httpOnly: true,
+      sameSite: 'lax',
+      secure: cfg.publicBaseUrl.startsWith('https://') && cfg.authMode === 'authentik',
+      maxAge: 14 * 86400,
+    });
+    return { ok: true, user: authenticatedUser };
+  });
+
+  // Change own password (available to local accounts & admins/owners)
+  app.post('/api/auth/change-password', async (req, reply) => {
+    const user = requireUser(req, reply, store, cfg);
+    if (!user) return;
+    const body = (req.body || {}) as { currentPassword?: string; newPassword?: string };
+    const newPassword = String(body.newPassword || '');
+    if (newPassword.length < 6) {
+      return reply.code(400).send({ error: 'New password must be at least 6 characters' });
+    }
+    if (user.authProvider === 'local') {
+      const verified = store.authenticateLocalUser(user.handle, String(body.currentPassword || ''));
+      if (!verified) {
+        return reply.code(401).send({ error: 'Current password is incorrect' });
+      }
+    }
+    store.setUserPassword(user.id, newPassword);
+    return { ok: true };
   });
 
   // Dev user switcher (only active when authMode === 'dev')
@@ -328,7 +390,7 @@ export function registerAuthRoutes(app: FastifyInstance, store: FinanceStore, cf
     }
 
     const sessToken = signPayload(
-      { uid: mappedUser.id, exp: Date.now() + 14 * 86400_000 },
+      { uid: mappedUser.id, loginVia: 'oidc', exp: Date.now() + 14 * 86400_000 },
       cfg.sessionSecret
     );
     reply.setCookie(SESSION_COOKIE, sessToken, {
@@ -342,11 +404,14 @@ export function registerAuthRoutes(app: FastifyInstance, store: FinanceStore, cf
     return reply.redirect('/');
   });
 
-  app.post('/api/auth/logout', async (_req, reply) => {
+  app.post('/api/auth/logout', async (req, reply) => {
+    const rawCookie = req.cookies?.[SESSION_COOKIE];
+    const sess = verifyPayload<{ uid: string; loginVia?: string; exp: number }>(rawCookie, cfg.sessionSecret);
     reply.clearCookie(SESSION_COOKIE, { path: '/' });
+    const useOidcEndSession = sess?.loginVia === 'oidc' && Boolean(cfg.clientId);
     return {
       ok: true,
-      endSessionUrl: cfg.clientId
+      endSessionUrl: useOidcEndSession
         ? `${cfg.authentikPublicUrl}/application/o/${cfg.authentikSlug}/end-session/`
         : '/',
     };

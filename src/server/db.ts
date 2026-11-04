@@ -6,6 +6,7 @@ import { DEFAULT_FX_RATES } from '../shared/currency.js';
 import type {
   AssetBelongingRecord,
   AttachmentRecord,
+  AuthProviderKind,
   BankAccountRecord,
   CurrencyCode,
   ExpenseEntryRecord,
@@ -13,6 +14,7 @@ import type {
   FxRateRecord,
   IncomeStreamRecord,
   LiabilityRecord,
+  LocaleCode,
   ObligationRecord,
   PartnerVisibility,
   PaymentOccurrenceRecord,
@@ -20,8 +22,28 @@ import type {
   SplitMode,
   UserProfile,
   WealthSnapshotRecord,
+  WorkspaceKind,
+  WorkspaceMemberRecord,
   WorkspaceRecord,
+  WorkspaceRole,
 } from '../shared/types.js';
+
+export function hashPassword(rawPassword: string): string {
+  const salt = crypto.randomBytes(16).toString('base64url');
+  const hash = crypto.scryptSync(rawPassword, salt, 64).toString('base64url');
+  return `scrypt$${salt}$${hash}`;
+}
+
+export function verifyPassword(rawPassword: string, stored: string | null | undefined): boolean {
+  if (!stored || !stored.startsWith('scrypt$')) return false;
+  const parts = stored.split('$');
+  if (parts.length !== 3) return false;
+  const [, salt, expectedB64] = parts;
+  const actual = crypto.scryptSync(rawPassword, salt, 64);
+  const expected = Buffer.from(expectedB64, 'base64url');
+  if (actual.length !== expected.length) return false;
+  return crypto.timingSafeEqual(actual, expected);
+}
 
 export interface DataPaths {
   dataDir: string;
@@ -173,6 +195,18 @@ export class FinanceStore {
         UNIQUE(obligation_id, year_month)
       );
 
+      CREATE TABLE IF NOT EXISTS income_occurrences (
+        id TEXT PRIMARY KEY,
+        income_id TEXT NOT NULL REFERENCES income_streams(id) ON DELETE CASCADE,
+        year_month TEXT NOT NULL,
+        expected_date TEXT NOT NULL,
+        received_minor INTEGER NOT NULL,
+        currency TEXT NOT NULL DEFAULT 'GBP',
+        status TEXT NOT NULL DEFAULT 'received',
+        received_at TEXT NOT NULL,
+        UNIQUE(income_id, year_month)
+      );
+
       CREATE TABLE IF NOT EXISTS expenses (
         id TEXT PRIMARY KEY,
         workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
@@ -261,11 +295,42 @@ export class FinanceStore {
         revoked_at TEXT
       );
 
+      CREATE TABLE IF NOT EXISTS workspace_members (
+        workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        role TEXT NOT NULL DEFAULT 'editor',
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (workspace_id, user_id)
+      );
+
       CREATE TABLE IF NOT EXISTS app_meta (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
     `);
+
+    // Idempotent column migrations for existing production SQLite databases
+    const userCols = new Set(
+      (this.db.prepare(`PRAGMA table_info(users)`).all() as Array<{ name: string }>).map((c) => c.name)
+    );
+    if (!userCols.has('auth_provider')) {
+      this.db.exec(`ALTER TABLE users ADD COLUMN auth_provider TEXT NOT NULL DEFAULT 'oidc'`);
+    }
+    if (!userCols.has('password_hash')) {
+      this.db.exec(`ALTER TABLE users ADD COLUMN password_hash TEXT`);
+    }
+    if (!userCols.has('locale')) {
+      this.db.exec(`ALTER TABLE users ADD COLUMN locale TEXT NOT NULL DEFAULT 'en'`);
+    }
+    if (!userCols.has('is_admin')) {
+      this.db.exec(`ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0`);
+    }
+    if (!userCols.has('is_active')) {
+      this.db.exec(`ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1`);
+    }
+    if (!userCols.has('created_at')) {
+      this.db.exec(`ALTER TABLE users ADD COLUMN created_at TEXT NOT NULL DEFAULT '2026-11-04T00:00:00Z'`);
+    }
   }
 
   private seedCoreDefaults(): void {
@@ -278,11 +343,13 @@ export class FinanceStore {
     }
 
     const insertUser = this.db.prepare(`
-      INSERT OR IGNORE INTO users (id, handle, display_name, email, default_currency, personal_workspace_id)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT OR IGNORE INTO users (id, handle, display_name, email, default_currency, personal_workspace_id, auth_provider, is_admin, is_active)
+      VALUES (?, ?, ?, ?, ?, ?, 'oidc', 1, 1)
     `);
     insertUser.run('usr-wadera', 'wadera', 'Wadera', 'pstopa@skyday.eu', 'GBP', 'ws-wadera');
     insertUser.run('usr-walter', 'walter', 'Walter', 'poznanski.wojciech@gmail.com', 'GBP', 'ws-walter');
+    // Ensure primary owners retain admin flag on migrated DBs
+    this.db.prepare(`UPDATE users SET is_admin = 1 WHERE id IN ('usr-wadera', 'usr-walter')`).run();
 
     const insertWs = this.db.prepare(`
       INSERT OR IGNORE INTO workspaces (id, slug, name, kind, owner_user_id, partner_visibility, default_split_mode, wadera_custom_split_bp)
@@ -290,7 +357,19 @@ export class FinanceStore {
     `);
     insertWs.run('ws-wadera', 'ws-wadera', 'Wadera Personal', 'personal', 'usr-wadera', 'totals_only', 'owner_only', 10000);
     insertWs.run('ws-walter', 'ws-walter', 'Walter Personal', 'personal', 'usr-walter', 'totals_only', 'owner_only', 0);
-    insertWs.run('ws-home', 'ws-home', 'Shared Household', 'shared', null, 'readonly', 'equal_50_50', 5000);
+    insertWs.run('ws-home', 'ws-home', 'Shared Household', 'shared', 'usr-wadera', 'readonly', 'equal_50_50', 5000);
+    this.db.prepare(`UPDATE workspaces SET owner_user_id = 'usr-wadera' WHERE id = 'ws-home' AND owner_user_id IS NULL`).run();
+
+    // Ensure core workspace_members exist so multi-workspace sharing & isolation work seamlessly
+    const insMem = this.db.prepare(`
+      INSERT OR IGNORE INTO workspace_members (workspace_id, user_id, role, created_at)
+      VALUES (?, ?, ?, ?)
+    `);
+    const nowIso = new Date().toISOString();
+    insMem.run('ws-wadera', 'usr-wadera', 'owner', nowIso);
+    insMem.run('ws-walter', 'usr-walter', 'owner', nowIso);
+    insMem.run('ws-home', 'usr-wadera', 'owner', nowIso);
+    insMem.run('ws-home', 'usr-walter', 'editor', nowIso);
 
     // Seed starter household architecture once on brand-new DB so charts & workflows work immediately out-of-the-box
     // (User can click "Reset / Clear Starter Data" in Settings at any time)
@@ -300,6 +379,16 @@ export class FinanceStore {
     if (!seeded) {
       this.loadStarterHouseholdSample();
       this.db.prepare(`INSERT OR REPLACE INTO app_meta (key, value) VALUES ('initial_seed_v1', 'done')`).run();
+    }
+
+    const payday27Migrated = this.db.prepare(`SELECT value FROM app_meta WHERE key = 'payday_27_v1'`).get() as
+      | { value: string }
+      | undefined;
+    if (!payday27Migrated) {
+      this.db
+        .prepare(`UPDATE income_streams SET payday_day = 27 WHERE id = 'inc-wadera-cur' AND payday_day = 25`)
+        .run();
+      this.db.prepare(`INSERT OR REPLACE INTO app_meta (key, value) VALUES ('payday_27_v1', 'done')`).run();
     }
   }
 
@@ -327,14 +416,22 @@ export class FinanceStore {
 
   public getUsers(): UserProfile[] {
     const rows = this.db
-      .prepare(`SELECT id, handle, display_name, email, default_currency, personal_workspace_id FROM users ORDER BY handle`)
+      .prepare(
+        `SELECT id, handle, display_name, email, default_currency, personal_workspace_id, locale, auth_provider, is_admin, is_active
+         FROM users
+         ORDER BY is_admin DESC, handle ASC`
+      )
       .all() as Array<{
       id: string;
-      handle: 'wadera' | 'walter';
+      handle: string;
       display_name: string;
       email: string;
       default_currency: CurrencyCode;
       personal_workspace_id: string;
+      locale: LocaleCode;
+      auth_provider: AuthProviderKind;
+      is_admin: number;
+      is_active: number;
     }>;
     return rows.map((u) => ({
       id: u.id,
@@ -343,27 +440,160 @@ export class FinanceStore {
       email: u.email,
       defaultCurrency: u.default_currency,
       personalWorkspaceId: u.personal_workspace_id,
+      locale: u.locale === 'pl' ? 'pl' : 'en',
+      authProvider: (u.auth_provider || 'oidc') as AuthProviderKind,
+      isAdmin: Boolean(u.is_admin),
+      isActive: u.is_active !== 0,
     }));
   }
 
   public getUserById(userId: string): UserProfile | null {
-    return this.getUsers().find((u) => u.id === userId) ?? null;
+    return this.getUsers().find((u) => u.id === userId && u.isActive) ?? null;
   }
 
   public updateUserDefaultCurrency(userId: string, currency: CurrencyCode): void {
     this.db.prepare(`UPDATE users SET default_currency = ? WHERE id = ?`).run(currency, userId);
   }
 
+  public updateUserLocale(userId: string, locale: LocaleCode): void {
+    const safeLocale: LocaleCode = locale === 'pl' ? 'pl' : 'en';
+    this.db.prepare(`UPDATE users SET locale = ? WHERE id = ?`).run(safeLocale, userId);
+  }
+
+  public authenticateLocalUser(identifier: string, password: string): UserProfile | null {
+    const ident = identifier.trim().toLowerCase();
+    if (!ident || !password) return null;
+    const row = this.db
+      .prepare(
+        `SELECT id, password_hash, is_active
+         FROM users
+         WHERE LOWER(handle) = ? OR LOWER(email) = ?`
+      )
+      .get(ident, ident) as { id: string; password_hash: string | null; is_active: number } | undefined;
+    if (!row || row.is_active === 0 || !row.password_hash) return null;
+    if (!verifyPassword(password, row.password_hash)) return null;
+    return this.getUserById(row.id);
+  }
+
+  public setUserPassword(userId: string, newPassword: string): void {
+    if (newPassword.length < 6) {
+      throw new Error('Password must be at least 6 characters');
+    }
+    const cur = this.db.prepare(`SELECT auth_provider FROM users WHERE id = ?`).get(userId) as
+      | { auth_provider: string }
+      | undefined;
+    if (!cur) throw new Error('User not found');
+    const nextProvider: AuthProviderKind = cur.auth_provider === 'oidc' ? 'both' : (cur.auth_provider as AuthProviderKind);
+    this.db
+      .prepare(`UPDATE users SET password_hash = ?, auth_provider = ? WHERE id = ?`)
+      .run(hashPassword(newPassword), nextProvider, userId);
+  }
+
+  public createLocalUser(params: {
+    handle: string;
+    displayName: string;
+    email?: string;
+    password: string;
+    defaultCurrency?: CurrencyCode;
+    locale?: LocaleCode;
+    isAdmin?: boolean;
+    sharedWorkspaceGrants?: Array<{ workspaceId: string; role: WorkspaceRole }>;
+  }): UserProfile {
+    const cleanHandle = params.handle
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9._-]/g, '');
+    if (cleanHandle.length < 2) {
+      throw new Error('Username handle must be at least 2 alphanumeric characters');
+    }
+    if (!params.password || params.password.length < 6) {
+      throw new Error('Password must be at least 6 characters');
+    }
+    const existingHandle = this.db
+      .prepare(`SELECT id FROM users WHERE LOWER(handle) = ?`)
+      .get(cleanHandle) as { id: string } | undefined;
+    if (existingHandle) {
+      throw new Error(`Username "${cleanHandle}" is already taken`);
+    }
+
+    const email = (params.email?.trim() || `${cleanHandle}@local.skyday.eu`).toLowerCase();
+    const existingEmail = this.db
+      .prepare(`SELECT id FROM users WHERE LOWER(email) = ?`)
+      .get(email) as { id: string } | undefined;
+    if (existingEmail) {
+      throw new Error(`Email "${email}" is already registered`);
+    }
+
+    const userId = `usr-${cleanHandle}-${crypto.randomUUID().slice(0, 4)}`;
+    const personalWsId = `ws-${cleanHandle}-${crypto.randomUUID().slice(0, 4)}`;
+    const displayName = params.displayName.trim() || cleanHandle;
+    const defaultCurrency: CurrencyCode = params.defaultCurrency || 'GBP';
+    const locale: LocaleCode = params.locale === 'pl' ? 'pl' : 'en';
+    const pwdHash = hashPassword(params.password);
+    const nowIso = new Date().toISOString();
+
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO users (id, handle, display_name, email, default_currency, personal_workspace_id, auth_provider, password_hash, locale, is_admin, is_active, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'local', ?, ?, ?, 1, ?)`
+        )
+        .run(
+          userId,
+          cleanHandle,
+          displayName,
+          email,
+          defaultCurrency,
+          personalWsId,
+          pwdHash,
+          locale,
+          params.isAdmin ? 1 : 0,
+          nowIso
+        );
+
+      this.db
+        .prepare(
+          `INSERT INTO workspaces (id, slug, name, kind, owner_user_id, partner_visibility, default_split_mode, wadera_custom_split_bp)
+           VALUES (?, ?, ?, 'personal', ?, 'private', 'owner_only', 0)`
+        )
+        .run(personalWsId, personalWsId, `${displayName} Personal`, userId);
+
+      this.db
+        .prepare(`INSERT INTO workspace_members (workspace_id, user_id, role, created_at) VALUES (?, ?, 'owner', ?)`)
+        .run(personalWsId, userId, nowIso);
+
+      if (Array.isArray(params.sharedWorkspaceGrants)) {
+        const insGrant = this.db.prepare(
+          `INSERT OR REPLACE INTO workspace_members (workspace_id, user_id, role, created_at) VALUES (?, ?, ?, ?)`
+        );
+        for (const g of params.sharedWorkspaceGrants) {
+          if (g.workspaceId && g.role) {
+            insGrant.run(g.workspaceId, userId, g.role, nowIso);
+          }
+        }
+      }
+      this.db.exec('COMMIT;');
+    } catch (err) {
+      this.db.exec('ROLLBACK;');
+      throw err;
+    }
+
+    return this.getUserById(userId)!;
+  }
+
   public getWorkspaces(): WorkspaceRecord[] {
     const rows = this.db
       .prepare(
-        `SELECT id, slug, name, kind, owner_user_id, partner_visibility, default_split_mode, wadera_custom_split_bp FROM workspaces`
+        `SELECT id, slug, name, kind, owner_user_id, partner_visibility, default_split_mode, wadera_custom_split_bp
+         FROM workspaces
+         ORDER BY CASE kind WHEN 'shared' THEN 0 WHEN 'company' THEN 1 ELSE 2 END, name ASC`
       )
       .all() as Array<{
       id: string;
-      slug: 'ws-wadera' | 'ws-walter' | 'ws-home';
+      slug: string;
       name: string;
-      kind: 'personal' | 'shared';
+      kind: WorkspaceKind;
       owner_user_id: string | null;
       partner_visibility: PartnerVisibility;
       default_split_mode: SplitMode;
@@ -381,9 +611,100 @@ export class FinanceStore {
     }));
   }
 
+  public createWorkspace(params: {
+    ownerUserId: string;
+    name: string;
+    kind: WorkspaceKind;
+    sharedMembers?: Array<{ userId: string; role: WorkspaceRole }>;
+  }): WorkspaceRecord {
+    const name = params.name.trim();
+    if (!name) throw new Error('Workspace name is required');
+    const baseSlug =
+      name
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 24) || 'workspace';
+    const id = `ws-${baseSlug}-${crypto.randomUUID().slice(0, 5)}`;
+    const kind: WorkspaceKind =
+      params.kind === 'company' ? 'company' : params.kind === 'shared' ? 'shared' : 'personal';
+    const splitMode: SplitMode = kind === 'shared' ? 'equal_50_50' : 'owner_only';
+    const nowIso = new Date().toISOString();
+
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO workspaces (id, slug, name, kind, owner_user_id, partner_visibility, default_split_mode, wadera_custom_split_bp)
+           VALUES (?, ?, ?, ?, ?, 'private', ?, 5000)`
+        )
+        .run(id, id, name, kind, params.ownerUserId, splitMode);
+
+      this.db
+        .prepare(`INSERT INTO workspace_members (workspace_id, user_id, role, created_at) VALUES (?, ?, 'owner', ?)`)
+        .run(id, params.ownerUserId, nowIso);
+
+      if (Array.isArray(params.sharedMembers)) {
+        const insMem = this.db.prepare(
+          `INSERT OR REPLACE INTO workspace_members (workspace_id, user_id, role, created_at) VALUES (?, ?, ?, ?)`
+        );
+        for (const m of params.sharedMembers) {
+          if (m.userId && m.userId !== params.ownerUserId) {
+            insMem.run(id, m.userId, m.role, nowIso);
+          }
+        }
+      }
+      this.db.exec('COMMIT;');
+    } catch (err) {
+      this.db.exec('ROLLBACK;');
+      throw err;
+    }
+
+    return this.getWorkspaces().find((w) => w.id === id)!;
+  }
+
+  public listWorkspaceMembers(workspaceId: string): WorkspaceMemberRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT wm.workspace_id, wm.user_id, wm.role, u.handle, u.display_name
+         FROM workspace_members wm
+         JOIN users u ON u.id = wm.user_id
+         WHERE wm.workspace_id = ? AND u.is_active = 1
+         ORDER BY CASE wm.role WHEN 'owner' THEN 0 WHEN 'editor' THEN 1 WHEN 'viewer' THEN 2 ELSE 3 END, u.display_name ASC`
+      )
+      .all(workspaceId) as Array<{
+      workspace_id: string;
+      user_id: string;
+      role: WorkspaceRole;
+      handle: string;
+      display_name: string;
+    }>;
+    return rows.map((r) => ({
+      workspaceId: r.workspace_id,
+      userId: r.user_id,
+      handle: r.handle,
+      displayName: r.display_name,
+      role: r.role,
+    }));
+  }
+
+  public setWorkspaceMember(workspaceId: string, userId: string, role: WorkspaceRole): void {
+    this.db
+      .prepare(`INSERT OR REPLACE INTO workspace_members (workspace_id, user_id, role, created_at) VALUES (?, ?, ?, ?)`)
+      .run(workspaceId, userId, role, new Date().toISOString());
+  }
+
+  public removeWorkspaceMember(workspaceId: string, userId: string): void {
+    this.db
+      .prepare(`DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ?`)
+      .run(workspaceId, userId);
+  }
+
   public updateWorkspaceSettings(
     workspaceId: string,
     patch: {
+      name?: string;
+      kind?: WorkspaceKind;
       partnerVisibility?: PartnerVisibility;
       defaultSplitMode?: SplitMode;
       waderaCustomSplitBp?: number;
@@ -394,10 +715,12 @@ export class FinanceStore {
     this.db
       .prepare(
         `UPDATE workspaces
-         SET partner_visibility = ?, default_split_mode = ?, wadera_custom_split_bp = ?
+         SET name = ?, kind = ?, partner_visibility = ?, default_split_mode = ?, wadera_custom_split_bp = ?
          WHERE id = ?`
       )
       .run(
+        patch.name?.trim() || current.name,
+        patch.kind ?? current.kind,
         patch.partnerVisibility ?? current.partnerVisibility,
         patch.defaultSplitMode ?? current.defaultSplitMode,
         patch.waderaCustomSplitBp ?? current.waderaCustomSplitBp,
@@ -405,49 +728,76 @@ export class FinanceStore {
       );
   }
 
-  /**
-   * Access Control Helper enforcing Partner Privacy Scope:
-   * - Own personal workspace + Shared Household (`ws-home`): read + write
-   * - Partner's personal workspace:
-   *   - `'readonly'`: read allowed, write denied
-   *   - `'totals_only'`: item read denied (only aggregate wealth total allowed in Combined Family Wealth)
-   *   - `'private'`: completely invisible to partner
-   */
-  public canReadWorkspaceItems(userId: string, workspaceId: string): boolean {
+  public getEffectiveWorkspaceRole(userId: string, workspaceId: string): WorkspaceRole | null {
     const ws = this.getWorkspaces().find((w) => w.id === workspaceId);
-    if (!ws) return false;
-    if (ws.kind === 'shared') return true;
-    if (ws.ownerUserId === userId) return true;
-    return ws.partnerVisibility === 'readonly';
+    if (!ws) return null;
+    if (ws.ownerUserId === userId) return 'owner';
+
+    const mem = this.db
+      .prepare(`SELECT role FROM workspace_members WHERE workspace_id = ? AND user_id = ?`)
+      .get(workspaceId, userId) as { role: WorkspaceRole } | undefined;
+    if (mem) return mem.role;
+
+    // Household couple Partner Privacy Scope between Wadera & Walter on their personal workspaces
+    const isHouseholdCouple =
+      (userId === 'usr-wadera' || userId === 'usr-walter') &&
+      (ws.ownerUserId === 'usr-wadera' || ws.ownerUserId === 'usr-walter') &&
+      ws.kind === 'personal';
+    if (isHouseholdCouple) {
+      if (ws.partnerVisibility === 'readonly') return 'viewer';
+      if (ws.partnerVisibility === 'totals_only') return 'totals_only';
+      return null;
+    }
+
+    return null;
+  }
+
+  public canManageWorkspace(userId: string, workspaceId: string): boolean {
+    const role = this.getEffectiveWorkspaceRole(userId, workspaceId);
+    if (role === 'owner') return true;
+    const u = this.getUserById(userId);
+    if (workspaceId === 'ws-home' && u?.isAdmin) return true;
+    return false;
+  }
+
+  public canReadWorkspaceItems(userId: string, workspaceId: string): boolean {
+    const role = this.getEffectiveWorkspaceRole(userId, workspaceId);
+    return role === 'owner' || role === 'editor' || role === 'viewer';
   }
 
   public canWriteWorkspace(userId: string, workspaceId: string): boolean {
-    const ws = this.getWorkspaces().find((w) => w.id === workspaceId);
-    if (!ws) return false;
-    if (ws.kind === 'shared') return true;
-    return ws.ownerUserId === userId;
+    const role = this.getEffectiveWorkspaceRole(userId, workspaceId);
+    return role === 'owner' || role === 'editor';
   }
 
   public canIncludeInCombinedWealth(userId: string, workspaceId: string): boolean {
-    const ws = this.getWorkspaces().find((w) => w.id === workspaceId);
-    if (!ws) return false;
-    if (ws.kind === 'shared') return true;
-    if (ws.ownerUserId === userId) return true;
-    return ws.partnerVisibility === 'totals_only' || ws.partnerVisibility === 'readonly';
+    const role = this.getEffectiveWorkspaceRole(userId, workspaceId);
+    return role !== null;
   }
 
-  public readableWorkspaceIds(userId: string, scope: 'all' | 'shared' | 'personal' | 'partner'): string[] {
+  public readableWorkspaceIds(userId: string, scope: string): string[] {
     const user = this.getUserById(userId);
     if (!user) return [];
     const all = this.getWorkspaces();
-    if (scope === 'shared') return ['ws-home'];
-    if (scope === 'personal') return [user.personalWorkspaceId];
+    if (!scope || scope === 'all') {
+      return all.filter((w) => this.canReadWorkspaceItems(userId, w.id)).map((w) => w.id);
+    }
+    if (scope === 'shared') {
+      return all.filter((w) => w.kind === 'shared' && this.canReadWorkspaceItems(userId, w.id)).map((w) => w.id);
+    }
+    if (scope === 'company') {
+      return all.filter((w) => w.kind === 'company' && this.canReadWorkspaceItems(userId, w.id)).map((w) => w.id);
+    }
+    if (scope === 'personal') {
+      return this.canReadWorkspaceItems(userId, user.personalWorkspaceId) ? [user.personalWorkspaceId] : [];
+    }
     if (scope === 'partner') {
       return all
-        .filter((w) => w.kind === 'personal' && w.ownerUserId !== userId && w.partnerVisibility === 'readonly')
+        .filter((w) => w.kind === 'personal' && w.ownerUserId !== userId && this.canReadWorkspaceItems(userId, w.id))
         .map((w) => w.id);
     }
-    return all.filter((w) => this.canReadWorkspaceItems(userId, w.id)).map((w) => w.id);
+    // Specific workspace ID (e.g. 'ws-home', 'ws-wadera', 'ws-company-a', 'ws-company-b')
+    return this.canReadWorkspaceItems(userId, scope) ? [scope] : [];
   }
 
   public listAccounts(workspaceIds: string[]): BankAccountRecord[] {
@@ -565,6 +915,72 @@ export class FinanceStore {
       paidAt: (r.paid_at as string | null) ?? null,
       notes: (r.notes as string | null) ?? null,
     }));
+  }
+
+  public listIncomeOccurrences(
+    yearMonth: string,
+    incomeIds: string[]
+  ): Array<{
+    id: string;
+    incomeId: string;
+    yearMonth: string;
+    expectedDate: string;
+    receivedMinor: number;
+    currency: CurrencyCode;
+    status: 'received';
+    receivedAt: string;
+  }> {
+    if (!incomeIds.length) return [];
+    const placeholders = incomeIds.map(() => '?').join(',');
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM income_occurrences WHERE year_month = ? AND income_id IN (${placeholders}) ORDER BY expected_date`
+      )
+      .all(yearMonth, ...incomeIds) as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      id: String(r.id),
+      incomeId: String(r.income_id),
+      yearMonth: String(r.year_month),
+      expectedDate: String(r.expected_date),
+      receivedMinor: Number(r.received_minor),
+      currency: r.currency as CurrencyCode,
+      status: 'received' as const,
+      receivedAt: String(r.received_at),
+    }));
+  }
+
+  public setIncomeReceived(params: {
+    incomeId: string;
+    yearMonth: string;
+    expectedDate: string;
+    amountMinor: number;
+    currency: CurrencyCode;
+    received: boolean;
+  }): void {
+    if (params.received) {
+      this.db
+        .prepare(
+          `INSERT INTO income_occurrences (id, income_id, year_month, expected_date, received_minor, currency, status, received_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'received', ?)
+           ON CONFLICT(income_id, year_month) DO UPDATE SET
+             received_minor = excluded.received_minor,
+             status = 'received',
+             received_at = excluded.received_at`
+        )
+        .run(
+          `incocc-${crypto.randomUUID().slice(0, 8)}`,
+          params.incomeId,
+          params.yearMonth,
+          params.expectedDate,
+          params.amountMinor,
+          params.currency,
+          new Date().toISOString()
+        );
+    } else {
+      this.db
+        .prepare(`DELETE FROM income_occurrences WHERE income_id = ? AND year_month = ?`)
+        .run(params.incomeId, params.yearMonth);
+    }
   }
 
   public listExpenses(workspaceIds: string[], fromYm?: string, toYm?: string): ExpenseEntryRecord[] {
@@ -706,6 +1122,7 @@ export class FinanceStore {
 
   public clearAllFinancialRecords(): void {
     this.db.exec(`
+      DELETE FROM income_occurrences;
       DELETE FROM payment_occurrences;
       DELETE FROM expenses;
       DELETE FROM obligations;
@@ -737,8 +1154,8 @@ export class FinanceStore {
       INSERT INTO income_streams (id, workspace_id, name, source_kind, amount_minor, currency, cadence, payday_day, effective_from, effective_to, is_active, portal_url, notes)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
-    insInc.run('inc-wadera-2024', 'ws-wadera', 'Principal Engineering Salary (2024)', 'salary', 510000, 'GBP', 'monthly', 25, '2024-01-01', '2025-03-31', 1, null, 'Previous role band');
-    insInc.run('inc-wadera-cur', 'ws-wadera', 'Net Monthly Salary (Wadera)', 'salary', 595000, 'GBP', 'monthly', 25, '2025-04-01', null, 1, null, 'Primary take-home');
+    insInc.run('inc-wadera-2024', 'ws-wadera', 'Principal Engineering Salary (2024)', 'salary', 510000, 'GBP', 'monthly', 27, '2024-01-01', '2025-03-31', 1, null, 'Previous role band');
+    insInc.run('inc-wadera-cur', 'ws-wadera', 'Net Monthly Salary (Wadera)', 'salary', 595000, 'GBP', 'monthly', 27, '2025-04-01', null, 1, null, 'Primary take-home (27th payday)');
     insInc.run('inc-walter-cur', 'ws-walter', 'Net Monthly Salary (Walter)', 'salary', 465000, 'GBP', 'monthly', 28, '2025-01-01', null, 1, null, 'Primary take-home');
 
     // Hierarchical Pots

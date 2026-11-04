@@ -220,6 +220,76 @@ export function computeMonthlyIncomeMinor(
   return convertMinor(monthlyNative, inc.currency, targetCurrency, rateMap);
 }
 
+export interface PotBreadcrumbInfo {
+  potId: string;
+  ancestorIds: string[];
+  pathNames: string[];
+  pathString: string;
+  depth: number;
+}
+
+/**
+ * Builds cycle-safe unlimited-depth breadcrumb metadata for every pot.
+ */
+export function buildPotBreadcrumbs(pots: PotRecord[]): Map<string, PotBreadcrumbInfo> {
+  const byId = new Map(pots.map((p) => [p.id, p]));
+  const out = new Map<string, PotBreadcrumbInfo>();
+
+  for (const pot of pots) {
+    const names: string[] = [pot.name];
+    const ids: string[] = [pot.id];
+    const seen = new Set<string>([pot.id]);
+    let curParentId = pot.parentId;
+
+    while (curParentId && byId.has(curParentId) && !seen.has(curParentId)) {
+      seen.add(curParentId);
+      const parent = byId.get(curParentId)!;
+      names.unshift(parent.name);
+      ids.unshift(parent.id);
+      curParentId = parent.parentId;
+    }
+
+    out.set(pot.id, {
+      potId: pot.id,
+      ancestorIds: ids,
+      pathNames: names,
+      pathString: names.join(' › '),
+      depth: names.length - 1,
+    });
+  }
+
+  return out;
+}
+
+/**
+ * Collects `rootPotId` plus all recursive descendant pot IDs at unlimited depth (cycle-safe).
+ */
+export function collectSubtreePotIds(rootPotId: string, pots: PotRecord[]): Set<string> {
+  const byParent = new Map<string, string[]>();
+  for (const p of pots) {
+    if (p.parentId && p.parentId !== p.id) {
+      const list = byParent.get(p.parentId) ?? [];
+      list.push(p.id);
+      byParent.set(p.parentId, list);
+    }
+  }
+
+  const visited = new Set<string>();
+  const stack = [rootPotId];
+  while (stack.length > 0) {
+    const id = stack.pop()!;
+    if (visited.has(id)) continue;
+    visited.add(id);
+    const kids = byParent.get(id);
+    if (kids) {
+      for (const k of kids) {
+        if (!visited.has(k)) stack.push(k);
+      }
+    }
+  }
+  return visited;
+}
+
 export interface PotRollupNode {
   pot: PotRecord;
   estimateDisplayMinor: number;
@@ -233,8 +303,8 @@ export interface PotRollupNode {
 }
 
 /**
- * Hierarchical Pot Roll-Up Engine:
- * - Supports nested pots (e.g. Household -> Food -> Meat/Dairy, Car -> Insurance/Fuel).
+ * Hierarchical Pot Roll-Up Engine (Unlimited Nesting Depth, Cycle-Safe):
+ * - Supports arbitrarily deep nested pots (Level 0 -> Level 1 -> ... -> Level N).
  * - If a pot has `envelopeMode = true` with £600 estimate and £85 itemized groceries,
  *   effectiveTotal = £600 (£85 itemized + £515 unallocated envelope) — NO double counting!
  *   If itemized + scheduled exceeds £600 (say £640), effectiveTotal = £640.
@@ -247,21 +317,41 @@ export function buildPotRollupTree(
   displayCurrency: CurrencyCode,
   rateMap: Record<CurrencyCode, number>
 ): PotRollupNode[] {
+  const potIds = new Set(pots.map((p) => p.id));
+  const byId = new Map(pots.map((p) => [p.id, p]));
+
+  // Detect any cyclic parent_id chains so cyclic nodes fall back cleanly without infinite recursion
+  const hasCycleFrom = (startId: string): boolean => {
+    const seen = new Set<string>([startId]);
+    let cur = byId.get(startId)?.parentId ?? null;
+    while (cur && potIds.has(cur)) {
+      if (seen.has(cur)) return true;
+      seen.add(cur);
+      cur = byId.get(cur)?.parentId ?? null;
+    }
+    return false;
+  };
+
   const byParent = new Map<string | null, PotRecord[]>();
   for (const p of pots) {
-    const key = p.parentId ?? null;
-    const arr = byParent.get(key) ?? [];
+    const validParent =
+      p.parentId && p.parentId !== p.id && potIds.has(p.parentId) && !hasCycleFrom(p.id)
+        ? p.parentId
+        : null;
+    const arr = byParent.get(validParent) ?? [];
     arr.push(p);
-    byParent.set(key, arr);
+    byParent.set(validParent, arr);
   }
   for (const arr of byParent.values()) {
     arr.sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name));
   }
 
   const monthExpenses = expenses.filter((e) => e.spentDate.slice(0, 7) === yearMonth);
+  const visited = new Set<string>();
 
   const buildNode = (pot: PotRecord): PotRollupNode => {
-    const childPots = byParent.get(pot.id) ?? [];
+    visited.add(pot.id);
+    const childPots = (byParent.get(pot.id) ?? []).filter((c) => !visited.has(c.id));
     const children = childPots.map(buildNode);
 
     const directExpensesMinor = monthExpenses

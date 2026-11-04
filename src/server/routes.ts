@@ -15,8 +15,11 @@ import {
 } from '../shared/financeEngine.js';
 import type {
   CurrencyCode,
+  LocaleCode,
   PartnerVisibility,
   SplitMode,
+  WorkspaceKind,
+  WorkspaceRole,
 } from '../shared/types.js';
 import { type AuthConfig, requireUser } from './auth.js';
 import type { FinanceStore } from './db.js';
@@ -33,6 +36,14 @@ function prevYearMonths(centerYm: string, count: number): string[] {
   return res;
 }
 
+function shiftYearMonth(ym: string, deltaMonths: number): string {
+  const [y, m] = ym.split('-').map(Number);
+  const total = y * 12 + (m - 1) + deltaMonths;
+  const yy = Math.floor(total / 12);
+  const mm = ((total % 12) + 12) % 12 + 1;
+  return `${yy}-${String(mm).padStart(2, '0')}`;
+}
+
 export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg: AuthConfig): void {
   // Healthcheck (no private data exposed)
   app.get('/healthz', async () => {
@@ -45,20 +56,39 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     const user = requireUser(req, reply, store, cfg);
     if (!user) return;
 
-    const workspaces = store.getWorkspaces().map((ws) => ({
-      ...ws,
-      canReadItems: store.canReadWorkspaceItems(user.id, ws.id),
-      canWrite: store.canWriteWorkspace(user.id, ws.id),
-      includedInFamilyWealth: store.canIncludeInCombinedWealth(user.id, ws.id),
-    }));
+    const workspaces = store
+      .getWorkspaces()
+      .filter(
+        (ws) =>
+          store.canIncludeInCombinedWealth(user.id, ws.id) ||
+          (ws.kind === 'personal' &&
+            (user.id === 'usr-wadera' || user.id === 'usr-walter') &&
+            (ws.ownerUserId === 'usr-wadera' || ws.ownerUserId === 'usr-walter'))
+      )
+      .map((ws) => ({
+        ...ws,
+        role: store.getEffectiveWorkspaceRole(user.id, ws.id),
+        canReadItems: store.canReadWorkspaceItems(user.id, ws.id),
+        canWrite: store.canWriteWorkspace(user.id, ws.id),
+        canManage: store.canManageWorkspace(user.id, ws.id),
+        includedInFamilyWealth: store.canIncludeInCombinedWealth(user.id, ws.id),
+        members: store.canReadWorkspaceItems(user.id, ws.id) ? store.listWorkspaceMembers(ws.id) : [],
+      }));
 
+    const allUsers = store.getUsers();
     return {
       user,
-      users: store.getUsers().map((u) => ({
+      users: (user.isAdmin ? allUsers : allUsers.filter((u) => u.isActive)).map((u) => ({
         id: u.id,
         handle: u.handle,
         displayName: u.displayName,
+        email: user.isAdmin || u.id === user.id ? u.email : undefined,
         personalWorkspaceId: u.personalWorkspaceId,
+        authProvider: u.authProvider,
+        defaultCurrency: u.defaultCurrency,
+        locale: u.locale,
+        isAdmin: u.isAdmin,
+        isActive: u.isActive,
       })),
       workspaces,
       fxRates: store.getFxRates(),
@@ -71,7 +101,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     const user = requireUser(req, reply, store, cfg);
     if (!user) return;
 
-    const q = (req.query || {}) as { ym?: string; scope?: 'all' | 'shared' | 'personal' | 'partner' };
+    const q = (req.query || {}) as { ym?: string; scope?: string };
     const ym = q.ym && /^\d{4}-\d{2}$/.test(q.ym) ? q.ym : new Date().toISOString().slice(0, 7);
     const scope = q.scope || 'all';
     const cur = user.defaultCurrency;
@@ -91,7 +121,12 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
 
     const sixMonths = prevYearMonths(ym, 6);
     const allSixMonthExpenses = store.listExpenses(wsIds, sixMonths[0], sixMonths[sixMonths.length - 1]);
-    const expenses = allSixMonthExpenses.filter((e) => e.spentDate.slice(0, 7) === ym);
+    const expenses = allSixMonthExpenses
+      .filter((e) => e.spentDate.slice(0, 7) === ym)
+      .map((e) => ({
+        ...e,
+        displayAmountMinor: convertMinor(e.amountMinor, e.currency, cur, rateMap),
+      }));
 
     // Compute Wadera & Walter monthly incomes for proportional split calculations
     const waderaIncs = store.listIncomes(['ws-wadera']);
@@ -133,12 +168,26 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
 
     const potTree = buildPotRollupTree(pots, obligations, expenses, ym, cur, rateMap);
 
-    // Monthly Income total in display currency
+    // Monthly Income streams + explicit arrival tracking (income_occurrences)
+    const incomeOccurrences = store.listIncomeOccurrences(
+      ym,
+      incomes.map((i) => i.id)
+    );
+    const incOccById = new Map(incomeOccurrences.map((io) => [io.incomeId, io]));
+
     const activeIncomes = incomes
-      .map((inc) => ({
-        ...inc,
-        monthlyDisplayMinor: computeMonthlyIncomeMinor(inc, ym, cur, rateMap),
-      }))
+      .map((inc) => {
+        const monthlyDisplayMinor = computeMonthlyIncomeMinor(inc, ym, cur, rateMap);
+        const occ = incOccById.get(inc.id) ?? null;
+        const expectedDate = `${ym}-${String(Math.min(28, Math.max(1, inc.paydayDay))).padStart(2, '0')}`;
+        return {
+          ...inc,
+          monthlyDisplayMinor,
+          expectedDate,
+          isReceivedThisMonth: Boolean(occ && occ.status === 'received'),
+          receivedAt: occ?.receivedAt ?? null,
+        };
+      })
       .filter((i) => i.monthlyDisplayMinor > 0);
 
     const totalIncomeMinor = activeIncomes.reduce((s, i) => s + i.monthlyDisplayMinor, 0);
@@ -160,7 +209,97 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
 
     const netMonthlySurplusMinor = totalIncomeMinor - potPlannedTotalMinor;
 
+    // Smart Payday-Bridge Cashflow Calculation:
+    // - Most bills are scheduled around the 1st–25th, while salary arrives around the 27th.
+    // - Therefore this month's spending (1st–26th) is funded by Previous Month Overflow (from last month's 27th salary),
+    //   while this month's 27th salary (dotted until ticked received on Timeline) is bridged to fund Next Month's pre-salary bills!
+    const prevYm = shiftYearMonth(ym, -1);
+    const nextYm = shiftYearMonth(ym, 1);
+    const primaryPaydayDay =
+      activeIncomes.length > 0 ? Math.max(...activeIncomes.map((i) => i.paydayDay)) : 27;
+
+    // 1. Previous Month Overflow (from previous cycle's late-month salary minus any post-payday bills in prevYm)
+    const prevCycleSalaryMinor = incomes.reduce((sum, inc) => {
+      if (!inc.isActive || inc.paydayDay < 12) return sum;
+      const inPrev = computeMonthlyIncomeMinor(inc, prevYm, cur, rateMap);
+      const fallbackCur = inPrev > 0 ? inPrev : computeMonthlyIncomeMinor(inc, ym, cur, rateMap);
+      return sum + fallbackCur;
+    }, 0);
+
+    const prevPostPaydayObMinor = obligations
+      .filter((o) => o.isActive && o.dueDay > primaryPaydayDay)
+      .reduce((sum, ob) => {
+        const m = computeObligationMonthMetrics(ob, prevYm);
+        return sum + convertMinor(m.effectiveMonthlyBurdenNativeMinor, ob.currency, cur, rateMap);
+      }, 0);
+
+    const earlyMonthReceivedMinor = activeIncomes
+      .filter((i) => i.paydayDay < 12 && i.isReceivedThisMonth)
+      .reduce((s, i) => s + i.monthlyDisplayMinor, 0);
+
+    const overflowInMinor = Math.max(
+      0,
+      (prevCycleSalaryMinor > 0 ? prevCycleSalaryMinor - prevPostPaydayObMinor : 0) + earlyMonthReceivedMinor
+    );
+
+    const thisMonthBufferMinor = Math.max(0, overflowInMinor - potPlannedTotalMinor);
+    const thisMonthShortfallMinor = Math.max(0, potPlannedTotalMinor - overflowInMinor);
+
+    // 2. Next Month Needed Before Next Salary (1st .. primaryPaydayDay - 1 of nextYm)
+    const nextMonthPreSalaryObligations = obligations.filter(
+      (ob) => ob.isActive && (ob.dueDay < primaryPaydayDay || ob.cadence !== 'monthly')
+    );
+    const nextMonthPotTree = buildPotRollupTree(
+      pots,
+      nextMonthPreSalaryObligations,
+      [],
+      nextYm,
+      cur,
+      rateMap
+    );
+    const nextMonthUnassignedObMinor = nextMonthPreSalaryObligations
+      .filter((o) => !o.potId)
+      .reduce((sum, ob) => {
+        const m = computeObligationMonthMetrics(ob, nextYm);
+        return sum + convertMinor(m.effectiveMonthlyBurdenNativeMinor, ob.currency, cur, rateMap);
+      }, 0);
+
+    const nextMonthPreSalaryMinor =
+      nextMonthPotTree.reduce((s, n) => s + n.effectiveTotalDisplayMinor, 0) + nextMonthUnassignedObMinor;
+
+    const nextMonthBreakdown = [
+      ...nextMonthPotTree
+        .filter((n) => n.effectiveTotalDisplayMinor > 0)
+        .map((n) => ({
+          id: `next-pot-${n.pot.id}`,
+          potId: n.pot.id,
+          name: n.pot.name,
+          color: n.pot.color || '#DC2626',
+          displayMinor: n.effectiveTotalDisplayMinor,
+        })),
+      ...(nextMonthUnassignedObMinor > 0
+        ? [
+            {
+              id: 'next-pot-other',
+              potId: null,
+              name: 'Other Pre-Salary Bills',
+              color: '#DC2626',
+              displayMinor: nextMonthUnassignedObMinor,
+            },
+          ]
+        : []),
+    ];
+
+    const upcomingCycleIncomes = activeIncomes.filter((i) => i.paydayDay >= 12 || !i.isReceivedThisMonth);
+    const upcomingSalaryTotalMinor = upcomingCycleIncomes.reduce((s, i) => s + i.monthlyDisplayMinor, 0);
+    const upcomingSalaryReceivedMinor = upcomingCycleIncomes
+      .filter((i) => i.isReceivedThisMonth)
+      .reduce((s, i) => s + i.monthlyDisplayMinor, 0);
+    const upcomingSalaryPendingMinor = upcomingSalaryTotalMinor - upcomingSalaryReceivedMinor;
+    const projectedFreeFromUpcomingMinor = Math.max(0, upcomingSalaryTotalMinor - nextMonthPreSalaryMinor);
+
     // Account Runway & Month-End Sufficiency Engine
+    // Honest pre-salary sufficiency: unticked future salary is NOT counted as available cash before payday!
     const [yrNum, moNum] = ym.split('-').map(Number);
     const daysInMonth = new Date(yrNum, moNum, 0).getDate();
     const todayIso = new Date().toISOString().slice(0, 10);
@@ -174,8 +313,13 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       .filter((o) => o.metrics.isDueThisMonth && !o.isPaidThisMonth)
       .reduce((s, o) => s + o.dueDisplayMinor, 0);
 
+    const unpaidPrePaydayBillsMinor = enrichedObligations
+      .filter((o) => o.metrics.isDueThisMonth && !o.isPaidThisMonth && o.dueDay < primaryPaydayDay)
+      .reduce((s, o) => s + o.dueDisplayMinor, 0);
+
+    // Only count unticked incomes as future expected inflow AFTER their paydayDay
     const remainingPaydaysIncomeMinor = activeIncomes
-      .filter((i) => i.paydayDay > currentDay && todayIso.slice(0, 7) === ym)
+      .filter((i) => !i.isReceivedThisMonth)
       .reduce((s, i) => s + i.monthlyDisplayMinor, 0);
 
     const unallocatedEnvelopeRemainingMinor = potTree.reduce((s, n) => {
@@ -184,23 +328,30 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       return s + sumEnv(n);
     }, 0);
 
+    const totalNeededBeforePaydayMinor = unpaidPrePaydayBillsMinor + unallocatedEnvelopeRemainingMinor;
+    const prePaydayBufferMinor = runwayCashMinor - totalNeededBeforePaydayMinor;
+
     const totalNeededTillMonthEndMinor =
       unpaidBillsMinor + totalPreserveSliceMinor + unallocatedEnvelopeRemainingMinor;
+    // Available now without relying on unticked salary:
+    const currentCashAfterMonthBillsMinor = runwayCashMinor - totalNeededTillMonthEndMinor;
+    // Projected after unticked payday arrives (before reserving next month's pre-salary bills):
     const projectedEndBalanceMinor =
       runwayCashMinor + remainingPaydaysIncomeMinor - totalNeededTillMonthEndMinor;
-    const shortfallMinor = Math.max(0, -projectedEndBalanceMinor);
+    // True cycle buffer after ALSO reserving next month's pre-salary requirements from the new salary:
+    const projectedAfterNextMonthReserveMinor =
+      projectedEndBalanceMinor - nextMonthPreSalaryMinor;
+    const shortfallMinor = Math.max(0, -prePaydayBufferMinor);
 
     // Daily Runway Curve (days 1..daysInMonth)
     const dailyCurve: Array<{ day: number; balanceMinor: number; label?: string }> = [];
     let runningBal = runwayCashMinor;
     for (let d = 1; d <= daysInMonth; d++) {
       const labels: string[] = [];
-      if (d > currentDay || todayIso.slice(0, 7) !== ym) {
-        for (const inc of activeIncomes) {
-          if (inc.paydayDay === d) {
-            runningBal += inc.monthlyDisplayMinor;
-            labels.push(`+${inc.name}`);
-          }
+      for (const inc of activeIncomes) {
+        if (!inc.isReceivedThisMonth && inc.paydayDay === d) {
+          runningBal += inc.monthlyDisplayMinor;
+          labels.push(`+${inc.name} (expected)`);
         }
       }
       for (const ob of enrichedObligations) {
@@ -321,13 +472,33 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
         runwayCashMinor,
         remainingPaydaysIncomeMinor,
         unpaidBillsMinor,
+        unpaidPrePaydayBillsMinor,
         totalPreserveSliceMinor,
         unallocatedEnvelopeRemainingMinor,
+        totalNeededBeforePaydayMinor,
+        prePaydayBufferMinor,
+        currentCashAfterMonthBillsMinor,
         totalNeededTillMonthEndMinor,
         projectedEndBalanceMinor,
+        projectedAfterNextMonthReserveMinor,
         shortfallMinor,
-        isSufficient: projectedEndBalanceMinor >= 0,
+        isSufficient: prePaydayBufferMinor >= 0,
         dailyCurve,
+      },
+      cashflowBridge: {
+        prevYearMonth: prevYm,
+        nextYearMonth: nextYm,
+        primaryPaydayDay,
+        overflowInMinor,
+        thisMonthSpendingMinor: potPlannedTotalMinor,
+        thisMonthBufferMinor,
+        thisMonthShortfallMinor,
+        upcomingSalaryTotalMinor,
+        upcomingSalaryReceivedMinor,
+        upcomingSalaryPendingMinor,
+        nextMonthPreSalaryMinor,
+        projectedFreeFromUpcomingMinor,
+        nextMonthBreakdown,
       },
       sankey: {
         nodes: sankeyNodes,
@@ -342,15 +513,26 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     const user = requireUser(req, reply, store, cfg);
     if (!user) return;
 
-    const q = (req.query || {}) as { horizon?: string };
+    const q = (req.query || {}) as { horizon?: string; scope?: string };
     const horizonYears = Math.min(30, Math.max(3, Number(q.horizon || 10)));
+    const scope = q.scope || 'all';
     const cur = user.defaultCurrency;
     const rateMap = buildRateMap(store.getFxRates());
     const ym = new Date().toISOString().slice(0, 7);
     const currentYear = Number(ym.slice(0, 4));
 
     const workspaces = store.getWorkspaces();
-    const partnerWs = workspaces.find((w) => w.kind === 'personal' && w.ownerUserId !== user.id) ?? null;
+    const isPrimaryCouple = user.id === 'usr-wadera' || user.id === 'usr-walter';
+    const partnerWs = isPrimaryCouple
+      ? workspaces.find(
+          (w) =>
+            w.kind === 'personal' &&
+            w.ownerUserId !== user.id &&
+            (w.ownerUserId === 'usr-wadera' || w.ownerUserId === 'usr-walter')
+        ) ?? null
+      : workspaces.find(
+          (w) => w.kind === 'personal' && w.ownerUserId !== user.id && store.canIncludeInCombinedWealth(user.id, w.id)
+        ) ?? null;
 
     const summarizeWs = (wsId: string, scaleFactor = 1.0) => {
       const assets = store.listAssets([wsId]);
@@ -378,7 +560,19 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     };
 
     const personalSummary = summarizeWs(user.personalWorkspaceId, 1.0);
-    const sharedHalfSummary = summarizeWs('ws-home', 0.5);
+    const hasHomeShare = store.canIncludeInCombinedWealth(user.id, 'ws-home');
+    const sharedHalfSummary = hasHomeShare
+      ? summarizeWs('ws-home', 0.5)
+      : {
+          cashMinor: 0,
+          assetsMinor: 0,
+          totalAssetsMinor: 0,
+          liabilitiesMinor: 0,
+          netWorthMinor: 0,
+          assets: [],
+          liabilities: [],
+          accounts: [],
+        };
 
     const myTotalAssetsMinor = personalSummary.totalAssetsMinor + sharedHalfSummary.totalAssetsMinor;
     const myTotalLiabilitiesMinor = personalSummary.liabilitiesMinor + sharedHalfSummary.liabilitiesMinor;
@@ -410,10 +604,12 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       };
     }
 
-    // Combined Family Wealth (all workspaces permitted by privacy scope)
-    const combinedWsIds = workspaces
+    // Combined Wealth across all workspaces permitted by privacy/membership scope (or scoped workspace when selected)
+    const allCombinedWsIds = workspaces
       .filter((w) => store.canIncludeInCombinedWealth(user.id, w.id))
       .map((w) => w.id);
+    const combinedWsIds =
+      scope && scope !== 'all' ? store.readableWorkspaceIds(user.id, scope) : allCombinedWsIds;
 
     const combinedAssets = store.listAssets(combinedWsIds);
     const combinedLiabilities = store.listLiabilities(combinedWsIds);
@@ -423,7 +619,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       0
     );
 
-    // Estimate monthly net family savings for long-horizon projection
+    // Estimate monthly net family/workspace savings for long-horizon projection
     const combinedIncomes = store
       .listIncomes(combinedWsIds)
       .reduce((s, i) => s + computeMonthlyIncomeMinor(i, ym, cur, rateMap), 0);
@@ -465,7 +661,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
         })),
       ],
       bankCashDisplayMinor: personalSummary.cashMinor + sharedHalfSummary.cashMinor,
-      monthlyNetSavingsDisplayMinor: Math.round(estMonthlySavings * 0.55),
+      monthlyNetSavingsDisplayMinor: Math.round(estMonthlySavings * (hasHomeShare ? 0.55 : 1.0)),
       displayCurrency: cur,
       rateMap,
     });
@@ -487,7 +683,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     }
 
     // Visible item lists (never expose partner items unless partnerVisibility === 'readonly')
-    const itemVisibleWsIds = store.readableWorkspaceIds(user.id, 'all');
+    const itemVisibleWsIds = store.readableWorkspaceIds(user.id, scope);
     const visibleAssets = store.listAssets(itemVisibleWsIds).map((a) => ({
       ...a,
       displayValueMinor: convertMinor(a.currentValueMinor, a.currency, cur, rateMap),
@@ -499,9 +695,12 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       displayMonthlyMinor: convertMinor(l.monthlyPaymentMinor, l.currency, cur, rateMap),
     }));
 
+    const salaryWsIds = scope && scope !== 'all' ? itemVisibleWsIds : [user.personalWorkspaceId];
+
     return {
       displayCurrency: cur,
       horizonYears,
+      scope,
       myWealth: {
         totalAssetsMinor: myTotalAssetsMinor,
         totalLiabilitiesMinor: myTotalLiabilitiesMinor,
@@ -519,7 +718,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       },
       assets: visibleAssets,
       liabilities: visibleLiabilities,
-      salaryHistory: store.listIncomes([user.personalWorkspaceId]),
+      salaryHistory: store.listIncomes(salaryWsIds),
     };
   });
 
@@ -529,6 +728,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     if (!user) return;
     const body = (req.body || {}) as {
       defaultCurrency?: CurrencyCode;
+      locale?: LocaleCode;
       partnerVisibility?: PartnerVisibility;
       sharedSplitMode?: SplitMode;
       waderaCustomSplitBp?: number;
@@ -538,22 +738,188 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     if (body.defaultCurrency) {
       store.updateUserDefaultCurrency(user.id, body.defaultCurrency);
     }
+    if (body.locale === 'en' || body.locale === 'pl') {
+      store.updateUserLocale(user.id, body.locale);
+    }
     if (body.partnerVisibility) {
       store.updateWorkspaceSettings(user.personalWorkspaceId, {
         partnerVisibility: body.partnerVisibility,
       });
     }
-    if (body.sharedSplitMode || body.waderaCustomSplitBp != null) {
+    if ((body.sharedSplitMode || body.waderaCustomSplitBp != null) && store.canWriteWorkspace(user.id, 'ws-home')) {
       store.updateWorkspaceSettings('ws-home', {
         defaultSplitMode: body.sharedSplitMode,
         waderaCustomSplitBp: body.waderaCustomSplitBp,
       });
     }
-    if (Array.isArray(body.fxRates)) {
+    if (Array.isArray(body.fxRates) && user.isAdmin) {
       for (const r of body.fxRates) {
         if (r.rateToGbp > 0) store.updateFxRate(r.currency, Number(r.rateToGbp));
       }
     }
+    return { ok: true };
+  });
+
+  // --- CRUD: Multi-Workspaces & Sharing (Company A, Company B, Household, Family, Personal) ---
+  app.post('/api/workspaces', async (req, reply) => {
+    const user = requireUser(req, reply, store, cfg);
+    if (!user) return;
+    const body = (req.body || {}) as {
+      name?: string;
+      kind?: WorkspaceKind;
+      sharedMembers?: Array<{ userId: string; role: WorkspaceRole }>;
+    };
+    const name = String(body.name || '').trim();
+    if (!name) return reply.code(400).send({ error: 'Workspace name is required' });
+    const kind: WorkspaceKind =
+      body.kind === 'company' ? 'company' : body.kind === 'shared' ? 'shared' : 'personal';
+    const created = store.createWorkspace({
+      ownerUserId: user.id,
+      name,
+      kind,
+      sharedMembers: body.sharedMembers,
+    });
+    return { ok: true, workspace: created };
+  });
+
+  app.patch('/api/workspaces/:id', async (req, reply) => {
+    const user = requireUser(req, reply, store, cfg);
+    if (!user) return;
+    const { id } = req.params as { id: string };
+    if (!store.canManageWorkspace(user.id, id)) {
+      return reply.code(403).send({ error: 'Only workspace owner can update workspace settings' });
+    }
+    const body = (req.body || {}) as {
+      name?: string;
+      kind?: WorkspaceKind;
+      partnerVisibility?: PartnerVisibility;
+      defaultSplitMode?: SplitMode;
+    };
+    store.updateWorkspaceSettings(id, body);
+    return { ok: true };
+  });
+
+  app.delete('/api/workspaces/:id', async (req, reply) => {
+    const user = requireUser(req, reply, store, cfg);
+    if (!user) return;
+    const { id } = req.params as { id: string };
+    if (id === user.personalWorkspaceId || id === 'ws-wadera' || id === 'ws-walter' || id === 'ws-home') {
+      return reply.code(400).send({ error: 'Default personal or primary household workspace cannot be deleted' });
+    }
+    if (!store.canManageWorkspace(user.id, id)) {
+      return reply.code(403).send({ error: 'Only workspace owner can delete this workspace' });
+    }
+    store.db.prepare(`DELETE FROM workspaces WHERE id = ?`).run(id);
+    return { ok: true };
+  });
+
+  app.post('/api/workspaces/:id/members', async (req, reply) => {
+    const user = requireUser(req, reply, store, cfg);
+    if (!user) return;
+    const { id } = req.params as { id: string };
+    if (!store.canManageWorkspace(user.id, id)) {
+      return reply.code(403).send({ error: 'Only workspace owner can share this workspace' });
+    }
+    const body = (req.body || {}) as { userId?: string; role?: WorkspaceRole };
+    const targetUserId = String(body.userId || '');
+    const role = (body.role || 'editor') as WorkspaceRole;
+    if (!targetUserId || !['editor', 'viewer', 'totals_only', 'owner'].includes(role)) {
+      return reply.code(400).send({ error: 'Valid userId and role required' });
+    }
+    const targetUser = store.getUserById(targetUserId);
+    if (!targetUser) return reply.code(404).send({ error: 'Target user not found' });
+    store.setWorkspaceMember(id, targetUserId, role);
+    return { ok: true, members: store.listWorkspaceMembers(id) };
+  });
+
+  app.delete('/api/workspaces/:id/members/:targetUserId', async (req, reply) => {
+    const user = requireUser(req, reply, store, cfg);
+    if (!user) return;
+    const { id, targetUserId } = req.params as { id: string; targetUserId: string };
+    const ws = store.getWorkspaces().find((w) => w.id === id);
+    if (!ws) return reply.code(404).send({ error: 'Workspace not found' });
+    if (ws.ownerUserId === targetUserId) {
+      return reply.code(400).send({ error: 'Cannot remove workspace owner' });
+    }
+    if (!store.canManageWorkspace(user.id, id) && user.id !== targetUserId) {
+      return reply.code(403).send({ error: 'Permission denied' });
+    }
+    store.removeWorkspaceMember(id, targetUserId);
+    return { ok: true, members: store.listWorkspaceMembers(id) };
+  });
+
+  // --- CRUD: Local Accounts & User Invitations (Admin Only) ---
+  app.post('/api/users/local', async (req, reply) => {
+    const user = requireUser(req, reply, store, cfg);
+    if (!user) return;
+    if (!user.isAdmin) {
+      return reply.code(403).send({ error: 'Admin privileges required to create local user accounts' });
+    }
+    const body = (req.body || {}) as {
+      handle?: string;
+      displayName?: string;
+      email?: string;
+      password?: string;
+      defaultCurrency?: CurrencyCode;
+      locale?: LocaleCode;
+      isAdmin?: boolean;
+      sharedWorkspaceGrants?: Array<{ workspaceId: string; role: WorkspaceRole }>;
+    };
+    try {
+      const created = store.createLocalUser({
+        handle: String(body.handle || ''),
+        displayName: String(body.displayName || body.handle || ''),
+        email: body.email ? String(body.email) : undefined,
+        password: String(body.password || ''),
+        defaultCurrency: body.defaultCurrency || 'GBP',
+        locale: body.locale === 'pl' ? 'pl' : 'en',
+        isAdmin: Boolean(body.isAdmin),
+        sharedWorkspaceGrants: body.sharedWorkspaceGrants,
+      });
+      return { ok: true, user: created };
+    } catch (err) {
+      return reply.code(400).send({ error: err instanceof Error ? err.message : 'Failed to create local user' });
+    }
+  });
+
+  app.patch('/api/users/:id', async (req, reply) => {
+    const user = requireUser(req, reply, store, cfg);
+    if (!user) return;
+    if (!user.isAdmin) return reply.code(403).send({ error: 'Admin privileges required' });
+    const { id } = req.params as { id: string };
+    const body = (req.body || {}) as {
+      newPassword?: string;
+      isActive?: boolean;
+      displayName?: string;
+    };
+    try {
+      if (body.newPassword) {
+        store.setUserPassword(id, body.newPassword);
+      }
+      if (typeof body.isActive === 'boolean' && id !== user.id && id !== 'usr-wadera') {
+        store.db.prepare(`UPDATE users SET is_active = ? WHERE id = ?`).run(body.isActive ? 1 : 0, id);
+      }
+      if (body.displayName?.trim()) {
+        store.db.prepare(`UPDATE users SET display_name = ? WHERE id = ?`).run(body.displayName.trim(), id);
+      }
+      return { ok: true };
+    } catch (err) {
+      return reply.code(400).send({ error: err instanceof Error ? err.message : 'Update failed' });
+    }
+  });
+
+  app.delete('/api/users/:id', async (req, reply) => {
+    const user = requireUser(req, reply, store, cfg);
+    if (!user) return;
+    if (!user.isAdmin) return reply.code(403).send({ error: 'Admin privileges required' });
+    const { id } = req.params as { id: string };
+    if (id === user.id || id === 'usr-wadera' || id === 'usr-walter') {
+      return reply.code(400).send({ error: 'Cannot delete primary household owner account' });
+    }
+    const target = store.getUsers().find((u) => u.id === id);
+    if (!target) return reply.code(404).send({ error: 'User not found' });
+    store.db.prepare(`DELETE FROM workspaces WHERE owner_user_id = ?`).run(id);
+    store.db.prepare(`DELETE FROM users WHERE id = ?`).run(id);
     return { ok: true };
   });
 
@@ -576,6 +942,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
   app.post('/api/settings/sample-data', async (req, reply) => {
     const user = requireUser(req, reply, store, cfg);
     if (!user) return;
+    if (!user.isAdmin) return reply.code(403).send({ error: 'Admin privileges required' });
     const body = (req.body || {}) as { action?: 'load' | 'clear' };
     if (body.action === 'clear') {
       store.clearAllFinancialRecords();
@@ -588,6 +955,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
   app.get('/api/settings/backup', async (req, reply) => {
     const user = requireUser(req, reply, store, cfg);
     if (!user) return;
+    if (!user.isAdmin) return reply.code(403).send({ error: 'Admin privileges required' });
     const snapPath = store.createBackupSnapshot();
     const fileName = path.basename(snapPath);
     reply.header('Content-Disposition', `attachment; filename="${fileName}"`);
@@ -683,14 +1051,73 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     return { ok: true };
   });
 
-  // --- CRUD: Hierarchical Pots ---
+  // Tick / Untick "[✓] Salary / Income Arrived" on the Monthly Timeline Tracker
+  app.post('/api/incomes/:id/toggle-received', async (req, reply) => {
+    const user = requireUser(req, reply, store, cfg);
+    if (!user) return;
+    const { id } = req.params as { id: string };
+    const body = (req.body || {}) as { yearMonth?: string; received?: boolean };
+    const ym = body.yearMonth && /^\d{4}-\d{2}$/.test(body.yearMonth) ? body.yearMonth : new Date().toISOString().slice(0, 7);
+
+    const wsIds = store.readableWorkspaceIds(user.id, 'all');
+    const inc = store.listIncomes(wsIds).find((i) => i.id === id);
+    if (!inc || !store.canWriteWorkspace(user.id, inc.workspaceId)) {
+      return reply.code(403).send({ error: 'Income stream not found or write denied' });
+    }
+
+    const expectedDate = `${ym}-${String(Math.min(28, Math.max(1, inc.paydayDay))).padStart(2, '0')}`;
+    const markReceived = body.received !== false;
+    store.setIncomeReceived({
+      incomeId: inc.id,
+      yearMonth: ym,
+      expectedDate,
+      amountMinor: inc.amountMinor,
+      currency: inc.currency,
+      received: markReceived,
+    });
+
+    return { ok: true, incomeId: inc.id, yearMonth: ym, isReceivedThisMonth: markReceived };
+  });
+
+  // --- CRUD: Hierarchical Pots (Unlimited Nesting + Item-to-Pot Promotion) ---
   app.post('/api/pots', async (req, reply) => {
     const user = requireUser(req, reply, store, cfg);
     if (!user) return;
     const b = (req.body || {}) as Record<string, unknown>;
-    const wsId = String(b.workspaceId || 'ws-home');
-    if (!store.canWriteWorkspace(user.id, wsId)) return reply.code(403).send({ error: 'Write denied' });
     const id = b.id ? String(b.id) : `pot-${crypto.randomUUID().slice(0, 8)}`;
+    const parentId = b.parentId ? String(b.parentId) : null;
+
+    let parentRow: { id: string; workspace_id: string; parent_id: string | null; color: string } | undefined;
+    if (parentId) {
+      if (parentId === id) {
+        return reply.code(400).send({ error: 'A pot cannot be its own parent' });
+      }
+      parentRow = store.db
+        .prepare(`SELECT id, workspace_id, parent_id, color FROM pots WHERE id = ?`)
+        .get(parentId) as typeof parentRow;
+      if (!parentRow) {
+        return reply.code(400).send({ error: 'Parent pot not found' });
+      }
+      // Prevent cycles across arbitrary depth
+      let cursor: string | null = parentRow.parent_id;
+      const seen = new Set<string>([id, parentId]);
+      while (cursor) {
+        if (seen.has(cursor)) {
+          return reply.code(400).send({ error: 'Circular pot hierarchy rejected' });
+        }
+        seen.add(cursor);
+        const ancestor = store.db
+          .prepare(`SELECT parent_id FROM pots WHERE id = ?`)
+          .get(cursor) as { parent_id: string | null } | undefined;
+        cursor = ancestor?.parent_id ?? null;
+      }
+    }
+
+    const wsId = String(b.workspaceId || parentRow?.workspace_id || 'ws-home');
+    if (!store.canWriteWorkspace(user.id, wsId)) return reply.code(403).send({ error: 'Write denied' });
+
+    const color = String(b.color || parentRow?.color || '#2E6F7E');
+
     store.db
       .prepare(
         `INSERT INTO pots (id, workspace_id, parent_id, name, icon, color, envelope_mode, monthly_estimate_minor, currency, tags_json, sort_order)
@@ -704,10 +1131,10 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       .run(
         id,
         wsId,
-        b.parentId ? String(b.parentId) : null,
+        parentId,
         String(b.name || 'New Pot'),
         String(b.icon || 'folder'),
-        String(b.color || '#2E6F7E'),
+        color,
         b.envelopeMode ? 1 : 0,
         Math.round(Number(b.monthlyEstimateMinor ?? 0)),
         String(b.currency || user.defaultCurrency),
@@ -717,12 +1144,221 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     return { ok: true, id };
   });
 
+  /**
+   * Promotes an existing leaf item ('obligation' or 'expense') into a Pot when a new sub-pot or item
+   * is added inside it ("By default any item can become a pot if new item is added inside as sub-pot").
+   */
+  app.post('/api/pots/promote-item', async (req, reply) => {
+    const user = requireUser(req, reply, store, cfg);
+    if (!user) return;
+
+    const body = (req.body || {}) as {
+      itemKind?: 'obligation' | 'expense';
+      itemId?: string;
+      promoteMode?: 'envelope' | 'group';
+      child?: {
+        kind?: 'pot' | 'obligation' | 'expense';
+        name?: string;
+        amountMinor?: number;
+        currency?: CurrencyCode;
+        cadence?: ObligationRecord['cadence'];
+        intervalMonths?: number;
+        nextDueDate?: string;
+        spentDate?: string;
+      };
+    };
+
+    const itemKind = body.itemKind;
+    const itemId = String(body.itemId || '');
+    const promoteMode = body.promoteMode === 'group' ? 'group' : 'envelope';
+    const child = body.child || {};
+    const childKind = child.kind || 'pot';
+    const childName = String(child.name || '').trim();
+    const childAmountMinor = Math.max(0, Math.round(Number(child.amountMinor ?? 0)));
+
+    if (!itemKind || !itemId || !childName) {
+      return reply.code(400).send({ error: 'itemKind, itemId, and child.name are required' });
+    }
+
+    const wsIds = store.readableWorkspaceIds(user.id, 'all');
+    const palette = ['#2E6F7E', '#3D7A5A', '#47688A', '#7C5E8C', '#B4693E'];
+
+    let wsId = 'ws-home';
+    let parentPotId: string | null = null;
+    let promotedName = 'New Pot';
+    let itemCurrency: CurrencyCode = user.defaultCurrency;
+    let envelopeEstimateMinor = 0;
+
+    if (itemKind === 'obligation') {
+      const ob = store.listObligations(wsIds).find((o) => o.id === itemId);
+      if (!ob || !store.canWriteWorkspace(user.id, ob.workspaceId)) {
+        return reply.code(403).send({ error: 'Obligation not found or write denied' });
+      }
+      wsId = ob.workspaceId;
+      parentPotId = ob.potId;
+      promotedName = ob.name;
+      itemCurrency = ob.currency;
+
+      if (ob.cadence === 'monthly') envelopeEstimateMinor = ob.amountMinor;
+      else if (ob.cadence === 'weekly') envelopeEstimateMinor = Math.round((ob.amountMinor * 52) / 12);
+      else if (ob.cadence === 'quarterly') envelopeEstimateMinor = Math.round(ob.amountMinor / 3);
+      else if (ob.cadence === 'biannual') envelopeEstimateMinor = Math.round(ob.amountMinor / 6);
+      else if (ob.cadence === 'annual') envelopeEstimateMinor = Math.round(ob.amountMinor / 12);
+      else if (ob.cadence === 'custom_months') {
+        envelopeEstimateMinor = Math.round(ob.amountMinor / Math.max(1, ob.intervalMonths));
+      } else {
+        const ymNow = new Date().toISOString().slice(0, 7);
+        const m = computeObligationMonthMetrics(ob, ymNow);
+        envelopeEstimateMinor = m.effectiveMonthlyBurdenNativeMinor || ob.amountMinor;
+      }
+    } else if (itemKind === 'expense') {
+      const row = store.db
+        .prepare(`SELECT id, workspace_id, pot_id, merchant, amount_minor, currency FROM expenses WHERE id = ?`)
+        .get(itemId) as
+        | {
+            id: string;
+            workspace_id: string;
+            pot_id: string | null;
+            merchant: string;
+            amount_minor: number;
+            currency: CurrencyCode;
+          }
+        | undefined;
+      if (!row || !store.canWriteWorkspace(user.id, row.workspace_id)) {
+        return reply.code(403).send({ error: 'Expense not found or write denied' });
+      }
+      wsId = row.workspace_id;
+      parentPotId = row.pot_id;
+      promotedName = row.merchant;
+      itemCurrency = row.currency;
+      envelopeEstimateMinor = row.amount_minor;
+    } else {
+      return reply.code(400).send({ error: 'Invalid itemKind' });
+    }
+
+    const parentPotRow = parentPotId
+      ? (store.db.prepare(`SELECT color FROM pots WHERE id = ?`).get(parentPotId) as { color: string } | undefined)
+      : undefined;
+    const potColor = parentPotRow?.color || palette[Math.abs(promotedName.length) % palette.length];
+
+    const newPotId = `pot-${crypto.randomUUID().slice(0, 8)}`;
+    const childCurrency = (child.currency || itemCurrency || user.defaultCurrency) as CurrencyCode;
+    let childId = '';
+
+    store.db.exec('BEGIN IMMEDIATE;');
+    try {
+      store.db
+        .prepare(
+          `INSERT INTO pots (id, workspace_id, parent_id, name, icon, color, envelope_mode, monthly_estimate_minor, currency, tags_json, sort_order)
+           VALUES (?, ?, ?, ?, 'folder', ?, ?, ?, ?, '[]', 10)`
+        )
+        .run(
+          newPotId,
+          wsId,
+          parentPotId,
+          promotedName,
+          potColor,
+          promoteMode === 'envelope' && envelopeEstimateMinor > 0 ? 1 : 0,
+          promoteMode === 'envelope' ? envelopeEstimateMinor : 0,
+          itemCurrency
+        );
+
+      if (promoteMode === 'envelope') {
+        // Re-link any attachments onto the newly promoted pot and replace the leaf item cleanly
+        store.db
+          .prepare(`UPDATE attachments SET entity_type = 'pot', entity_id = ? WHERE entity_type = ? AND entity_id = ?`)
+          .run(newPotId, itemKind, itemId);
+        if (itemKind === 'obligation') {
+          store.db.prepare(`DELETE FROM obligations WHERE id = ?`).run(itemId);
+        } else {
+          store.db.prepare(`DELETE FROM expenses WHERE id = ?`).run(itemId);
+        }
+      } else {
+        // 'group' mode: move the original item inside the new pot alongside the new child
+        if (itemKind === 'obligation') {
+          store.db.prepare(`UPDATE obligations SET pot_id = ? WHERE id = ?`).run(newPotId, itemId);
+        } else {
+          store.db.prepare(`UPDATE expenses SET pot_id = ? WHERE id = ?`).run(newPotId, itemId);
+        }
+      }
+
+      if (childKind === 'pot') {
+        childId = `pot-${crypto.randomUUID().slice(0, 8)}`;
+        store.db
+          .prepare(
+            `INSERT INTO pots (id, workspace_id, parent_id, name, icon, color, envelope_mode, monthly_estimate_minor, currency, tags_json, sort_order)
+             VALUES (?, ?, ?, ?, 'folder', ?, ?, ?, ?, '[]', 10)`
+          )
+          .run(
+            childId,
+            wsId,
+            newPotId,
+            childName,
+            potColor,
+            childAmountMinor > 0 ? 1 : 0,
+            childAmountMinor,
+            childCurrency
+          );
+      } else if (childKind === 'obligation') {
+        childId = `ob-${crypto.randomUUID().slice(0, 8)}`;
+        const cad = (child.cadence || 'monthly') as ObligationRecord['cadence'];
+        const nextDue = String(child.nextDueDate || new Date().toISOString().slice(0, 10));
+        const dueDay = Number(nextDue.slice(8, 10)) || 1;
+        const intMonths = cadenceIntervalMonths(cad, Number(child.intervalMonths || 1));
+        store.db
+          .prepare(
+            `INSERT INTO obligations (
+               id, workspace_id, pot_id, name, amount_minor, currency, cadence, interval_months,
+               next_due_date, due_day, preserved_minor, auto_preserve, split_mode, wadera_split_bp,
+               tags_json, manage_url, portal_url, reference_number, renewal_notice_days, notes, is_active
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?, '[]', NULL, NULL, NULL, NULL, NULL, 1)`
+          )
+          .run(
+            childId,
+            wsId,
+            newPotId,
+            childName,
+            childAmountMinor,
+            childCurrency,
+            cad,
+            intMonths,
+            nextDue,
+            dueDay,
+            wsId === 'ws-home' ? 'equal_50_50' : 'owner_only',
+            wsId === 'ws-home' ? 5000 : 10000
+          );
+      } else {
+        childId = `exp-${crypto.randomUUID().slice(0, 8)}`;
+        const spentDate = String(child.spentDate || new Date().toISOString().slice(0, 10));
+        store.db
+          .prepare(
+            `INSERT INTO expenses (id, workspace_id, pot_id, merchant, description, amount_minor, currency, spent_date, tags_json, portal_url, source, items_json, created_at)
+             VALUES (?, ?, ?, ?, '', ?, ?, ?, '[]', NULL, 'manual', '[]', ?)`
+          )
+          .run(childId, wsId, newPotId, childName, childAmountMinor, childCurrency, spentDate, new Date().toISOString());
+      }
+
+      store.db.exec('COMMIT;');
+    } catch (err) {
+      store.db.exec('ROLLBACK;');
+      throw err;
+    }
+
+    return { ok: true, newPotId, childId, parentPotId };
+  });
+
   app.delete('/api/pots/:id', async (req, reply) => {
     const user = requireUser(req, reply, store, cfg);
     if (!user) return;
     const { id } = req.params as { id: string };
-    const row = store.db.prepare(`SELECT workspace_id FROM pots WHERE id = ?`).get(id) as { workspace_id: string } | undefined;
+    const row = store.db
+      .prepare(`SELECT workspace_id, parent_id FROM pots WHERE id = ?`)
+      .get(id) as { workspace_id: string; parent_id: string | null } | undefined;
     if (!row || !store.canWriteWorkspace(user.id, row.workspace_id)) return reply.code(403).send({ error: 'Denied' });
+    // Re-parent nested children up to the deleted pot's parent so deep hierarchies stay connected
+    store.db.prepare(`UPDATE pots SET parent_id = ? WHERE parent_id = ?`).run(row.parent_id, id);
+    store.db.prepare(`UPDATE obligations SET pot_id = ? WHERE pot_id = ?`).run(row.parent_id, id);
+    store.db.prepare(`UPDATE expenses SET pot_id = ? WHERE pot_id = ?`).run(row.parent_id, id);
     store.db.prepare(`DELETE FROM pots WHERE id = ?`).run(id);
     return { ok: true };
   });

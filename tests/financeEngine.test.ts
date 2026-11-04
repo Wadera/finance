@@ -8,7 +8,9 @@ import {
 } from '../src/shared/currency.js';
 import {
   applyObligationPaymentReset,
+  buildPotBreadcrumbs,
   buildPotRollupTree,
+  collectSubtreePotIds,
   computeMonthlyIncomeMinor,
   computeObligationMonthMetrics,
   projectWealthHorizon,
@@ -188,6 +190,44 @@ describe('Hierarchical Pot Envelope vs. Itemized Roll-Up', () => {
     expect(food.unallocatedEnvelopeDisplayMinor).toBe(51500); // £515 remaining in £600 envelope
     expect(food.effectiveTotalDisplayMinor).toBe(60000); // £600 total, not £685!
     expect(house.effectiveTotalDisplayMinor).toBe(60000);
+  });
+
+  it('rolls up arbitrary 5+ level deep pot hierarchies and collects subtree pot IDs safely', () => {
+    const deepPots: PotRecord[] = [
+      { id: 'p0', workspaceId: 'ws-home', parentId: null, name: 'L0 Home', icon: 'folder', color: '#2E6F7E', envelopeMode: false, monthlyEstimateMinor: 0, currency: 'GBP', tags: [], sortOrder: 1 },
+      { id: 'p1', workspaceId: 'ws-home', parentId: 'p0', name: 'L1 Kitchen', icon: 'folder', color: '#2E6F7E', envelopeMode: true, monthlyEstimateMinor: 50000, currency: 'GBP', tags: [], sortOrder: 1 },
+      { id: 'p2', workspaceId: 'ws-home', parentId: 'p1', name: 'L2 Dairy', icon: 'folder', color: '#2E6F7E', envelopeMode: false, monthlyEstimateMinor: 0, currency: 'GBP', tags: [], sortOrder: 1 },
+      { id: 'p3', workspaceId: 'ws-home', parentId: 'p2', name: 'L3 Butter', icon: 'folder', color: '#2E6F7E', envelopeMode: false, monthlyEstimateMinor: 0, currency: 'GBP', tags: [], sortOrder: 1 },
+      { id: 'p4', workspaceId: 'ws-home', parentId: 'p3', name: 'L4 Salted Kerrygold', icon: 'folder', color: '#2E6F7E', envelopeMode: false, monthlyEstimateMinor: 0, currency: 'GBP', tags: [], sortOrder: 1 },
+    ];
+    const exps: ExpenseEntryRecord[] = [
+      {
+        id: 'e-deep',
+        workspaceId: 'ws-home',
+        potId: 'p4',
+        merchant: 'Farm Shop',
+        description: 'Salted butter',
+        amountMinor: 1200,
+        currency: 'GBP',
+        spentDate: '2026-11-04',
+        tags: [],
+        portalUrl: null,
+        source: 'manual',
+        items: [],
+        createdAt: '2026-11-04T00:00:00Z',
+      },
+    ];
+
+    const crumbs = buildPotBreadcrumbs(deepPots);
+    expect(crumbs.get('p4')?.depth).toBe(4);
+    expect(crumbs.get('p4')?.pathString).toBe('L0 Home › L1 Kitchen › L2 Dairy › L3 Butter › L4 Salted Kerrygold');
+
+    const sub = collectSubtreePotIds('p1', deepPots);
+    expect(Array.from(sub).sort()).toEqual(['p1', 'p2', 'p3', 'p4']);
+
+    const tree = buildPotRollupTree(deepPots, [], exps, '2026-11', 'GBP', rateMap);
+    expect(tree[0].effectiveTotalDisplayMinor).toBe(50000); // £500 envelope at L1 absorbs £12 spend at L4
+    expect(tree[0].children[0].unallocatedEnvelopeDisplayMinor).toBe(48800);
   });
 });
 

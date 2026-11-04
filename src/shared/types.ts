@@ -1,8 +1,14 @@
 export type CurrencyCode = 'GBP' | 'EUR' | 'PLN' | 'USD' | 'CHF';
 
+export type LocaleCode = 'en' | 'pl';
+
 export type PartnerVisibility = 'private' | 'totals_only' | 'readonly';
 
-export type WorkspaceKind = 'personal' | 'shared';
+export type WorkspaceKind = 'personal' | 'shared' | 'company';
+
+export type WorkspaceRole = 'owner' | 'editor' | 'viewer' | 'totals_only';
+
+export type AuthProviderKind = 'oidc' | 'local' | 'both';
 
 export type CadenceKind =
   | 'once'
@@ -31,16 +37,28 @@ export interface FxRateRecord {
 
 export interface UserProfile {
   id: string;
-  handle: 'wadera' | 'walter';
+  handle: string;
   displayName: string;
   email: string;
   defaultCurrency: CurrencyCode;
   personalWorkspaceId: string;
+  locale: LocaleCode;
+  authProvider: AuthProviderKind;
+  isAdmin: boolean;
+  isActive: boolean;
+}
+
+export interface WorkspaceMemberRecord {
+  workspaceId: string;
+  userId: string;
+  handle: string;
+  displayName: string;
+  role: WorkspaceRole;
 }
 
 export interface WorkspaceRecord {
   id: string;
-  slug: 'ws-wadera' | 'ws-walter' | 'ws-home';
+  slug: string;
   name: string;
   kind: WorkspaceKind;
   ownerUserId: string | null;
@@ -206,7 +224,7 @@ export interface WealthSnapshotRecord {
 export interface AttachmentRecord {
   id: string;
   workspaceId: string;
-  entityType: 'obligation' | 'expense' | 'asset' | 'liability' | 'income';
+  entityType: 'obligation' | 'expense' | 'asset' | 'liability' | 'income' | 'pot';
   entityId: string;
   originalName: string;
   mimeType: string;
@@ -216,4 +234,4 @@ export interface AttachmentRecord {
   createdAt: string;
 }
 
-export type { HorizonProjectionPoint, PotRollupNode } from './financeEngine.js';
+export type { HorizonProjectionPoint, PotBreadcrumbInfo, PotRollupNode } from './financeEngine.js';

@@ -1,6 +1,7 @@
 import type {
   AssetBelongingRecord,
   AttachmentRecord,
+  AuthProviderKind,
   BankAccountRecord,
   CurrencyCode,
   ExpenseEntryRecord,
@@ -8,6 +9,7 @@ import type {
   HorizonProjectionPoint,
   IncomeStreamRecord,
   LiabilityRecord,
+  LocaleCode,
   ObligationRecord,
   PartnerVisibility,
   PaymentOccurrenceRecord,
@@ -15,7 +17,10 @@ import type {
   PotRollupNode,
   SplitMode,
   UserProfile,
+  WorkspaceKind,
+  WorkspaceMemberRecord,
   WorkspaceRecord,
+  WorkspaceRole,
 } from '../shared/types.js';
 
 export interface AuthStatusResponse {
@@ -23,25 +28,44 @@ export interface AuthStatusResponse {
   via: string;
   authMode: 'authentik' | 'dev';
   oidcConfigured: boolean;
+  localLoginEnabled?: boolean;
   loginUrl: string;
   user: {
     id: string;
-    handle: 'wadera' | 'walter';
+    handle: string;
     displayName: string;
     defaultCurrency: CurrencyCode;
+    locale?: LocaleCode;
+    isAdmin?: boolean;
   } | null;
   devUsers?: Array<{ handle: string; displayName: string }>;
 }
 
 export interface WorkspaceWithAccess extends WorkspaceRecord {
+  role: WorkspaceRole | null;
   canReadItems: boolean;
   canWrite: boolean;
+  canManage: boolean;
   includedInFamilyWealth: boolean;
+  members: WorkspaceMemberRecord[];
+}
+
+export interface DirectoryUser {
+  id: string;
+  handle: string;
+  displayName: string;
+  email?: string;
+  personalWorkspaceId: string;
+  authProvider: AuthProviderKind;
+  defaultCurrency: CurrencyCode;
+  locale: LocaleCode;
+  isAdmin: boolean;
+  isActive: boolean;
 }
 
 export interface BootstrapResponse {
   user: UserProfile;
-  users: Array<{ id: string; handle: string; displayName: string; personalWorkspaceId: string }>;
+  users: DirectoryUser[];
   workspaces: WorkspaceWithAccess[];
   fxRates: FxRateRecord[];
   apiKeys: Array<{ id: string; label: string; keyPrefix: string; createdAt: string; lastUsedAt: string | null }>;
@@ -66,17 +90,50 @@ export interface EnrichedObligation extends ObligationRecord {
   preservedDisplayMinor: number;
 }
 
+export type EnrichedExpense = ExpenseEntryRecord & { displayAmountMinor: number };
+
+export interface EnrichedIncome extends IncomeStreamRecord {
+  monthlyDisplayMinor: number;
+  expectedDate: string;
+  isReceivedThisMonth: boolean;
+  receivedAt: string | null;
+}
+
+export interface NextMonthBreakdownItem {
+  id: string;
+  potId: string | null;
+  name: string;
+  color: string;
+  displayMinor: number;
+}
+
+export interface CashflowBridgeData {
+  prevYearMonth: string;
+  nextYearMonth: string;
+  primaryPaydayDay: number;
+  overflowInMinor: number;
+  thisMonthSpendingMinor: number;
+  thisMonthBufferMinor: number;
+  thisMonthShortfallMinor: number;
+  upcomingSalaryTotalMinor: number;
+  upcomingSalaryReceivedMinor: number;
+  upcomingSalaryPendingMinor: number;
+  nextMonthPreSalaryMinor: number;
+  projectedFreeFromUpcomingMinor: number;
+  nextMonthBreakdown: NextMonthBreakdownItem[];
+}
+
 export interface BudgetMonthResponse {
   yearMonth: string;
-  scope: 'all' | 'shared' | 'personal' | 'partner';
+  scope: string;
   displayCurrency: CurrencyCode;
   accounts: BankAccountRecord[];
-  incomes: Array<IncomeStreamRecord & { monthlyDisplayMinor: number }>;
+  incomes: EnrichedIncome[];
   allIncomes: IncomeStreamRecord[];
   pots: PotRecord[];
   potTree: PotRollupNode[];
   obligations: EnrichedObligation[];
-  expenses: ExpenseEntryRecord[];
+  expenses: EnrichedExpense[];
   kpis: {
     totalIncomeMinor: number;
     potPlannedTotalMinor: number;
@@ -88,14 +145,20 @@ export interface BudgetMonthResponse {
     runwayCashMinor: number;
     remainingPaydaysIncomeMinor: number;
     unpaidBillsMinor: number;
+    unpaidPrePaydayBillsMinor: number;
     totalPreserveSliceMinor: number;
     unallocatedEnvelopeRemainingMinor: number;
+    totalNeededBeforePaydayMinor: number;
+    prePaydayBufferMinor: number;
+    currentCashAfterMonthBillsMinor: number;
     totalNeededTillMonthEndMinor: number;
     projectedEndBalanceMinor: number;
+    projectedAfterNextMonthReserveMinor: number;
     shortfallMinor: number;
     isSufficient: boolean;
     dailyCurve: Array<{ day: number; balanceMinor: number; label?: string }>;
   };
+  cashflowBridge: CashflowBridgeData;
   sankey: {
     nodes: Array<{ id: string; name: string; stage: number; color: string }>;
     links: Array<{ source: string; target: string; valueMinor: number }>;
@@ -106,6 +169,7 @@ export interface BudgetMonthResponse {
 export interface WealthOverviewResponse {
   displayCurrency: CurrencyCode;
   horizonYears: number;
+  scope?: string;
   myWealth: {
     totalAssetsMinor: number;
     totalLiabilitiesMinor: number;
@@ -132,6 +196,34 @@ export interface WealthOverviewResponse {
   salaryHistory: IncomeStreamRecord[];
 }
 
+export type QuickAddTarget =
+  | {
+      targetKind: 'pot';
+      potId: string;
+      potName: string;
+      workspaceId: string;
+      currency: CurrencyCode;
+      color: string;
+    }
+  | {
+      targetKind: 'obligation';
+      itemId: string;
+      itemName: string;
+      workspaceId: string;
+      parentPotId: string | null;
+      amountMinor: number;
+      currency: CurrencyCode;
+    }
+  | {
+      targetKind: 'expense';
+      itemId: string;
+      itemName: string;
+      workspaceId: string;
+      parentPotId: string | null;
+      amountMinor: number;
+      currency: CurrencyCode;
+    };
+
 export async function apiFetch<T>(url: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers || {});
   if (init?.body && !(init.body instanceof FormData) && !headers.has('Content-Type')) {
@@ -152,4 +244,4 @@ export async function listAttachmentsApi(entityType: string, entityId: string): 
   return data.attachments;
 }
 
-export type { PartnerVisibility, SplitMode };
+export type { PartnerVisibility, SplitMode, WorkspaceKind, WorkspaceRole };

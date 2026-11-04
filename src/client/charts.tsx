@@ -1,119 +1,750 @@
-import { sankey, sankeyLinkHorizontal } from 'd3-sankey';
-import React from 'react';
+import { ChevronDown, ChevronRight, Plus } from 'lucide-react';
+import { sankey, sankeyLeft, sankeyLinkHorizontal } from 'd3-sankey';
+import React, { useMemo } from 'react';
 import { formatDisplayValue, formatIndexedWealth } from '../shared/currency.js';
-import type { CurrencyCode, HorizonProjectionPoint, PotRollupNode } from '../shared/types.js';
+import { buildPotBreadcrumbs } from '../shared/financeEngine.js';
+import type {
+  CurrencyCode,
+  HorizonProjectionPoint,
+  PotRecord,
+  PotRollupNode,
+} from '../shared/types.js';
+import type {
+  CashflowBridgeData,
+  EnrichedExpense,
+  EnrichedIncome,
+  EnrichedObligation,
+  QuickAddTarget,
+} from './api.js';
+import type { TranslationDict } from './i18n.js';
+
+interface SankeyNodeDatum {
+  id: string;
+  name: string;
+  color: string;
+  displayMinor: number;
+  nodeKind:
+    | 'income'
+    | 'pool'
+    | 'pot'
+    | 'obligation'
+    | 'expense'
+    | 'subitem'
+    | 'envelope'
+    | 'surplus'
+    | 'next_needed'
+    | 'other';
+  canUnfold: boolean;
+  isExpanded: boolean;
+  potRef?: PotRollupNode;
+  obRef?: EnrichedObligation;
+  expRef?: EnrichedExpense;
+  dashed?: boolean;
+}
+
+interface SankeyLinkDatum {
+  source: string;
+  target: string;
+  value: number;
+  dashed?: boolean;
+  strokeColorOverride?: string;
+}
 
 /**
- * 1. Editorial Cashflow Sankey Diagram (Overview Tab)
- * Inspired by clean muted ribbons showing where income comes from and where every % / £ goes.
+ * 1. Interactive Unlimited-Depth Unfoldable Cashflow Sankey Diagram with Smart Two-Track Payday Bridge (Overview Tab)
+ * - Top Track (Solid): Previous Month Overflow -> This Month Pool -> This Month Spending Pots (unfoldable to unlimited depth) + Buffer.
+ * - Bottom Track (Dotted until ticked on Timeline): Upcoming Salary (e.g. 27th) -> Next-Cycle Bridge -> Next Month Needed Before Salary (Dotted Red, unfoldable!) + Free Savings.
+ * - Never merges previous-month overflow + upcoming 27th salary into a fake 2x spendable pool.
  */
 export const CashflowSankeyChart: React.FC<{
-  nodes: Array<{ id: string; name: string; stage: number; color: string }>;
-  links: Array<{ source: string; target: string; valueMinor: number }>;
+  incomes: EnrichedIncome[];
+  cashflowBridge?: CashflowBridgeData;
+  potTree: PotRollupNode[];
+  obligations: EnrichedObligation[];
+  expenses: EnrichedExpense[];
+  totalIncomeMinor: number;
+  potPlannedTotalMinor: number;
+  netMonthlySurplusMinor: number;
   currency: CurrencyCode;
   privacyMode: boolean;
-  referenceIncomeMinor: number;
-}> = ({ nodes, links, currency, privacyMode, referenceIncomeMinor }) => {
-  const validLinks = links.filter((l) => l.valueMinor > 0);
-  if (nodes.length < 2 || validLinks.length === 0) {
+  expandedPotIds: Set<string>;
+  expandedExpenseIds: Set<string>;
+  onTogglePot: (potId: string) => void;
+  onToggleExpense: (expId: string) => void;
+  onQuickAdd: (target: QuickAddTarget) => void;
+  onInspectItem?: (kind: 'obligation' | 'expense', id: string) => void;
+  t: TranslationDict;
+}> = ({
+  incomes,
+  cashflowBridge,
+  potTree,
+  obligations,
+  expenses,
+  totalIncomeMinor,
+  potPlannedTotalMinor,
+  netMonthlySurplusMinor,
+  currency,
+  privacyMode,
+  expandedPotIds,
+  expandedExpenseIds,
+  onTogglePot,
+  onToggleExpense,
+  onQuickAdd,
+  onInspectItem,
+  t,
+}) => {
+  const model = useMemo(() => {
+    const nodes: SankeyNodeDatum[] = [];
+    const links: SankeyLinkDatum[] = [];
+
+    if (totalIncomeMinor <= 0 && potPlannedTotalMinor <= 0 && potTree.length === 0) {
+      return null;
+    }
+
+    const obsByPot = new Map<string | null, EnrichedObligation[]>();
+    for (const ob of obligations) {
+      if (!ob.isActive) continue;
+      const k = ob.potId ?? null;
+      const list = obsByPot.get(k) ?? [];
+      list.push(ob);
+      obsByPot.set(k, list);
+    }
+
+    const expsByPot = new Map<string | null, EnrichedExpense[]>();
+    for (const exp of expenses) {
+      const k = exp.potId ?? null;
+      const list = expsByPot.get(k) ?? [];
+      list.push(exp);
+      expsByPot.set(k, list);
+    }
+
+    // --- TOP TRACK (SOLID): Previous Month Overflow -> This Month Pool -> This Month Spending Pots ---
+    const poolId = 'pool-budget';
+    const overflowMinor =
+      cashflowBridge && cashflowBridge.overflowInMinor > 0
+        ? cashflowBridge.overflowInMinor
+        : totalIncomeMinor;
+    const poolMinor = Math.max(overflowMinor, potPlannedTotalMinor);
+
+    nodes.push({
+      id: poolId,
+      name: t.sankeyPool,
+      color: '#1E293B',
+      displayMinor: poolMinor,
+      nodeKind: 'pool',
+      canUnfold: false,
+      isExpanded: false,
+    });
+
+    if (overflowMinor > 0) {
+      const ovfId = 'inc-prev-overflow';
+      nodes.push({
+        id: ovfId,
+        name: t.sankeyPrevOverflow,
+        color: '#15803D',
+        displayMinor: overflowMinor,
+        nodeKind: 'income',
+        canUnfold: false,
+        isExpanded: false,
+        dashed: false,
+      });
+      links.push({
+        source: ovfId,
+        target: poolId,
+        value: Math.max(1, overflowMinor),
+        dashed: false,
+        strokeColorOverride: '#16A34A',
+      });
+    }
+
+    if (overflowMinor < potPlannedTotalMinor) {
+      const gap = potPlannedTotalMinor - overflowMinor;
+      nodes.push({
+        id: 'inc-drawdown',
+        name: t.sankeyDrawdown,
+        color: '#D97706',
+        displayMinor: gap,
+        nodeKind: 'other',
+        canUnfold: false,
+        isExpanded: false,
+      });
+      links.push({ source: 'inc-drawdown', target: poolId, value: Math.max(1, gap) });
+    } else if (overflowMinor === 0 && potTree.length > 0) {
+      nodes.push({
+        id: 'inc-placeholder',
+        name: t.sankeyPrevOverflow,
+        color: '#94A3B8',
+        displayMinor: 0,
+        nodeKind: 'income',
+        canUnfold: false,
+        isExpanded: false,
+      });
+      links.push({ source: 'inc-placeholder', target: poolId, value: 1 });
+    }
+
+    const visitedPots = new Set<string>();
+
+    const emitPotSubtree = (potNode: PotRollupNode, parentSourceId: string) => {
+      const pid = potNode.pot.id;
+      if (visitedPots.has(pid)) return;
+      visitedPots.add(pid);
+
+      const directObs = (obsByPot.get(pid) ?? []).filter((o) => o.effectiveDisplayMinor > 0);
+      const directExps = (expsByPot.get(pid) ?? []).filter((e) => e.displayAmountMinor > 0);
+      const hasChildrenToUnfold =
+        potNode.children.length > 0 || directObs.length > 0 || directExps.length > 0;
+      const isExpanded = hasChildrenToUnfold && expandedPotIds.has(pid);
+
+      const nodeId = `pot-${pid}`;
+      const valMinor = potNode.effectiveTotalDisplayMinor;
+      const isZeroContainer = valMinor <= 0;
+
+      nodes.push({
+        id: nodeId,
+        name: potNode.pot.name,
+        color: potNode.pot.color || '#2E6F7E',
+        displayMinor: valMinor,
+        nodeKind: 'pot',
+        canUnfold: hasChildrenToUnfold,
+        isExpanded,
+        potRef: potNode,
+        dashed: isZeroContainer,
+      });
+
+      links.push({
+        source: parentSourceId,
+        target: nodeId,
+        value: Math.max(1, valMinor),
+        dashed: isZeroContainer,
+      });
+
+      if (!isExpanded) return;
+
+      // 1. Recursive Child Sub-Pots (unlimited depth)
+      for (const childNode of potNode.children) {
+        emitPotSubtree(childNode, nodeId);
+      }
+
+      // 2. Direct Scheduled Obligations on this pot (each can be promoted into a Pot via '+')
+      for (const ob of directObs) {
+        const obNodeId = `ob-${ob.id}`;
+        nodes.push({
+          id: obNodeId,
+          name: ob.name,
+          color: potNode.pot.color || '#475569',
+          displayMinor: ob.effectiveDisplayMinor,
+          nodeKind: 'obligation',
+          canUnfold: false,
+          isExpanded: false,
+          obRef: ob,
+        });
+        links.push({
+          source: nodeId,
+          target: obNodeId,
+          value: Math.max(1, ob.effectiveDisplayMinor),
+        });
+      }
+
+      // 3. Direct Logged Expenses on this pot (can unfold receipt line-items OR promote into a Pot via '+')
+      for (const exp of directExps) {
+        const expNodeId = `exp-${exp.id}`;
+        const canExpUnfold = exp.items.length > 0;
+        const expExpanded = canExpUnfold && expandedExpenseIds.has(exp.id);
+        nodes.push({
+          id: expNodeId,
+          name: exp.merchant,
+          color: potNode.pot.color || '#0F766E',
+          displayMinor: exp.displayAmountMinor,
+          nodeKind: 'expense',
+          canUnfold: canExpUnfold,
+          isExpanded: expExpanded,
+          expRef: exp,
+        });
+        links.push({
+          source: nodeId,
+          target: expNodeId,
+          value: Math.max(1, exp.displayAmountMinor),
+        });
+
+        if (expExpanded) {
+          exp.items.forEach((sub, idx) => {
+            const subId = `sub-${exp.id}-${idx}`;
+            const subRatio = exp.amountMinor > 0 ? sub.amountMinor / exp.amountMinor : 0;
+            const subDisplay = Math.round(exp.displayAmountMinor * subRatio);
+            nodes.push({
+              id: subId,
+              name: sub.subCategory ? `${sub.name} (${sub.subCategory})` : sub.name,
+              color: potNode.pot.color || '#64748B',
+              displayMinor: subDisplay,
+              nodeKind: 'subitem',
+              canUnfold: false,
+              isExpanded: false,
+            });
+            links.push({
+              source: expNodeId,
+              target: subId,
+              value: Math.max(1, subDisplay),
+            });
+          });
+        }
+      }
+
+      // 4. Remaining Unallocated Rough Envelope (keeps parent ribbon 100% proportional)
+      if (potNode.unallocatedEnvelopeDisplayMinor > 0) {
+        const envId = `env-${pid}`;
+        nodes.push({
+          id: envId,
+          name: t.sankeyRemainingEnv,
+          color: '#94A3B8',
+          displayMinor: potNode.unallocatedEnvelopeDisplayMinor,
+          nodeKind: 'envelope',
+          canUnfold: false,
+          isExpanded: false,
+          dashed: true,
+        });
+        links.push({
+          source: nodeId,
+          target: envId,
+          value: Math.max(1, potNode.unallocatedEnvelopeDisplayMinor),
+          dashed: true,
+        });
+      }
+    };
+
+    for (const rootPot of potTree) {
+      if (rootPot.effectiveTotalDisplayMinor <= 0 && !expandedPotIds.has(rootPot.pot.id) && potTree.some((p) => p.effectiveTotalDisplayMinor > 0)) {
+        // Still render £0 top-level pots if user created one so they can click '+' right away!
+      }
+      emitPotSubtree(rootPot, poolId);
+    }
+
+    // Unassigned obligations & expenses (potId === null)
+    const unassignedObs = (obsByPot.get(null) ?? []).filter((o) => o.effectiveDisplayMinor > 0);
+    const unassignedExps = (expsByPot.get(null) ?? []).filter((e) => e.displayAmountMinor > 0);
+    for (const ob of unassignedObs) {
+      const obNodeId = `ob-${ob.id}`;
+      nodes.push({
+        id: obNodeId,
+        name: ob.name,
+        color: '#64748B',
+        displayMinor: ob.effectiveDisplayMinor,
+        nodeKind: 'obligation',
+        canUnfold: false,
+        isExpanded: false,
+        obRef: ob,
+      });
+      links.push({ source: poolId, target: obNodeId, value: Math.max(1, ob.effectiveDisplayMinor) });
+    }
+    for (const exp of unassignedExps) {
+      const expNodeId = `exp-${exp.id}`;
+      nodes.push({
+        id: expNodeId,
+        name: exp.merchant,
+        color: '#64748B',
+        displayMinor: exp.displayAmountMinor,
+        nodeKind: 'expense',
+        canUnfold: exp.items.length > 0,
+        isExpanded: false,
+        expRef: exp,
+      });
+      links.push({ source: poolId, target: expNodeId, value: Math.max(1, exp.displayAmountMinor) });
+    }
+
+    const topBufferMinor =
+      cashflowBridge != null ? cashflowBridge.thisMonthBufferMinor : Math.max(0, netMonthlySurplusMinor);
+    if (topBufferMinor > 0) {
+      nodes.push({
+        id: 'out-surplus',
+        name: t.sankeyThisMonthBuffer,
+        color: '#10B981',
+        displayMinor: topBufferMinor,
+        nodeKind: 'surplus',
+        canUnfold: false,
+        isExpanded: false,
+      });
+      links.push({ source: poolId, target: 'out-surplus', value: topBufferMinor });
+    }
+
+    // --- BOTTOM TRACK (DOTTED / PAYDAY BRIDGE): Upcoming Salary (27th) -> Next-Cycle Bridge -> Next Month Needed Before Salary ---
+    if (cashflowBridge && cashflowBridge.upcomingSalaryTotalMinor > 0) {
+      const nextPoolId = 'pool-next-cycle';
+      const anyPending = cashflowBridge.upcomingSalaryPendingMinor > 0;
+      const bridgeMinor = Math.max(
+        cashflowBridge.upcomingSalaryTotalMinor,
+        cashflowBridge.nextMonthPreSalaryMinor
+      );
+
+      nodes.push({
+        id: nextPoolId,
+        name: t.sankeyNextCycleBridge,
+        color: '#334155',
+        displayMinor: bridgeMinor,
+        nodeKind: 'pool',
+        canUnfold: false,
+        isExpanded: false,
+        dashed: anyPending,
+      });
+
+      for (const inc of incomes) {
+        if (inc.monthlyDisplayMinor <= 0) continue;
+        if (inc.paydayDay < 12 && inc.isReceivedThisMonth) continue;
+        const nid = `inc-upcoming-${inc.id}`;
+        const pending = !inc.isReceivedThisMonth;
+        nodes.push({
+          id: nid,
+          name: `${pending ? '' : '✓ '}${t.sankeyUpcomingSalary}: ${inc.name} (${inc.paydayDay}.)`,
+          color: pending ? '#16A34A' : '#15803D',
+          displayMinor: inc.monthlyDisplayMinor,
+          nodeKind: 'income',
+          canUnfold: false,
+          isExpanded: false,
+          dashed: pending,
+        });
+        links.push({
+          source: nid,
+          target: nextPoolId,
+          value: Math.max(1, inc.monthlyDisplayMinor),
+          dashed: pending,
+          strokeColorOverride: '#16A34A',
+        });
+      }
+
+      if (cashflowBridge.nextMonthPreSalaryMinor > 0) {
+        const nextNeedId = 'out-next-month-needed';
+        const canUnfoldNext = cashflowBridge.nextMonthBreakdown.length > 0;
+        const isNextExpanded = canUnfoldNext && expandedPotIds.has('__next_month_needed__');
+
+        nodes.push({
+          id: nextNeedId,
+          name: `${t.sankeyNextMonthNeeded} (1–${Math.max(1, cashflowBridge.primaryPaydayDay - 1)}.)`,
+          color: '#DC2626',
+          displayMinor: cashflowBridge.nextMonthPreSalaryMinor,
+          nodeKind: 'next_needed',
+          canUnfold: canUnfoldNext,
+          isExpanded: isNextExpanded,
+          dashed: true,
+        });
+        links.push({
+          source: nextPoolId,
+          target: nextNeedId,
+          value: Math.max(1, cashflowBridge.nextMonthPreSalaryMinor),
+          dashed: true,
+          strokeColorOverride: '#DC2626',
+        });
+
+        if (isNextExpanded) {
+          for (const item of cashflowBridge.nextMonthBreakdown) {
+            nodes.push({
+              id: item.id,
+              name: item.name,
+              color: '#DC2626',
+              displayMinor: item.displayMinor,
+              nodeKind: 'other',
+              canUnfold: false,
+              isExpanded: false,
+              dashed: true,
+            });
+            links.push({
+              source: nextNeedId,
+              target: item.id,
+              value: Math.max(1, item.displayMinor),
+              dashed: true,
+              strokeColorOverride: '#DC2626',
+            });
+          }
+        }
+      }
+
+      if (cashflowBridge.projectedFreeFromUpcomingMinor > 0) {
+        const freeId = 'out-next-cycle-free';
+        nodes.push({
+          id: freeId,
+          name: t.sankeyProjectedFree,
+          color: '#0D9488',
+          displayMinor: cashflowBridge.projectedFreeFromUpcomingMinor,
+          nodeKind: 'surplus',
+          canUnfold: false,
+          isExpanded: false,
+          dashed: anyPending,
+        });
+        links.push({
+          source: nextPoolId,
+          target: freeId,
+          value: Math.max(1, cashflowBridge.projectedFreeFromUpcomingMinor),
+          dashed: anyPending,
+          strokeColorOverride: '#0D9488',
+        });
+      }
+    }
+
+    if (nodes.length < 2 || links.length === 0) return null;
+
+    // Pre-pass to determine column depth & max nodes in any column for collision-free sizing
+    const probeLayout = sankey<SankeyNodeDatum, SankeyLinkDatum>()
+      .nodeId((d) => d.id)
+      .nodeAlign(sankeyLeft)
+      .nodeWidth(10)
+      .nodePadding(28)
+      .extent([
+        [10, 16],
+        [660, 280],
+      ]);
+
+    const probed = probeLayout({
+      nodes: nodes.map((n) => ({ ...n })),
+      links: links.map((l) => ({ ...l })),
+    });
+
+    const colCounts = new Map<number, number>();
+    let maxDepth = 2;
+    for (const nd of probed.nodes) {
+      const d = nd.depth ?? 0;
+      maxDepth = Math.max(maxDepth, d);
+      colCounts.set(d, (colCounts.get(d) ?? 0) + 1);
+    }
+    const maxNodesInCol = Math.max(3, ...Array.from(colCounts.values()));
+    const numCols = maxDepth + 1;
+
+    const width = numCols <= 3 ? 860 : Math.max(860, numCols * 255 + 95);
+    const height = Math.max(295, maxNodesInCol * 46 + 34);
+    const rightMargin = 205;
+
+    const finalLayout = sankey<SankeyNodeDatum, SankeyLinkDatum>()
+      .nodeId((d) => d.id)
+      .nodeAlign(sankeyLeft)
+      .nodeWidth(10)
+      .nodePadding(28)
+      .extent([
+        [12, 18],
+        [width - rightMargin, height - 18],
+      ]);
+
+    const graph = finalLayout({
+      nodes: nodes.map((n) => ({ ...n })),
+      links: links.map((l) => ({ ...l })),
+    });
+
+    return { graph, width, height, numCols, maxDepth };
+  }, [
+    incomes,
+    cashflowBridge,
+    potTree,
+    obligations,
+    expenses,
+    totalIncomeMinor,
+    potPlannedTotalMinor,
+    netMonthlySurplusMinor,
+    expandedPotIds,
+    expandedExpenseIds,
+    t,
+  ]);
+
+  if (!model) {
     return (
-      <div className="h-56 flex items-center justify-center text-sm text-slate-400 font-mono-num">
-        Add an income stream or pot budget to render cashflow routing.
+      <div className="h-52 flex items-center justify-center text-sm text-slate-400 font-mono-num">
+        {t.sankeyEmpty}
       </div>
     );
   }
 
-  const width = 820;
-  const height = 270;
-
-  const layout = sankey<
-    { id: string; name: string; color: string },
-    { source: string; target: string; value: number }
-  >()
-    .nodeId((d) => d.id)
-    .nodeWidth(10)
-    .nodePadding(16)
-    .extent([
-      [12, 14],
-      [width - 175, height - 14],
-    ]);
-
-  const graph = layout({
-    nodes: nodes.map((n) => ({ ...n })),
-    links: validLinks.map((l) => ({
-      source: l.source,
-      target: l.target,
-      value: l.valueMinor,
-    })),
-  });
-
+  const { graph, width, height, numCols, maxDepth } = model;
   const pathGen = sankeyLinkHorizontal();
-  const denom = referenceIncomeMinor > 0 ? referenceIncomeMinor : validLinks.reduce((s, l) => s + l.valueMinor, 0);
+  const denom = totalIncomeMinor > 0 ? totalIncomeMinor : Math.max(1, potPlannedTotalMinor);
+
+  const triggerQuickAddForNode = (node: SankeyNodeDatum) => {
+    if (node.nodeKind === 'pot' && node.potRef) {
+      onQuickAdd({
+        targetKind: 'pot',
+        potId: node.potRef.pot.id,
+        potName: node.potRef.pot.name,
+        workspaceId: node.potRef.pot.workspaceId,
+        currency: node.potRef.pot.currency,
+        color: node.potRef.pot.color,
+      });
+    } else if (node.nodeKind === 'obligation' && node.obRef) {
+      onQuickAdd({
+        targetKind: 'obligation',
+        itemId: node.obRef.id,
+        itemName: node.obRef.name,
+        workspaceId: node.obRef.workspaceId,
+        parentPotId: node.obRef.potId,
+        amountMinor: node.obRef.amountMinor,
+        currency: node.obRef.currency,
+      });
+    } else if (node.nodeKind === 'expense' && node.expRef) {
+      onQuickAdd({
+        targetKind: 'expense',
+        itemId: node.expRef.id,
+        itemName: node.expRef.merchant,
+        workspaceId: node.expRef.workspaceId,
+        parentPotId: node.expRef.potId,
+        amountMinor: node.expRef.amountMinor,
+        currency: node.expRef.currency,
+      });
+    }
+  };
+
+  const handleNodeLabelClick = (node: SankeyNodeDatum) => {
+    if (node.nodeKind === 'next_needed' && node.canUnfold) {
+      onTogglePot('__next_month_needed__');
+    } else if (node.nodeKind === 'pot' && node.potRef) {
+      if (node.canUnfold) {
+        onTogglePot(node.potRef.pot.id);
+      } else {
+        // Clicking an empty leaf pot opens Quick Add directly so user can start nesting inside it!
+        triggerQuickAddForNode(node);
+      }
+    } else if (node.nodeKind === 'expense' && node.expRef) {
+      if (node.canUnfold) {
+        onToggleExpense(node.expRef.id);
+      } else if (onInspectItem) {
+        onInspectItem('expense', node.expRef.id);
+      }
+    } else if (node.nodeKind === 'obligation' && node.obRef && onInspectItem) {
+      onInspectItem('obligation', node.obRef.id);
+    }
+  };
 
   return (
-    <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-auto overflow-visible select-none">
-      <g fill="none">
-        {graph.links.map((link, idx) => {
-          const d = pathGen(link as never) || '';
-          const srcNode = link.source as { color?: string };
-          const tgtNode = link.target as { color?: string; name?: string };
-          const strokeColor = tgtNode.color && tgtNode.color !== '#334155' ? tgtNode.color : srcNode.color || '#64748B';
-          return (
-            <path
-              key={idx}
-              d={d}
-              stroke={strokeColor}
-              strokeOpacity={0.26}
-              strokeWidth={Math.max(2, link.width || 2)}
-              className="transition-opacity hover:stroke-opacity-50"
-            />
-          );
-        })}
-      </g>
-      <g>
-        {graph.nodes.map((node) => {
-          const x0 = node.x0 ?? 0;
-          const x1 = node.x1 ?? 0;
-          const y0 = node.y0 ?? 0;
-          const y1 = node.y1 ?? 0;
-          const val = node.value ?? 0;
-          const pct = denom > 0 ? ((val / denom) * 100).toFixed(0) : '0';
-          const isRight = x0 > width * 0.45;
-          const labelValue = privacyMode
-            ? `${pct}%`
-            : `${formatDisplayValue(val, { currency, privacyMode: false, compact: true })} · ${pct}%`;
+    <div className="w-full overflow-x-auto pb-1">
+      <div
+        className="relative select-none"
+        style={{
+          minWidth: numCols > 3 ? `${width}px` : undefined,
+        }}
+      >
+        <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-auto block overflow-visible">
+          <g fill="none">
+            {graph.links.map((link, idx) => {
+              const d = pathGen(link as never) || '';
+              const srcNode = link.source as SankeyNodeDatum;
+              const tgtNode = link.target as SankeyNodeDatum;
+              const customStroke = (link as SankeyLinkDatum).strokeColorOverride;
+              const strokeColor =
+                customStroke ||
+                (tgtNode.color && tgtNode.color !== '#334155' && tgtNode.color !== '#1E293B'
+                  ? tgtNode.color
+                  : srcNode.color || '#64748B');
+              const isDashed = Boolean((link as SankeyLinkDatum).dashed);
+              return (
+                <path
+                  key={idx}
+                  d={d}
+                  stroke={strokeColor}
+                  strokeOpacity={isDashed ? 0.55 : 0.26}
+                  strokeDasharray={isDashed ? '7 5' : undefined}
+                  strokeLinecap={isDashed ? 'round' : undefined}
+                  strokeWidth={isDashed ? Math.max(2.5, (link.width || 3) * 0.7) : Math.max(2, link.width || 2)}
+                  className="transition-opacity hover:stroke-opacity-70"
+                />
+              );
+            })}
+          </g>
+          <g>
+            {graph.nodes.map((node) => {
+              const x0 = node.x0 ?? 0;
+              const x1 = node.x1 ?? 0;
+              const y0 = node.y0 ?? 0;
+              const y1 = node.y1 ?? 0;
+              const interactive =
+                node.nodeKind === 'pot' ||
+                node.nodeKind === 'obligation' ||
+                node.nodeKind === 'expense' ||
+                node.nodeKind === 'next_needed';
+              return (
+                <rect
+                  key={node.id}
+                  x={x0}
+                  y={y0}
+                  width={Math.max(7, x1 - x0)}
+                  height={Math.max(5, y1 - y0)}
+                  rx={2}
+                  fill={node.color || '#334155'}
+                  fillOpacity={node.dashed ? 0.45 : 1}
+                  onClick={() => interactive && handleNodeLabelClick(node)}
+                  className={interactive ? 'cursor-pointer hover:opacity-80 transition-opacity' : ''}
+                />
+              );
+            })}
+          </g>
+        </svg>
 
-          return (
-            <g key={node.id}>
-              <rect
-                x={x0}
-                y={y0}
-                width={Math.max(6, x1 - x0)}
-                height={Math.max(4, y1 - y0)}
-                rx={2}
-                fill={node.color || '#334155'}
-              />
-              <text
-                x={isRight ? x1 + 8 : x0 + 14}
-                y={(y0 + y1) / 2 - 2}
-                className="fill-slate-800 text-[11px] font-medium"
-                dominantBaseline="middle"
+        {/* Precision HTML Label + Unfold Chevron + Quick '+' Overlay anchored to exact viewBox % */}
+        <div className="pointer-events-none absolute inset-0">
+          {graph.nodes.map((node) => {
+            const x1 = node.x1 ?? 0;
+            const y0 = node.y0 ?? 0;
+            const y1 = node.y1 ?? 0;
+            const cy = (y0 + y1) / 2;
+            const depth = node.depth ?? 0;
+            const pctVal = denom > 0 ? ((node.displayMinor / denom) * 100).toFixed(0) : '0';
+            const valueText = privacyMode
+              ? `${pctVal}%`
+              : `${formatDisplayValue(node.displayMinor, { currency, privacyMode: false, compact: true })} · ${pctVal}%`;
+
+            const canAddInside =
+              node.nodeKind === 'pot' || node.nodeKind === 'obligation' || node.nodeKind === 'expense';
+            const isClickableLabel =
+              canAddInside ||
+              node.nodeKind === 'next_needed' ||
+              (node.nodeKind === 'expense' && node.canUnfold);
+
+            const colMaxWidthPx = depth >= maxDepth ? 192 : 178;
+
+            return (
+              <div
+                key={`lbl-${node.id}`}
+                style={{
+                  left: `${((x1 + 7) / width) * 100}%`,
+                  top: `${(cy / height) * 100}%`,
+                  maxWidth: `${colMaxWidthPx}px`,
+                }}
+                className="pointer-events-auto absolute -translate-y-1/2 flex flex-col leading-tight group"
               >
-                {node.name}
-              </text>
-              <text
-                x={isRight ? x1 + 8 : x0 + 14}
-                y={(y0 + y1) / 2 + 11}
-                className="fill-slate-500 text-[10px] font-mono-num"
-                dominantBaseline="middle"
-              >
-                {labelValue}
-              </text>
-            </g>
-          );
-        })}
-      </g>
-    </svg>
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={() => handleNodeLabelClick(node)}
+                    className={`inline-flex items-center gap-0.5 text-left text-[11px] font-medium text-slate-800 truncate ${
+                      isClickableLabel ? 'cursor-pointer hover:text-teal-800' : 'cursor-default'
+                    }`}
+                    title={node.name}
+                  >
+                    {node.canUnfold &&
+                      (node.isExpanded ? (
+                        <ChevronDown className="w-3 h-3 shrink-0 text-teal-700" />
+                      ) : (
+                        <ChevronRight className="w-3 h-3 shrink-0 text-slate-400 group-hover:text-teal-700" />
+                      ))}
+                    <span className="truncate">{node.name}</span>
+                  </button>
+
+                  {canAddInside && (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        triggerQuickAddForNode(node);
+                      }}
+                      title={node.nodeKind === 'pot' ? t.qaTooltipPot : t.qaTooltipPromote}
+                      className={`shrink-0 inline-flex items-center justify-center w-4 h-4 rounded border transition ${
+                        node.nodeKind === 'pot'
+                          ? 'border-teal-600/40 bg-white/90 text-teal-700 hover:bg-teal-700 hover:text-white hover:border-teal-700'
+                          : 'border-slate-300/80 bg-white/85 text-slate-500 opacity-75 group-hover:opacity-100 hover:bg-teal-700 hover:text-white hover:border-teal-700'
+                      }`}
+                    >
+                      <Plus className="w-2.5 h-2.5 stroke-[2.5]" />
+                    </button>
+                  )}
+                </div>
+
+                <span className="text-[10px] font-mono-num text-slate-500 truncate pl-0.5">{valueText}</span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
   );
 };
 
@@ -166,7 +797,8 @@ export const DailyRunwayChart: React.FC<{
   curve: Array<{ day: number; balanceMinor: number; label?: string }>;
   currency: CurrencyCode;
   privacyMode: boolean;
-}> = ({ curve, currency, privacyMode }) => {
+  t: TranslationDict;
+}> = ({ curve, currency, privacyMode, t }) => {
   if (!curve.length) return null;
   const width = 760;
   const height = 150;
@@ -188,7 +820,6 @@ export const DailyRunwayChart: React.FC<{
 
   return (
     <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-auto">
-      {/* Zero overdraft threshold line */}
       <line
         x1={padX}
         x2={width - padX}
@@ -208,13 +839,13 @@ export const DailyRunwayChart: React.FC<{
         ) : null
       )}
       <text x={padX} y={12} className="fill-slate-500 text-[10px] font-mono-num">
-        Day 1:{' '}
+        {t.day1}:{' '}
         {privacyMode
           ? '100%'
           : formatDisplayValue(curve[0].balanceMinor, { currency, privacyMode: false, compact: true })}
       </text>
       <text x={width - padX} y={12} textAnchor="end" className="fill-slate-600 text-[10px] font-mono-num">
-        End of Month:{' '}
+        {t.endOfMonth}:{' '}
         {formatDisplayValue(curve[curve.length - 1].balanceMinor, {
           currency,
           privacyMode,
@@ -227,83 +858,201 @@ export const DailyRunwayChart: React.FC<{
 };
 
 /**
- * 4. Proportional Nested Pot Strip & Drilldown Visualization (Pots Tab)
+ * 4. Proportional Nested Pot Strip & Infinite-Depth Breadcrumb Drilldown (Pots Tab)
  */
 export const PotProportionStrip: React.FC<{
   nodes: PotRollupNode[];
+  pots: PotRecord[];
+  obligations: EnrichedObligation[];
+  expenses: EnrichedExpense[];
   currency: CurrencyCode;
   privacyMode: boolean;
   selectedPotId: string | null;
   onSelectPot: (id: string | null) => void;
-}> = ({ nodes, currency, privacyMode, selectedPotId, onSelectPot }) => {
-  const active = nodes.filter((n) => n.effectiveTotalDisplayMinor > 0);
-  const total = active.reduce((s, n) => s + n.effectiveTotalDisplayMinor, 0);
-  if (!active.length || total <= 0) {
-    return <div className="text-xs text-slate-400 font-mono-num">No pot allocations in this scope.</div>;
-  }
+  t: TranslationDict;
+}> = ({ nodes, pots, obligations, expenses, currency, privacyMode, selectedPotId, onSelectPot, t }) => {
+  const crumbsMap = useMemo(() => buildPotBreadcrumbs(pots), [pots]);
+
+  // Locate selected PotRollupNode at arbitrary depth
+  const focusedNode = useMemo(() => {
+    if (!selectedPotId) return null;
+    const findRec = (list: PotRollupNode[]): PotRollupNode | null => {
+      for (const n of list) {
+        if (n.pot.id === selectedPotId) return n;
+        const found = findRec(n.children);
+        if (found) return found;
+      }
+      return null;
+    };
+    return findRec(nodes);
+  }, [nodes, selectedPotId]);
+
+  const segments = useMemo(() => {
+    if (!focusedNode) {
+      return nodes
+        .filter((n) => n.effectiveTotalDisplayMinor > 0)
+        .map((n) => ({
+          id: n.pot.id,
+          name: n.pot.name,
+          color: n.pot.color || '#2E6F7E',
+          valueMinor: n.effectiveTotalDisplayMinor,
+          selectablePotId: n.pot.id as string | null,
+        }));
+    }
+
+    const parts: Array<{
+      id: string;
+      name: string;
+      color: string;
+      valueMinor: number;
+      selectablePotId: string | null;
+    }> = [];
+
+    for (const ch of focusedNode.children) {
+      if (ch.effectiveTotalDisplayMinor > 0) {
+        parts.push({
+          id: ch.pot.id,
+          name: ch.pot.name,
+          color: ch.pot.color || focusedNode.pot.color || '#2E6F7E',
+          valueMinor: ch.effectiveTotalDisplayMinor,
+          selectablePotId: ch.pot.id,
+        });
+      }
+    }
+
+    for (const ob of obligations) {
+      if (ob.isActive && ob.potId === focusedNode.pot.id && ob.effectiveDisplayMinor > 0) {
+        parts.push({
+          id: `ob-${ob.id}`,
+          name: ob.name,
+          color: '#475569',
+          valueMinor: ob.effectiveDisplayMinor,
+          selectablePotId: null,
+        });
+      }
+    }
+
+    for (const exp of expenses) {
+      if (exp.potId === focusedNode.pot.id && exp.displayAmountMinor > 0) {
+        parts.push({
+          id: `exp-${exp.id}`,
+          name: exp.merchant,
+          color: '#0F766E',
+          valueMinor: exp.displayAmountMinor,
+          selectablePotId: null,
+        });
+      }
+    }
+
+    if (focusedNode.unallocatedEnvelopeDisplayMinor > 0) {
+      parts.push({
+        id: `env-${focusedNode.pot.id}`,
+        name: t.sankeyRemainingEnv,
+        color: '#94A3B8',
+        valueMinor: focusedNode.unallocatedEnvelopeDisplayMinor,
+        selectablePotId: null,
+      });
+    }
+
+    return parts;
+  }, [focusedNode, nodes, obligations, expenses, t]);
+
+  const total = segments.reduce((s, seg) => s + seg.valueMinor, 0);
+  const selectedCrumb = selectedPotId ? crumbsMap.get(selectedPotId) : null;
 
   return (
     <div className="space-y-3">
-      <div className="flex h-7 w-full overflow-hidden rounded-md border border-slate-200 bg-slate-100">
-        {active.map((n) => {
-          const pct = (n.effectiveTotalDisplayMinor / total) * 100;
-          const isSel = selectedPotId === n.pot.id;
-          return (
-            <button
-              key={n.pot.id}
-              type="button"
-              onClick={() => onSelectPot(isSel ? null : n.pot.id)}
-              style={{ width: `${Math.max(2, pct)}%`, backgroundColor: n.pot.color || '#2E6F7E' }}
-              className={`h-full transition-opacity hover:opacity-90 border-r border-white/40 ${
-                selectedPotId && !isSel ? 'opacity-45' : 'opacity-90'
-              }`}
-              title={`${n.pot.name}: ${pct.toFixed(1)}%`}
-            />
-          );
-        })}
-      </div>
-      <div className="flex flex-wrap gap-2">
-        {active.map((n) => {
-          const isSel = selectedPotId === n.pot.id;
-          return (
-            <button
-              key={n.pot.id}
-              type="button"
-              onClick={() => onSelectPot(isSel ? null : n.pot.id)}
-              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded border text-xs transition ${
-                isSel
-                  ? 'border-slate-800 bg-slate-800 text-white'
-                  : 'border-slate-200 bg-white text-slate-700 hover:border-slate-300'
-              }`}
-            >
-              <span className="w-2 h-2 rounded-full" style={{ backgroundColor: n.pot.color }} />
-              <span>{n.pot.name}</span>
-              <span className={`font-mono-num ${isSel ? 'text-slate-200' : 'text-slate-500'}`}>
-                {formatDisplayValue(n.effectiveTotalDisplayMinor, {
-                  currency,
-                  privacyMode,
-                  referenceTotalMinor: total,
-                  compact: true,
-                })}
-              </span>
-            </button>
-          );
-        })}
-      </div>
+      {/* Infinite-Depth Breadcrumb Bar */}
+      {selectedCrumb && (
+        <div className="flex flex-wrap items-center gap-1 text-xs font-mono-num text-slate-500">
+          <button
+            type="button"
+            onClick={() => onSelectPot(null)}
+            className="text-teal-700 hover:underline font-medium"
+          >
+            {t.allPotsCrumb}
+          </button>
+          {selectedCrumb.ancestorIds.map((ancId, idx) => {
+            const label = selectedCrumb.pathNames[idx];
+            const isLast = idx === selectedCrumb.ancestorIds.length - 1;
+            return (
+              <React.Fragment key={ancId}>
+                <span className="text-slate-300">/</span>
+                <button
+                  type="button"
+                  onClick={() => onSelectPot(ancId)}
+                  className={isLast ? 'font-semibold text-slate-900' : 'text-teal-700 hover:underline'}
+                >
+                  {label}
+                </button>
+              </React.Fragment>
+            );
+          })}
+        </div>
+      )}
+
+      {!segments.length || total <= 0 ? (
+        <div className="text-xs text-slate-400 font-mono-num">{t.sankeyEmpty}</div>
+      ) : (
+        <>
+          <div className="flex h-7 w-full overflow-hidden rounded-md border border-slate-200 bg-slate-100">
+            {segments.map((seg) => {
+              const pct = (seg.valueMinor / total) * 100;
+              return (
+                <button
+                  key={seg.id}
+                  type="button"
+                  onClick={() => seg.selectablePotId && onSelectPot(seg.selectablePotId)}
+                  style={{ width: `${Math.max(2, pct)}%`, backgroundColor: seg.color }}
+                  className={`h-full transition-opacity hover:opacity-95 border-r border-white/40 ${
+                    seg.selectablePotId ? 'cursor-pointer opacity-90' : 'cursor-default opacity-80'
+                  }`}
+                  title={`${seg.name}: ${pct.toFixed(1)}%`}
+                />
+              );
+            })}
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {segments.map((seg) => (
+              <button
+                key={seg.id}
+                type="button"
+                onClick={() => seg.selectablePotId && onSelectPot(seg.selectablePotId)}
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded border text-xs transition ${
+                  seg.selectablePotId
+                    ? 'border-slate-200 bg-white text-slate-700 hover:border-teal-600 cursor-pointer'
+                    : 'border-slate-100 bg-slate-50 text-slate-600 cursor-default'
+                }`}
+              >
+                <span className="w-2 h-2 rounded-full" style={{ backgroundColor: seg.color }} />
+                <span>{seg.name}</span>
+                <span className="font-mono-num text-slate-500">
+                  {formatDisplayValue(seg.valueMinor, {
+                    currency,
+                    privacyMode,
+                    referenceTotalMinor: total,
+                    compact: true,
+                  })}
+                </span>
+              </button>
+            ))}
+          </div>
+        </>
+      )}
     </div>
   );
 };
 
 /**
  * 5. Long-Horizon Wealth & Belongings Forecast Chart (Wealth Tab)
- * Shows Historical Trajectory + Future 5..20Y Net Worth, Property Appreciation, Belongings Depreciation & Debt Paydown.
  */
 export const WealthHorizonChart: React.FC<{
   history: Array<{ date: string; netWorthMinor: number }>;
   projection: HorizonProjectionPoint[];
   currency: CurrencyCode;
   privacyMode: boolean;
-}> = ({ history, projection, currency, privacyMode }) => {
+  t: TranslationDict;
+}> = ({ history, projection, currency, privacyMode, t }) => {
   if (!projection.length) return null;
   const width = 800;
   const height = 230;
@@ -327,10 +1076,7 @@ export const WealthHorizonChart: React.FC<{
     isHistory: false,
   }));
 
-  const combined = [
-    ...histPoints.filter((h) => h.year < projPoints[0].year),
-    ...projPoints,
-  ];
+  const combined = [...histPoints.filter((h) => h.year < projPoints[0].year), ...projPoints];
 
   const minYear = combined[0].year;
   const maxYear = combined[combined.length - 1].year;
@@ -364,9 +1110,7 @@ export const WealthHorizonChart: React.FC<{
 
   return (
     <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-auto select-none">
-      {/* Zero axis */}
       <line x1={padX} x2={width - padX} y1={zeroY} y2={zeroY} stroke="#CBD5E1" strokeWidth={1} />
-      {/* Today divider */}
       <line
         x1={nowX}
         x2={nowX}
@@ -377,14 +1121,12 @@ export const WealthHorizonChart: React.FC<{
         strokeOpacity={0.5}
       />
       <text x={nowX + 5} y={padY + 4} className="fill-slate-500 text-[10px] font-mono-num">
-        Now ({projPoints[0].year})
+        {t.nowLabel} ({projPoints[0].year})
       </text>
 
-      {/* Net worth area & curve */}
       <polygon points={nwArea} fill="#1E5F74" fillOpacity={0.12} />
       <polyline fill="none" stroke="#1E5F74" strokeWidth={2.4} points={nwLine} />
 
-      {/* Debt amortization curve below zero */}
       {projPoints.some((p) => p.liabilitiesMinor > 0) && (
         <polyline
           fill="none"
@@ -396,7 +1138,6 @@ export const WealthHorizonChart: React.FC<{
         />
       )}
 
-      {/* Key milestone dots */}
       {[combined[0], projPoints[0], projPoints[projPoints.length - 1]].map((pt, i) => (
         <g key={`${pt.year}-${i}`}>
           <circle cx={toX(pt.year)} cy={toY(pt.netWorthMinor)} r={3.5} fill="#1E5F74" />

@@ -5,6 +5,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { buildRateMap, convertMinor } from '../shared/currency.js';
 import {
   applyObligationPaymentReset,
+  buildPotBreadcrumbs,
   buildPotRollupTree,
   computeMonthlyIncomeMinor,
   computeObligationMonthMetrics,
@@ -24,11 +25,31 @@ const MCP_TOOLS = [
   {
     name: 'list_pots',
     description:
-      'List all accessible spending pots (including nested sub-pots like Home & Utilities -> Food & Groceries -> Butcher & Meat) so receipts can be categorized accurately.',
+      'List all accessible spending pots (including unlimited-depth nested sub-pots with full breadcrumb paths like Home & Utilities › Food & Groceries › Butcher & Meat) so receipts can be categorized accurately.',
     inputSchema: {
       type: 'object',
       properties: {
-        scope: { type: 'string', enum: ['all', 'shared', 'personal'], default: 'all' },
+        scope: {
+          type: 'string',
+          description: "all, shared, personal, company, or a specific workspaceId (e.g. ws-home, ws-company-a)",
+          default: 'all',
+        },
+      },
+    },
+  },
+  {
+    name: 'create_pot',
+    description:
+      'Create a new spending pot or nested sub-pot at any depth under parentId, with optional rough monthly envelope estimate.',
+    inputSchema: {
+      type: 'object',
+      required: ['name'],
+      properties: {
+        workspaceId: { type: 'string', description: 'ws-home, ws-wadera, or ws-walter (inherits from parentId if omitted)' },
+        parentId: { type: 'string', description: 'Optional parent pot ID for unlimited nesting' },
+        name: { type: 'string' },
+        monthlyEstimateMajor: { type: 'number', description: 'Optional rough monthly envelope amount (0 for pure container)' },
+        currency: { type: 'string', enum: ['GBP', 'EUR', 'PLN', 'USD', 'CHF'] },
       },
     },
   },
@@ -157,9 +178,47 @@ function executeSingleRpc(
     if (params.name === 'list_pots') {
       const scope = (toolArgs.scope as 'all' | 'shared' | 'personal') || 'all';
       const wsIds = store.readableWorkspaceIds(user.id, scope);
-      const pots = store.listPots(wsIds);
+      const rawPots = store.listPots(wsIds);
+      const crumbs = buildPotBreadcrumbs(rawPots);
+      const pots = rawPots.map((p) => {
+        const c = crumbs.get(p.id);
+        return {
+          ...p,
+          path: c?.pathString ?? p.name,
+          depth: c?.depth ?? 0,
+        };
+      });
       return ok({
         content: [{ type: 'text', text: JSON.stringify({ workspaces: wsIds, pots }, null, 2) }],
+      });
+    }
+
+    if (params.name === 'create_pot') {
+      const parentId = toolArgs.parentId ? String(toolArgs.parentId) : null;
+      const parentRow = parentId
+        ? (store.db
+            .prepare(`SELECT workspace_id, color FROM pots WHERE id = ?`)
+            .get(parentId) as { workspace_id: string; color: string } | undefined)
+        : undefined;
+      if (parentId && !parentRow) {
+        return err(-32602, `Parent pot ${parentId} not found`);
+      }
+      const wsId = String(toolArgs.workspaceId || parentRow?.workspace_id || 'ws-home');
+      if (!store.canWriteWorkspace(user.id, wsId)) {
+        return err(-32001, `Write denied for workspace ${wsId}`);
+      }
+      const id = `pot-${crypto.randomUUID().slice(0, 8)}`;
+      const estMinor = Math.max(0, Math.round(Number(toolArgs.monthlyEstimateMajor || 0) * 100));
+      const cur = ((toolArgs.currency as CurrencyCode) || user.defaultCurrency) as CurrencyCode;
+      const name = String(toolArgs.name || 'New Pot').trim();
+      store.db
+        .prepare(
+          `INSERT INTO pots (id, workspace_id, parent_id, name, icon, color, envelope_mode, monthly_estimate_minor, currency, tags_json, sort_order)
+           VALUES (?, ?, ?, ?, 'folder', ?, ?, ?, ?, '[]', 10)`
+        )
+        .run(id, wsId, parentId, name, parentRow?.color || '#2E6F7E', estMinor > 0 ? 1 : 0, estMinor, cur);
+      return ok({
+        content: [{ type: 'text', text: JSON.stringify({ ok: true, potId: id, parentId, workspaceId: wsId, name }) }],
       });
     }
 

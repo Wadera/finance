@@ -1,6 +1,8 @@
 import {
+  Building2,
   Check,
   CheckCircle2,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   Circle,
@@ -11,8 +13,10 @@ import {
   EyeOff,
   FileText,
   FolderTree,
+  Globe,
   KeyRound,
   Landmark,
+  Lock,
   LogOut,
   Paperclip,
   PiggyBank,
@@ -24,22 +28,31 @@ import {
   TrendingDown,
   TrendingUp,
   Upload,
+  UserPlus,
+  Users,
   X,
 } from 'lucide-react';
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { CURRENCY_SYMBOLS, formatDisplayValue, formatIndexedWealth } from '../shared/currency.js';
+import { buildPotBreadcrumbs, collectSubtreePotIds } from '../shared/financeEngine.js';
 import type {
   AttachmentRecord,
   CurrencyCode,
+  LocaleCode,
   PartnerVisibility,
   PotRollupNode,
   SplitMode,
+  WorkspaceKind,
+  WorkspaceRole,
 } from '../shared/types.js';
 import {
   type AuthStatusResponse,
   type BootstrapResponse,
   type BudgetMonthResponse,
+  type EnrichedExpense,
+  type EnrichedIncome,
   type EnrichedObligation,
+  type QuickAddTarget,
   type WealthOverviewResponse,
   apiFetch,
   listAttachmentsApi,
@@ -51,21 +64,24 @@ import {
   SixMonthTrendChart,
   WealthHorizonChart,
 } from './charts.js';
+import { I18N } from './i18n.js';
+import { QuickAddInline } from './QuickAddInline.js';
 
 type TabKey = 'overview' | 'timeline' | 'pots' | 'wealth' | 'settings';
 
 type ModalKind =
   | null
-  | { kind: 'obligation' }
-  | { kind: 'expense' }
-  | { kind: 'pot' }
+  | { kind: 'obligation'; defaultPotId?: string | null }
+  | { kind: 'expense'; defaultPotId?: string | null }
+  | { kind: 'pot'; defaultParentId?: string | null }
   | { kind: 'income' }
   | { kind: 'account' }
   | { kind: 'asset' }
-  | { kind: 'liability' };
+  | { kind: 'liability' }
+  | { kind: 'workspace' };
 
 interface DrawerSubject {
-  entityType: 'obligation' | 'expense' | 'asset' | 'liability';
+  entityType: 'obligation' | 'expense' | 'asset' | 'liability' | 'pot';
   entityId: string;
   workspaceId: string;
   title: string;
@@ -82,7 +98,7 @@ function shiftMonth(ym: string, delta: number): string {
   const [y, m] = ym.split('-').map(Number);
   const total = y * 12 + (m - 1) + delta;
   const ny = Math.floor(total / 12);
-  const nm = (total % 12) + 1;
+  const nm = ((total % 12) + 12) % 12 + 1;
   return `${ny}-${String(nm).padStart(2, '0')}`;
 }
 
@@ -95,19 +111,18 @@ function buildAgentBootstrapPrompt(params: {
 }): string {
   const mcpUrl = `${params.origin}/api/mcp`;
   const attachUrl = `${params.origin}/api/attachments`;
-  return `Connect to my **Skyday Finance & Budget** MCP server so you can read my spending pots, check monthly budgets, categorize receipt photos/invoices, and tick scheduled bills as paid.
+  return `Connect to my **Skyday Finance & Budget** MCP server so you can read my nested spending pots, check monthly budgets, categorize receipt photos/invoices, and tick scheduled bills as paid.
 
 ### 1. Connection & Credentials
 - **MCP Endpoint (Streamable HTTP / JSON-RPC 2.0 \`POST\`):** \`${mcpUrl}\`
 - **Attachment Upload Endpoint (Multipart \`POST\`):** \`${attachUrl}\`
 - **Authorization Header:** \`Authorization: Bearer ${params.token}\`
 - **Authenticated Account:** ${params.displayName} (Default currency: \`${params.defaultCurrency}\`)
-- **Workspaces:** \`ws-home\` (Shared Household) and \`${params.personalWorkspaceId}\` (${params.displayName} Personal)
+- **Primary Workspaces:** \`ws-home\` (Shared Household) and \`${params.personalWorkspaceId}\` (${params.displayName} Personal)
 
 > Security rule: Store this Bearer token in your secret file or local \`mcp_config.json\` (mode 0600); never commit it to Git or echo it into public reports.
 
 ### 2. Register in \`mcp_config.json\`
-If your client supports Streamable HTTP MCP with headers:
 \`\`\`json
 {
   "mcpServers": {
@@ -120,39 +135,12 @@ If your client supports Streamable HTTP MCP with headers:
   }
 }
 \`\`\`
-*(If your MCP host uses Stdio without custom HTTP header support, use \`mcp-remote\`):*
-\`\`\`json
-{
-  "mcpServers": {
-    "skyday-finance": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "mcp-remote",
-        "${mcpUrl}",
-        "--header",
-        "Authorization: Bearer ${params.token}"
-      ]
-    }
-  }
-}
-\`\`\`
 
-### 3. Direct JSON-RPC 2.0 Handshake & Tools (Works Immediately via HTTP \`POST\`)
-Even before restarting your MCP host, you can call \`${mcpUrl}\` directly via HTTP \`POST\` with \`Content-Type: application/json\` and \`Authorization: Bearer ${params.token}\`:
-
-1. **Discover Pots (\`list_pots\`):** Always call \`list_pots\` first to map a receipt/invoice to the right nested pot ID (e.g. \`Home & Utilities -> Food & Groceries -> Butcher & Meat\`, \`Car & Moto Fleet -> Fuel\`).
-2. **Log Categorized Receipt (\`log_expense_receipt\`):** Pass \`workspaceId\` (\`ws-home\` or \`${params.personalWorkspaceId}\`), \`potId\`, \`merchant\`, \`amountMajor\`, \`currency\` (\`GBP\`|\`EUR\`|\`PLN\`|\`USD\`|\`CHF\`), \`spentDate\` (\`YYYY-MM-DD\`), and optional itemized \`items: [{ name, subCategory, amountMajor }]\`. Returns \`expenseId\`.
-3. **Attach Receipt Photo / PDF (\`attach_receipt_base64\`):** Pass \`entityType: "expense"\`, \`entityId: "<expenseId>"\`, \`workspaceId\`, \`fileName\`, \`mimeType\`, and \`dataBase64\` to store the receipt image/PDF in the Skyday Finance vault.
-4. **Budget & Bills (\`get_monthly_budget\`, \`list_upcoming_obligations\`, \`mark_obligation_paid\`):** Query monthly budget/Preserve sinking-fund status or mark a bill paid.
-
-Verify connection now by calling \`tools/list\` against \`${mcpUrl}\`:
-\`\`\`bash
-curl -sS -X POST "${mcpUrl}" \\
-  -H "Authorization: Bearer ${params.token}" \\
-  -H "Content-Type: application/json" \\
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
-\`\`\``;
+### 3. Available MCP Tools
+1. **\`list_pots\` / \`create_pot\`:** Inspect or create arbitrary-depth nested pots & sub-pots.
+2. **\`log_expense_receipt\`:** Categorize a receipt with itemized \`items: [{ name, subCategory, amountMajor }]\`.
+3. **\`attach_receipt_base64\`:** Upload receipt image or PDF to the vault.
+4. **\`get_monthly_budget\` / \`list_upcoming_obligations\` / \`mark_obligation_paid\`:** Query monthly budget, sinking-fund reserves, and mark bills paid.`;
 }
 
 export const App: React.FC = () => {
@@ -163,10 +151,29 @@ export const App: React.FC = () => {
 
   const [tab, setTab] = useState<TabKey>('overview');
   const [yearMonth, setYearMonth] = useState<string>(() => new Date().toISOString().slice(0, 7));
-  const [scope, setScope] = useState<'all' | 'shared' | 'personal'>('all');
+  const [scope, setScope] = useState<string>('all');
   const [horizonYears, setHorizonYears] = useState<number>(10);
   const [wealthMode, setWealthMode] = useState<'combined' | 'mine'>('combined');
   const [selectedPotId, setSelectedPotId] = useState<string | null>(null);
+
+  const [locale, setLocale] = useState<LocaleCode>(() => {
+    const saved = localStorage.getItem('skyday_locale');
+    return saved === 'pl' ? 'pl' : 'en';
+  });
+  const t = I18N[locale];
+
+  // Unlimited-depth unfold state for Overview Sankey & Pots Tree
+  const [sankeyExpandedPots, setSankeyExpandedPots] = useState<Set<string>>(() => new Set());
+  const [sankeyExpandedExps, setSankeyExpandedExps] = useState<Set<string>>(() => new Set());
+  const [collapsedTreePots, setCollapsedTreePots] = useState<Set<string>>(() => new Set());
+
+  // Inline Quick-Add & Item-to-Pot Promotion target
+  const [quickAddTarget, setQuickAddTarget] = useState<QuickAddTarget | null>(null);
+
+  // Local Login state on Login Gate
+  const [loginUsername, setLoginUsername] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
+  const [loginErr, setLoginErr] = useState<string | null>(null);
 
   const [privacyMode, setPrivacyMode] = useState<boolean>(() => {
     return localStorage.getItem('skyday_privacy_mode') === '1';
@@ -178,6 +185,7 @@ export const App: React.FC = () => {
   const [newlyMintedKey, setNewlyMintedKey] = useState<string | null>(null);
   const [agentKeyLabel, setAgentKeyLabel] = useState<string>('');
   const [copiedNotice, setCopiedNotice] = useState<string | null>(null);
+  const [inviteBanner, setInviteBanner] = useState<string | null>(null);
   const [busy, setBusy] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -189,7 +197,20 @@ export const App: React.FC = () => {
     });
   }, []);
 
-  // Keyboard shortcut 'P' for Friends %-Only Privacy Mode
+  const switchLocale = useCallback(
+    async (next: LocaleCode) => {
+      setLocale(next);
+      localStorage.setItem('skyday_locale', next);
+      if (auth?.authenticated) {
+        await apiFetch('/api/settings/preferences', {
+          method: 'PATCH',
+          body: JSON.stringify({ locale: next }),
+        }).catch(() => {});
+      }
+    },
+    [auth?.authenticated]
+  );
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement | null)?.tagName?.toLowerCase();
@@ -208,12 +229,19 @@ export const App: React.FC = () => {
       setErrorMsg(null);
       const st = await apiFetch<AuthStatusResponse>('/api/auth/status');
       setAuth(st);
+      if (st.user?.locale && !localStorage.getItem('skyday_locale')) {
+        setLocale(st.user.locale);
+      }
       if (!st.authenticated) return;
 
       const [b, m, w] = await Promise.all([
         apiFetch<BootstrapResponse>('/api/bootstrap'),
-        apiFetch<BudgetMonthResponse>(`/api/budget/month?ym=${yearMonth}&scope=${scope}`),
-        apiFetch<WealthOverviewResponse>(`/api/wealth/overview?horizon=${horizonYears}`),
+        apiFetch<BudgetMonthResponse>(
+          `/api/budget/month?ym=${encodeURIComponent(yearMonth)}&scope=${encodeURIComponent(scope)}`
+        ),
+        apiFetch<WealthOverviewResponse>(
+          `/api/wealth/overview?horizon=${horizonYears}&scope=${encodeURIComponent(scope)}`
+        ),
       ]);
       setBoot(b);
       setBudget(m);
@@ -251,45 +279,175 @@ export const App: React.FC = () => {
     [cur, privacyMode, refIncome]
   );
 
-  const flatPots = useMemo(() => {
+  const potBreadcrumbs = useMemo(() => (budget ? buildPotBreadcrumbs(budget.pots) : new Map()), [budget]);
+
+  // Subtree pot IDs for selectedPotId so clicking a parent pot shows all nested receipts & bills across unlimited depth
+  const activeSubtreePotIds = useMemo(() => {
+    if (!budget || !selectedPotId) return null;
+    return collectSubtreePotIds(selectedPotId, budget.pots);
+  }, [budget, selectedPotId]);
+
+  const visiblePotTreeRows = useMemo(() => {
     if (!budget) return [];
-    const out: Array<{ node: PotRollupNode; depth: number }> = [];
+    const obsByPot = new Map<string, EnrichedObligation[]>();
+    for (const ob of budget.obligations) {
+      if (!ob.isActive || !ob.potId) continue;
+      const list = obsByPot.get(ob.potId) ?? [];
+      list.push(ob);
+      obsByPot.set(ob.potId, list);
+    }
+    const expsByPot = new Map<string, EnrichedExpense[]>();
+    for (const exp of budget.expenses) {
+      if (!exp.potId) continue;
+      const list = expsByPot.get(exp.potId) ?? [];
+      list.push(exp);
+      expsByPot.set(exp.potId, list);
+    }
+
+    const out: Array<{
+      node: PotRollupNode;
+      depth: number;
+      directObs: EnrichedObligation[];
+      directExps: EnrichedExpense[];
+      hasChildren: boolean;
+      isCollapsed: boolean;
+    }> = [];
+
     const walk = (nodes: PotRollupNode[], depth: number) => {
       for (const n of nodes) {
-        out.push({ node: n, depth });
-        walk(n.children, depth + 1);
+        const directObs = obsByPot.get(n.pot.id) ?? [];
+        const directExps = expsByPot.get(n.pot.id) ?? [];
+        const hasChildren = n.children.length > 0 || directObs.length > 0 || directExps.length > 0;
+        const isCollapsed = collapsedTreePots.has(n.pot.id);
+        out.push({ node: n, depth, directObs, directExps, hasChildren, isCollapsed });
+        if (!isCollapsed) {
+          walk(n.children, depth + 1);
+        }
       }
     };
     walk(budget.potTree, 0);
     return out;
-  }, [budget]);
+  }, [budget, collapsedTreePots]);
 
-  // --- Unauthenticated SSO Gate ---
+  const handleToggleSankeyPot = useCallback((potId: string) => {
+    setSankeyExpandedPots((prev) => {
+      const next = new Set(prev);
+      if (next.has(potId)) next.delete(potId);
+      else next.add(potId);
+      return next;
+    });
+  }, []);
+
+  const handleToggleSankeyExpense = useCallback((expId: string) => {
+    setSankeyExpandedExps((prev) => {
+      const next = new Set(prev);
+      if (next.has(expId)) next.delete(expId);
+      else next.add(expId);
+      return next;
+    });
+  }, []);
+
+  const toggleTreePotCollapse = useCallback((potId: string) => {
+    setCollapsedTreePots((prev) => {
+      const next = new Set(prev);
+      if (next.has(potId)) next.delete(potId);
+      else next.add(potId);
+      return next;
+    });
+  }, []);
+
+  // --- Unauthenticated SSO + Local Account Gate ---
   if (auth && !auth.authenticated) {
     return (
       <div className="min-h-screen flex items-center justify-center p-6 bg-[#FAF9F6]">
         <div className="max-w-md w-full bg-white border border-slate-200 rounded-xl p-8 shadow-xs space-y-6">
-          <div className="space-y-1">
+          <div className="flex items-center justify-between">
             <div className="text-xs font-mono-num uppercase tracking-widest text-teal-700 font-semibold">
-              SKYDAY · HOMELAB
+              {t.loginBadge}
             </div>
-            <h1 className="text-2xl font-semibold text-slate-900">Finance & Wealth</h1>
-            <p className="text-sm text-slate-500">
-              Personal & shared household budgeting, automatic sinking-fund reserves, and long-horizon wealth analytics.
-            </p>
+            <div className="inline-flex border border-slate-200 rounded-md p-0.5 text-[11px] font-mono-num">
+              {(['en', 'pl'] as LocaleCode[]).map((lc) => (
+                <button
+                  key={lc}
+                  type="button"
+                  onClick={() => void switchLocale(lc)}
+                  className={`px-2 py-0.5 rounded uppercase ${
+                    locale === lc ? 'bg-slate-900 text-white' : 'text-slate-500'
+                  }`}
+                >
+                  {lc}
+                </button>
+              ))}
+            </div>
           </div>
 
-          <a
-            href={auth.loginUrl}
-            className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-slate-900 text-white text-sm font-medium hover:bg-slate-800 transition"
+          <div className="space-y-1">
+            <h1 className="text-2xl font-semibold text-slate-900">{t.loginTitle}</h1>
+            <p className="text-sm text-slate-500">{t.loginSubtitle}</p>
+          </div>
+
+          {auth.oidcConfigured && (
+            <a
+              href={auth.loginUrl}
+              className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-slate-900 text-white text-sm font-medium hover:bg-slate-800 transition"
+            >
+              <Shield className="w-4 h-4 text-teal-400" />
+              {t.signInAuthentik}
+            </a>
+          )}
+
+          <div className="relative flex py-1 items-center">
+            <div className="flex-grow border-t border-slate-200" />
+            <span className="flex-shrink mx-3 text-[11px] text-slate-400 font-mono-num">{t.orLocalLogin}</span>
+            <div className="flex-grow border-t border-slate-200" />
+          </div>
+
+          <form
+            className="space-y-3"
+            onSubmit={async (e) => {
+              e.preventDefault();
+              setLoginErr(null);
+              try {
+                await apiFetch('/api/auth/local/login', {
+                  method: 'POST',
+                  body: JSON.stringify({ username: loginUsername, password: loginPassword }),
+                });
+                setLoginPassword('');
+                await reloadAll();
+              } catch (err) {
+                setLoginErr(err instanceof Error ? err.message : 'Login failed');
+              }
+            }}
           >
-            <Shield className="w-4 h-4 text-teal-400" />
-            Sign in with Authentik SSO
-          </a>
+            {loginErr && (
+              <div className="p-2.5 rounded bg-rose-50 border border-rose-200 text-rose-700 text-xs">{loginErr}</div>
+            )}
+            <input
+              type="text"
+              required
+              value={loginUsername}
+              onChange={(e) => setLoginUsername(e.target.value)}
+              placeholder={t.usernameOrEmail}
+              className="w-full border border-slate-200 rounded-lg px-3 py-2 text-xs focus:outline-none focus:border-teal-700"
+            />
+            <input
+              type="password"
+              required
+              value={loginPassword}
+              onChange={(e) => setLoginPassword(e.target.value)}
+              placeholder={t.password}
+              className="w-full border border-slate-200 rounded-lg px-3 py-2 text-xs focus:outline-none focus:border-teal-700"
+            />
+            <button
+              type="submit"
+              className="w-full inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-lg border border-slate-300 bg-white text-slate-800 text-xs font-medium hover:bg-slate-50 transition"
+            >
+              <Lock className="w-3.5 h-3.5 text-teal-700" />
+              {t.signInLocal}
+            </button>
+          </form>
 
-          <div className="text-[11px] text-slate-400 font-mono-num text-center">
-            Protected by SKYDAY Authentik · Named accounts: Wadera & Walter
-          </div>
+          <div className="text-[11px] text-slate-400 font-mono-num text-center">{t.loginFooter}</div>
         </div>
       </div>
     );
@@ -298,14 +456,19 @@ export const App: React.FC = () => {
   if (!boot || !budget || !wealth) {
     return (
       <div className="min-h-screen flex items-center justify-center text-sm text-slate-500 font-mono-num">
-        Loading Skyday Finance…
+        {t.loading}
       </div>
     );
   }
 
   const writableWorkspaces = boot.workspaces.filter((w) => w.canWrite);
+  const readableWorkspaces = boot.workspaces.filter((w) => w.canReadItems);
   const myPersonalWs = boot.workspaces.find((w) => w.id === boot.user.personalWorkspaceId);
   const sharedWs = boot.workspaces.find((w) => w.id === 'ws-home');
+  const defaultActiveWsId =
+    writableWorkspaces.find((w) => w.id === scope)?.id ||
+    writableWorkspaces.find((w) => w.id === 'ws-home')?.id ||
+    boot.user.personalWorkspaceId;
 
   const handleTogglePaid = async (ob: EnrichedObligation) => {
     setBusy(true);
@@ -313,6 +476,19 @@ export const App: React.FC = () => {
       await apiFetch(`/api/obligations/${ob.id}/toggle-paid`, {
         method: 'POST',
         body: JSON.stringify({ yearMonth, paid: !ob.isPaidThisMonth }),
+      });
+      await reloadAll();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleToggleIncomeReceived = async (inc: EnrichedIncome) => {
+    setBusy(true);
+    try {
+      await apiFetch(`/api/incomes/${inc.id}/toggle-received`, {
+        method: 'POST',
+        body: JSON.stringify({ yearMonth, received: !inc.isReceivedThisMonth }),
       });
       await reloadAll();
     } finally {
@@ -341,23 +517,23 @@ export const App: React.FC = () => {
     <div className="min-h-screen flex flex-col bg-[#FAF9F6] text-slate-800">
       {/* Editorial Top Bar */}
       <header className="sticky top-0 z-20 bg-[#FAF9F6]/95 backdrop-blur border-b border-slate-200">
-        <div className="max-w-6xl mx-auto px-4 sm:px-6 h-14 flex items-center justify-between gap-3">
-          <div className="flex items-center gap-5">
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 h-14 flex items-center justify-between gap-2">
+          <div className="flex items-center gap-4">
             <div className="flex items-center gap-2">
               <span className="w-2.5 h-2.5 rounded-xs bg-teal-700" />
               <span className="font-mono-num text-sm font-semibold tracking-tight text-slate-900">
-                SKYDAY · FINANCE
+                {t.loginBadge}
               </span>
             </div>
 
             <nav className="hidden md:flex items-center gap-1">
               {(
                 [
-                  ['overview', 'Overview'],
-                  ['timeline', 'Timeline'],
-                  ['pots', 'Pots'],
-                  ['wealth', 'Wealth'],
-                  ['settings', 'Settings'],
+                  ['overview', t.tabOverview],
+                  ['timeline', t.tabTimeline],
+                  ['pots', t.tabPots],
+                  ['wealth', t.tabWealth],
+                  ['settings', t.tabSettings],
                 ] as Array<[TabKey, string]>
               ).map(([k, label]) => (
                 <button
@@ -376,7 +552,7 @@ export const App: React.FC = () => {
             </nav>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1.5 sm:gap-2">
             {/* Month switcher */}
             {tab !== 'wealth' && tab !== 'settings' && (
               <div className="inline-flex items-center border border-slate-200 bg-white rounded-md text-xs font-mono-num">
@@ -384,45 +560,58 @@ export const App: React.FC = () => {
                   type="button"
                   onClick={() => setYearMonth((ym) => shiftMonth(ym, -1))}
                   className="p-1.5 text-slate-500 hover:text-slate-900"
-                  title="Previous month"
+                  title={t.prevMonth}
                 >
                   <ChevronLeft className="w-3.5 h-3.5" />
                 </button>
-                <span className="px-2 font-medium text-slate-800">{yearMonth}</span>
+                <span className="px-1.5 font-medium text-slate-800">{yearMonth}</span>
                 <button
                   type="button"
                   onClick={() => setYearMonth((ym) => shiftMonth(ym, 1))}
                   className="p-1.5 text-slate-500 hover:text-slate-900"
-                  title="Next month"
+                  title={t.nextMonth}
                 >
                   <ChevronRight className="w-3.5 h-3.5" />
                 </button>
               </div>
             )}
 
-            {/* Scope switcher */}
-            {tab !== 'wealth' && tab !== 'settings' && (
-              <div className="hidden sm:inline-flex border border-slate-200 bg-white rounded-md p-0.5 text-xs">
-                {(
-                  [
-                    ['all', 'All'],
-                    ['shared', 'Home'],
-                    ['personal', 'Personal'],
-                  ] as const
-                ).map(([sc, lbl]) => (
-                  <button
-                    key={sc}
-                    type="button"
-                    onClick={() => setScope(sc)}
-                    className={`px-2 py-1 rounded text-[11px] font-medium transition ${
-                      scope === sc ? 'bg-slate-800 text-white' : 'text-slate-600 hover:text-slate-900'
-                    }`}
-                  >
-                    {lbl}
-                  </button>
+            {/* Multi-Workspace Switcher (Personal, Household, Company A, Company B, + New Workspace) */}
+            {tab !== 'settings' && (
+              <select
+                value={scope}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  if (val === '__new__') {
+                    setModal({ kind: 'workspace' });
+                    return;
+                  }
+                  setScope(val);
+                  setSelectedPotId(null);
+                }}
+                className="border border-slate-200 bg-white rounded-md px-2 py-1.5 text-xs font-medium text-slate-700 max-w-[165px] truncate"
+              >
+                <option value="all">{t.allWorkspaces}</option>
+                {readableWorkspaces.map((ws) => (
+                  <option key={ws.id} value={ws.id}>
+                    {ws.kind === 'company' ? '🏢 ' : ws.kind === 'shared' ? '🏠 ' : '👤 '}
+                    {ws.name}
+                  </option>
                 ))}
-              </div>
+                <option value="__new__">{t.newWorkspaceBtn}</option>
+              </select>
             )}
+
+            {/* Bilingual EN / PL Switcher */}
+            <button
+              type="button"
+              onClick={() => void switchLocale(locale === 'en' ? 'pl' : 'en')}
+              title="Switch Language (English / Polski)"
+              className="inline-flex items-center gap-1 px-2 py-1.5 rounded-md border border-slate-200 bg-white text-slate-700 hover:border-slate-300 text-xs font-mono-num uppercase"
+            >
+              <Globe className="w-3.5 h-3.5 text-teal-700" />
+              <span>{locale}</span>
+            </button>
 
             {/* Friends %-Only Privacy Shield Toggle */}
             <button
@@ -436,7 +625,7 @@ export const App: React.FC = () => {
               }`}
             >
               {privacyMode ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-              <span>{privacyMode ? '% ONLY' : cur}</span>
+              <span>{privacyMode ? t.pctOnly : cur}</span>
             </button>
 
             {/* User Badge / Dev Switcher */}
@@ -459,11 +648,11 @@ export const App: React.FC = () => {
                 ))}
               </select>
             ) : (
-              <div className="inline-flex items-center gap-1.5 pl-2 text-xs text-slate-600">
-                <span className="font-medium text-slate-800">{boot.user.displayName}</span>
+              <div className="inline-flex items-center gap-1 pl-1 text-xs text-slate-600">
+                <span className="font-medium text-slate-800 hidden sm:inline">{boot.user.displayName}</span>
                 <button
                   type="button"
-                  title="Sign out"
+                  title={t.signOut}
                   onClick={async () => {
                     const r = await apiFetch<{ endSessionUrl: string }>('/api/auth/logout', { method: 'POST' });
                     window.location.href = r.endSessionUrl || '/';
@@ -479,16 +668,24 @@ export const App: React.FC = () => {
 
         {/* Mobile Tab Strip */}
         <div className="flex md:hidden border-t border-slate-200 px-3 py-1.5 gap-1 overflow-x-auto">
-          {(['overview', 'timeline', 'pots', 'wealth', 'settings'] as TabKey[]).map((k) => (
+          {(
+            [
+              ['overview', t.tabOverview],
+              ['timeline', t.tabTimeline],
+              ['pots', t.tabPots],
+              ['wealth', t.tabWealth],
+              ['settings', t.tabSettings],
+            ] as Array<[TabKey, string]>
+          ).map(([k, label]) => (
             <button
               key={k}
               type="button"
               onClick={() => setTab(k)}
-              className={`px-2.5 py-1 rounded text-xs capitalize ${
+              className={`px-2.5 py-1 rounded text-xs whitespace-nowrap ${
                 tab === k ? 'bg-slate-900 text-white' : 'text-slate-600'
               }`}
             >
-              {k}
+              {label}
             </button>
           ))}
         </div>
@@ -514,43 +711,37 @@ export const App: React.FC = () => {
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
               <div className="bg-white border border-slate-200 rounded-lg p-4">
                 <div className="text-[11px] font-mono-num uppercase tracking-wider text-slate-400">
-                  Monthly Income
+                  {t.kpiIncome}
                 </div>
                 <div className="mt-1 text-2xl font-mono-num font-semibold text-slate-900">
                   {privacyMode ? '100.0%' : fmt(budget.kpis.totalIncomeMinor)}
                 </div>
-                <div className="mt-1 text-xs text-slate-500">
-                  {budget.incomes.length} active stream{budget.incomes.length === 1 ? '' : 's'}
-                </div>
+                <div className="mt-1 text-xs text-slate-500">{t.kpiActiveStreams(budget.incomes.length)}</div>
               </div>
 
               <div className="bg-white border border-slate-200 rounded-lg p-4">
                 <div className="text-[11px] font-mono-num uppercase tracking-wider text-slate-400">
-                  Planned & Spent
+                  {t.kpiPlannedSpent}
                 </div>
                 <div className="mt-1 text-2xl font-mono-num font-semibold text-slate-900">
                   {fmt(budget.kpis.potPlannedTotalMinor)}
                 </div>
-                <div className="mt-1 text-xs text-slate-500">
-                  Bills, envelopes & receipts
-                </div>
+                <div className="mt-1 text-xs text-slate-500">{t.kpiPlannedSub}</div>
               </div>
 
               <div className="bg-white border border-slate-200 rounded-lg p-4">
                 <div className="text-[11px] font-mono-num uppercase tracking-wider text-teal-700">
-                  Auto-Preserve (Sinking)
+                  {t.kpiPreserve}
                 </div>
                 <div className="mt-1 text-2xl font-mono-num font-semibold text-teal-800">
                   {fmt(budget.kpis.totalPreserveSliceMinor)}
                 </div>
-                <div className="mt-1 text-xs text-slate-500">
-                  Set aside this month for future bills
-                </div>
+                <div className="mt-1 text-xs text-slate-500">{t.kpiPreserveSub}</div>
               </div>
 
               <div className="bg-white border border-slate-200 rounded-lg p-4">
                 <div className="text-[11px] font-mono-num uppercase tracking-wider text-slate-400">
-                  Unallocated Surplus
+                  {t.kpiSurplus}
                 </div>
                 <div
                   className={`mt-1 text-2xl font-mono-num font-semibold ${
@@ -560,46 +751,137 @@ export const App: React.FC = () => {
                   {fmt(budget.kpis.netMonthlySurplusMinor)}
                 </div>
                 <div className="mt-1 text-xs text-slate-500 font-mono-num">
-                  Savings rate: {budget.kpis.savingsRatePct}%
+                  {t.kpiSavingsRate}: {budget.kpis.savingsRatePct}%
                 </div>
               </div>
             </div>
 
-            {/* Cashflow Sankey Card */}
-            <section className="bg-white border border-slate-200 rounded-lg p-5">
-              <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+            {/* Cashflow Sankey Card with Unlimited-Depth Unfold & Two-Track Payday Bridge */}
+            <section className="bg-white border border-slate-200 rounded-lg p-5 space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
                 <div>
                   <h2 className="text-xs font-mono-num uppercase tracking-wider text-slate-500 font-semibold">
-                    Where the Money Goes · Cashflow Routing
+                    {t.sankeyTitle}
                   </h2>
-                  <p className="text-xs text-slate-400">
-                    Income streams → monthly budget pool → pots, sinking reserves & unallocated savings
-                  </p>
+                  <p className="text-xs text-slate-400">{t.sankeySub}</p>
                 </div>
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  {(sankeyExpandedPots.size > 0 || sankeyExpandedExps.size > 0) && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSankeyExpandedPots(new Set());
+                        setSankeyExpandedExps(new Set());
+                      }}
+                      className="px-2.5 py-1.5 rounded border border-teal-200 bg-teal-50/70 text-teal-800 text-xs font-mono-num hover:bg-teal-100"
+                    >
+                      {t.foldAll} ({sankeyExpandedPots.size + sankeyExpandedExps.size})
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setModal({ kind: 'pot' })}
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                  >
+                    <FolderTree className="w-3.5 h-3.5" /> {t.newPotBtn}
+                  </button>
                   <button
                     type="button"
                     onClick={() => setModal({ kind: 'expense' })}
                     className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50"
                   >
-                    <Plus className="w-3.5 h-3.5" /> Expense
+                    <Plus className="w-3.5 h-3.5" /> {t.btnAddExpense}
                   </button>
                   <button
                     type="button"
                     onClick={() => setModal({ kind: 'obligation' })}
                     className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded bg-slate-900 text-white text-xs font-medium hover:bg-slate-800"
                   >
-                    <Plus className="w-3.5 h-3.5" /> Scheduled Bill / Goal
+                    <Plus className="w-3.5 h-3.5" /> {t.btnAddBillGoal}
                   </button>
                 </div>
               </div>
 
+              {/* Legend explaining Solid vs Dotted Payday Bridge */}
+              <div className="text-[11px] font-mono-num text-slate-500 bg-slate-50/80 border border-slate-100 rounded px-3 py-1.5 flex flex-wrap items-center gap-2">
+                <span className="inline-flex items-center gap-1 text-emerald-800 font-medium">
+                  <span className="w-3 h-1.5 rounded-xs bg-emerald-700 inline-block" />
+                  {t.sankeyLegendSolid}
+                </span>
+                <span className="inline-flex items-center gap-1 text-rose-700">
+                  <span className="w-3 h-0 border-t-2 border-dashed border-rose-600 inline-block" />
+                  {t.sankeyLegendDotted}
+                </span>
+              </div>
+
+              {/* Inline Quick-Add / Item-to-Pot Promotion Form when '+' is clicked on any Sankey node */}
+              {quickAddTarget && (
+                <QuickAddInline
+                  target={quickAddTarget}
+                  defaultCurrency={cur}
+                  yearMonth={yearMonth}
+                  t={t}
+                  onCancel={() => setQuickAddTarget(null)}
+                  onCreated={async ({ expandPotIds }) => {
+                    setQuickAddTarget(null);
+                    if (expandPotIds.length > 0) {
+                      setSankeyExpandedPots((prev) => new Set([...prev, ...expandPotIds]));
+                    }
+                    await reloadAll();
+                  }}
+                />
+              )}
+
               <CashflowSankeyChart
-                nodes={budget.sankey.nodes}
-                links={budget.sankey.links}
+                incomes={budget.incomes}
+                cashflowBridge={budget.cashflowBridge}
+                potTree={budget.potTree}
+                obligations={budget.obligations}
+                expenses={budget.expenses}
+                totalIncomeMinor={budget.kpis.totalIncomeMinor}
+                potPlannedTotalMinor={budget.kpis.potPlannedTotalMinor}
+                netMonthlySurplusMinor={budget.kpis.netMonthlySurplusMinor}
                 currency={cur}
                 privacyMode={privacyMode}
-                referenceIncomeMinor={budget.kpis.totalIncomeMinor}
+                expandedPotIds={sankeyExpandedPots}
+                expandedExpenseIds={sankeyExpandedExps}
+                onTogglePot={handleToggleSankeyPot}
+                onToggleExpense={handleToggleSankeyExpense}
+                onQuickAdd={(target) => setQuickAddTarget(target)}
+                onInspectItem={(kind, id) => {
+                  if (kind === 'obligation') {
+                    const ob = budget.obligations.find((o) => o.id === id);
+                    if (ob) {
+                      setDrawer({
+                        entityType: 'obligation',
+                        entityId: ob.id,
+                        workspaceId: ob.workspaceId,
+                        title: ob.name,
+                        subtitle: `${ob.cadence} · ${t.dueLabel} ${ob.nextDueDate}`,
+                        manageUrl: ob.manageUrl,
+                        portalUrl: ob.portalUrl,
+                        referenceNumber: ob.referenceNumber,
+                        notes: ob.notes,
+                        currency: ob.currency,
+                      });
+                    }
+                  } else {
+                    const exp = budget.expenses.find((e) => e.id === id);
+                    if (exp) {
+                      setDrawer({
+                        entityType: 'expense',
+                        entityId: exp.id,
+                        workspaceId: exp.workspaceId,
+                        title: exp.merchant,
+                        subtitle: `${exp.spentDate} · ${exp.description}`,
+                        portalUrl: exp.portalUrl,
+                        items: exp.items,
+                        currency: exp.currency,
+                      });
+                    }
+                  }
+                }}
+                t={t}
               />
             </section>
 
@@ -608,9 +890,9 @@ export const App: React.FC = () => {
               <section className="bg-white border border-slate-200 rounded-lg p-5">
                 <div className="flex items-center justify-between mb-1">
                   <h3 className="text-xs font-mono-num uppercase tracking-wider text-slate-500 font-semibold">
-                    6-Month Income vs. Spend
+                    {t.trend6mTitle}
                   </h3>
-                  <span className="text-[11px] font-mono-num text-slate-400">Teal = Income · Slate = Spend</span>
+                  <span className="text-[11px] font-mono-num text-slate-400">{t.trend6mLegend}</span>
                 </div>
                 <SixMonthTrendChart data={budget.trend6m} currency={cur} privacyMode={privacyMode} />
               </section>
@@ -619,7 +901,7 @@ export const App: React.FC = () => {
                 <div>
                   <div className="flex items-center justify-between mb-3">
                     <h3 className="text-xs font-mono-num uppercase tracking-wider text-slate-500 font-semibold">
-                      Upcoming Sinking-Fund ("Preserve") Goals
+                      {t.preserveGoalsTitle}
                     </h3>
                     <PiggyBank className="w-4 h-4 text-teal-700" />
                   </div>
@@ -640,10 +922,11 @@ export const App: React.FC = () => {
                             </div>
                             <div className="flex items-center justify-between text-[11px] text-slate-500 mt-1 font-mono-num">
                               <span>
-                                Due {ob.nextDueDate} ({ob.metrics.monthsUntilDue}m left)
+                                {t.dueLabel} {ob.nextDueDate} ({ob.metrics.monthsUntilDue}
+                                {t.monthsLeft})
                               </span>
                               <span>
-                                Preserved {progressPct}%{' '}
+                                {t.preservedPct} {progressPct}%{' '}
                                 {!privacyMode && `(${fmt(ob.preservedDisplayMinor)} / ${fmt(ob.targetDisplayMinor)})`}
                               </span>
                             </div>
@@ -663,7 +946,7 @@ export const App: React.FC = () => {
         {/* ======================== TAB 2: TIMELINE & SUFFICIENCY ======================== */}
         {tab === 'timeline' && (
           <>
-            {/* Sufficiency Banner + Runway Curve */}
+            {/* Pre-Payday Sufficiency Banner + Runway Curve */}
             <section className="bg-white border border-slate-200 rounded-lg p-5 space-y-4">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
@@ -674,22 +957,26 @@ export const App: React.FC = () => {
                       }`}
                     />
                     <h2 className="text-sm font-semibold text-slate-900">
-                      {budget.runway.isSufficient
-                        ? 'Account Runway Sufficient Through Month-End'
-                        : 'Additional Funds Needed Before Month-End'}
+                      {budget.runway.isSufficient ? t.runwaySufficient : t.runwayShortfall}
                     </h2>
                   </div>
                   <p className="text-xs text-slate-500 mt-0.5 font-mono-num">
-                    Runway cash: {fmt(budget.runway.runwayCashMinor)} · Unpaid due:{' '}
-                    {fmt(budget.runway.unpaidBillsMinor)} · Preserve transfers:{' '}
-                    {fmt(budget.runway.totalPreserveSliceMinor)} · Remaining envelopes:{' '}
+                    {t.runwayCash}: {fmt(budget.runway.runwayCashMinor)} · {t.unpaidDue}:{' '}
+                    {fmt(budget.runway.unpaidPrePaydayBillsMinor)} · {t.preserveTransfers}:{' '}
+                    {fmt(budget.runway.totalPreserveSliceMinor)} · {t.remainingEnvelopes}:{' '}
                     {fmt(budget.runway.unallocatedEnvelopeRemainingMinor)}
                   </p>
+                  {budget.cashflowBridge.nextMonthPreSalaryMinor > 0 && (
+                    <p className="text-xs text-rose-700 mt-1 font-mono-num">
+                      {t.nextMonthReserveLabel}{' '}
+                      <span className="font-semibold">{fmt(budget.cashflowBridge.nextMonthPreSalaryMinor)}</span>
+                    </p>
+                  )}
                 </div>
 
                 <div className="text-right font-mono-num">
                   <div className="text-[11px] uppercase text-slate-400">
-                    {budget.runway.isSufficient ? 'Projected Month-End Buffer' : 'Required Top-Up'}
+                    {budget.runway.isSufficient ? t.projectedBuffer : t.requiredTopUp}
                   </div>
                   <div
                     className={`text-xl font-semibold ${
@@ -697,7 +984,7 @@ export const App: React.FC = () => {
                     }`}
                   >
                     {budget.runway.isSufficient
-                      ? fmt(budget.runway.projectedEndBalanceMinor)
+                      ? fmt(budget.runway.prePaydayBufferMinor)
                       : fmt(budget.runway.shortfallMinor)}
                   </div>
                 </div>
@@ -707,26 +994,89 @@ export const App: React.FC = () => {
                 curve={budget.runway.dailyCurve}
                 currency={cur}
                 privacyMode={privacyMode}
+                t={t}
               />
             </section>
 
-            {/* Chronological Monthly Checklist */}
+            {/* Expected Salary & Income Arrivals (Tick when received in bank account!) */}
+            <section className="bg-white border border-slate-200 rounded-lg overflow-hidden">
+              <div className="px-5 py-3.5 border-b border-slate-200 flex items-center justify-between bg-emerald-50/40">
+                <div>
+                  <h3 className="text-xs font-mono-num uppercase tracking-wider text-emerald-900 font-semibold">
+                    {t.incomeArrivalsTitle} ({yearMonth})
+                  </h3>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setModal({ kind: 'income' })}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded border border-emerald-700/30 bg-white text-emerald-900 text-xs font-medium hover:bg-emerald-50"
+                >
+                  <Plus className="w-3.5 h-3.5" /> {t.addIncomeBtn}
+                </button>
+              </div>
+              <div className="divide-y divide-slate-100">
+                {budget.incomes.map((inc) => (
+                  <div
+                    key={inc.id}
+                    className="px-5 py-3 flex flex-wrap items-center justify-between gap-3 hover:bg-slate-50/70"
+                  >
+                    <div className="flex items-center gap-3">
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => void handleToggleIncomeReceived(inc)}
+                        className="text-slate-400 hover:text-emerald-700 transition"
+                        title={inc.isReceivedThisMonth ? t.markIncomePending : t.markIncomeReceived}
+                      >
+                        {inc.isReceivedThisMonth ? (
+                          <CheckCircle2 className="w-5 h-5 text-emerald-600" />
+                        ) : (
+                          <Circle className="w-5 h-5 text-emerald-600/60" />
+                        )}
+                      </button>
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm font-medium text-slate-900">{inc.name}</span>
+                          <span
+                            className={`text-[10px] font-mono-num px-1.5 py-0.5 rounded ${
+                              inc.isReceivedThisMonth
+                                ? 'bg-emerald-100 text-emerald-800 font-semibold'
+                                : 'bg-amber-50 text-amber-800 border border-amber-200 border-dashed'
+                            }`}
+                          >
+                            {inc.isReceivedThisMonth
+                              ? t.statusReceivedBadge
+                              : t.statusAwaitingBadge(inc.paydayDay)}
+                          </span>
+                        </div>
+                        <div className="text-xs text-slate-500 font-mono-num">
+                          {inc.expectedDate} · {inc.cadence}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="font-mono-num text-sm font-semibold text-emerald-800">
+                      +{fmt(inc.monthlyDisplayMinor)}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </section>
+
+            {/* Chronological Monthly Payment Checklist */}
             <section className="bg-white border border-slate-200 rounded-lg overflow-hidden">
               <div className="px-5 py-3.5 border-b border-slate-200 flex items-center justify-between">
                 <div>
                   <h3 className="text-xs font-mono-num uppercase tracking-wider text-slate-600 font-semibold">
-                    Monthly Payment Checklist & Sinking Accruals ({yearMonth})
+                    {t.checklistTitle} ({yearMonth})
                   </h3>
-                  <p className="text-xs text-slate-400">
-                    Tick bills as paid to update live account sufficiency; multi-month bills automatically reset Preserve upon payment.
-                  </p>
+                  <p className="text-xs text-slate-400">{t.checklistSub}</p>
                 </div>
                 <button
                   type="button"
                   onClick={() => setModal({ kind: 'obligation' })}
                   className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded bg-slate-900 text-white text-xs font-medium"
                 >
-                  <Plus className="w-3.5 h-3.5" /> Add Scheduled Payment
+                  <Plus className="w-3.5 h-3.5" /> {t.addScheduledBtn}
                 </button>
               </div>
 
@@ -746,7 +1096,7 @@ export const App: React.FC = () => {
                           disabled={busy}
                           onClick={() => void handleTogglePaid(ob)}
                           className="text-slate-400 hover:text-teal-700 transition"
-                          title={ob.isPaidThisMonth ? 'Mark as unpaid' : 'Mark as paid'}
+                          title={ob.isPaidThisMonth ? t.markUnpaid : t.markPaid}
                         >
                           {ob.isPaidThisMonth ? (
                             <CheckCircle2 className="w-5 h-5 text-emerald-600" />
@@ -764,7 +1114,7 @@ export const App: React.FC = () => {
                                   entityId: ob.id,
                                   workspaceId: ob.workspaceId,
                                   title: ob.name,
-                                  subtitle: `${ob.cadence} · Next due ${ob.nextDueDate}`,
+                                  subtitle: `${ob.cadence} · ${t.dueLabel} ${ob.nextDueDate}`,
                                   manageUrl: ob.manageUrl,
                                   portalUrl: ob.portalUrl,
                                   referenceNumber: ob.referenceNumber,
@@ -778,9 +1128,6 @@ export const App: React.FC = () => {
                             >
                               {ob.name}
                             </button>
-                            <span className="text-[10px] font-mono-num px-1.5 py-0.5 rounded bg-slate-100 text-slate-600">
-                              {ob.workspaceId === 'ws-home' ? 'Shared' : 'Personal'}
-                            </span>
                             {ob.currency !== cur && !privacyMode && (
                               <span className="text-[10px] font-mono-num px-1.5 py-0.5 rounded bg-amber-50 text-amber-800">
                                 {ob.currency}
@@ -792,7 +1139,6 @@ export const App: React.FC = () => {
                                 target="_blank"
                                 rel="noreferrer"
                                 className="text-teal-700 hover:text-teal-900 inline-flex items-center gap-0.5 text-[11px]"
-                                title="Manage / Cancel Portal"
                               >
                                 <ExternalLink className="w-3 h-3" />
                               </a>
@@ -800,8 +1146,8 @@ export const App: React.FC = () => {
                           </div>
                           <div className="text-xs text-slate-500 font-mono-num">
                             {isDueNow
-                              ? `Due ${yearMonth}-${String(ob.dueDay).padStart(2, '0')} · ${ob.cadence}`
-                              : `Future (${ob.nextDueDate}, ${ob.metrics.monthsUntilDue}m away) · Sinking Preserve`}
+                              ? `${t.dueLabel} ${yearMonth}-${String(ob.dueDay).padStart(2, '0')} · ${ob.cadence}`
+                              : `${ob.nextDueDate} (${ob.metrics.monthsUntilDue}${t.monthsLeft}) · Preserve`}
                           </div>
                         </div>
                       </div>
@@ -813,9 +1159,8 @@ export const App: React.FC = () => {
                             disabled={busy}
                             onClick={() => void handleDepositPreserve(ob)}
                             className="px-2 py-1 rounded border border-teal-200 bg-teal-50 text-teal-800 text-[11px] hover:bg-teal-100"
-                            title="Add this month's Preserve slice to saved reserve"
                           >
-                            + Preserve {fmt(ob.preserveDisplayMinor)}
+                            {t.depositPreserveBtn} {fmt(ob.preserveDisplayMinor)}
                           </button>
                         )}
                         <div className="text-right">
@@ -824,7 +1169,7 @@ export const App: React.FC = () => {
                           </div>
                           {!isDueNow && !privacyMode && (
                             <div className="text-[10px] text-slate-400">
-                              Target {fmt(ob.targetDisplayMinor)}
+                              {t.targetLabel} {fmt(ob.targetDisplayMinor)}
                             </div>
                           )}
                         </div>
@@ -837,88 +1182,286 @@ export const App: React.FC = () => {
           </>
         )}
 
-        {/* ======================== TAB 3: POTS, ENVELOPES & VAULT ======================== */}
+        {/* ======================== TAB 3: POTS, ENVELOPES & UNLIMITED SUB-POTS ======================== */}
         {tab === 'pots' && (
           <>
             <section className="bg-white border border-slate-200 rounded-lg p-5 space-y-4">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div>
                   <h2 className="text-xs font-mono-num uppercase tracking-wider text-slate-500 font-semibold">
-                    Proportional Pot Allocation
+                    {t.propAllocationTitle}
                   </h2>
-                  <p className="text-xs text-slate-400">
-                    Click a pot to filter; supports rough monthly envelopes (e.g. £600 Food) alongside detailed sub-pot receipts without double counting.
-                  </p>
+                  <p className="text-xs text-slate-400">{t.propAllocationSub}</p>
                 </div>
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
-                    onClick={() => setModal({ kind: 'pot' })}
+                    onClick={() => setModal({ kind: 'pot', defaultParentId: selectedPotId })}
                     className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50"
                   >
-                    <FolderTree className="w-3.5 h-3.5" /> New Pot / Sub-Pot
+                    <FolderTree className="w-3.5 h-3.5" /> {t.newPotBtn}
                   </button>
                   <button
                     type="button"
-                    onClick={() => setModal({ kind: 'expense' })}
+                    onClick={() => setModal({ kind: 'expense', defaultPotId: selectedPotId })}
                     className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded bg-slate-900 text-white text-xs font-medium"
                   >
-                    <Plus className="w-3.5 h-3.5" /> Log Spend / Receipt
+                    <Plus className="w-3.5 h-3.5" /> {t.logSpendBtn}
                   </button>
                 </div>
               </div>
 
               <PotProportionStrip
                 nodes={budget.potTree}
+                pots={budget.pots}
+                obligations={budget.obligations}
+                expenses={budget.expenses}
                 currency={cur}
                 privacyMode={privacyMode}
                 selectedPotId={selectedPotId}
                 onSelectPot={setSelectedPotId}
+                t={t}
               />
             </section>
 
-            {/* Hierarchical Pots Table */}
+            {quickAddTarget && (
+              <QuickAddInline
+                target={quickAddTarget}
+                defaultCurrency={cur}
+                yearMonth={yearMonth}
+                t={t}
+                onCancel={() => setQuickAddTarget(null)}
+                onCreated={async ({ expandPotIds }) => {
+                  setQuickAddTarget(null);
+                  if (expandPotIds.length > 0) {
+                    setCollapsedTreePots((prev) => {
+                      const next = new Set(prev);
+                      for (const id of expandPotIds) next.delete(id);
+                      return next;
+                    });
+                    setSelectedPotId(expandPotIds[expandPotIds.length - 1]);
+                  }
+                  await reloadAll();
+                }}
+              />
+            )}
+
+            {/* Hierarchical Unlimited-Depth Pots & Items Tree + Subtree Receipts Panel */}
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
               <section className="bg-white border border-slate-200 rounded-lg overflow-hidden">
-                <div className="px-4 py-3 border-b border-slate-200 text-xs font-mono-num uppercase tracking-wider text-slate-500 font-semibold">
-                  Nested Pots & Envelopes
-                </div>
-                <div className="divide-y divide-slate-100">
-                  {flatPots.map(({ node, depth }) => (
-                    <div
-                      key={node.pot.id}
-                      onClick={() => setSelectedPotId((curId) => (curId === node.pot.id ? null : node.pot.id))}
-                      className={`px-4 py-2.5 flex items-center justify-between text-xs cursor-pointer hover:bg-slate-50 ${
-                        selectedPotId === node.pot.id ? 'bg-slate-100/80' : ''
-                      }`}
+                <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
+                  <span className="text-xs font-mono-num uppercase tracking-wider text-slate-500 font-semibold">
+                    {t.nestedPotsTitle}
+                  </span>
+                  <div className="flex items-center gap-2 text-[11px] font-mono-num">
+                    <button
+                      type="button"
+                      onClick={() => setCollapsedTreePots(new Set())}
+                      className="text-teal-700 hover:underline"
                     >
-                      <div className="flex items-center gap-2" style={{ paddingLeft: `${depth * 18}px` }}>
-                        <span className="w-2.5 h-2.5 rounded-xs" style={{ backgroundColor: node.pot.color }} />
-                        <span className="font-medium text-slate-800">{node.pot.name}</span>
-                        {node.pot.envelopeMode && (
-                          <span className="text-[10px] font-mono-num px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-800">
-                            Envelope
-                          </span>
-                        )}
+                      {t.expandAll}
+                    </button>
+                    <span className="text-slate-300">·</span>
+                    <button
+                      type="button"
+                      onClick={() => setCollapsedTreePots(new Set(budget.pots.map((p) => p.id)))}
+                      className="text-slate-500 hover:underline"
+                    >
+                      {t.collapseAll}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="divide-y divide-slate-100 max-h-[540px] overflow-y-auto">
+                  {visiblePotTreeRows.map(({ node, depth, directObs, directExps, hasChildren, isCollapsed }) => (
+                    <React.Fragment key={node.pot.id}>
+                      {/* Pot Row */}
+                      <div
+                        className={`px-4 py-2.5 flex items-center justify-between text-xs hover:bg-slate-50 group ${
+                          selectedPotId === node.pot.id ? 'bg-teal-50/50' : ''
+                        }`}
+                      >
+                        <div className="flex items-center gap-1.5 min-w-0" style={{ paddingLeft: `${depth * 18}px` }}>
+                          {hasChildren ? (
+                            <button
+                              type="button"
+                              onClick={() => toggleTreePotCollapse(node.pot.id)}
+                              className="p-0.5 text-slate-400 hover:text-slate-800"
+                            >
+                              {isCollapsed ? (
+                                <ChevronRight className="w-3.5 h-3.5" />
+                              ) : (
+                                <ChevronDown className="w-3.5 h-3.5" />
+                              )}
+                            </button>
+                          ) : (
+                            <span className="w-4" />
+                          )}
+                          <span
+                            className="w-2.5 h-2.5 rounded-xs shrink-0"
+                            style={{ backgroundColor: node.pot.color }}
+                          />
+                          <button
+                            type="button"
+                            onClick={() => setSelectedPotId((curId) => (curId === node.pot.id ? null : node.pot.id))}
+                            className="font-medium text-slate-800 hover:text-teal-800 truncate text-left"
+                          >
+                            {node.pot.name}
+                          </button>
+                          {node.pot.envelopeMode && (
+                            <span className="text-[10px] font-mono-num px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-800">
+                              {t.envelopeBadge}
+                            </span>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setQuickAddTarget({
+                                targetKind: 'pot',
+                                potId: node.pot.id,
+                                potName: node.pot.name,
+                                workspaceId: node.pot.workspaceId,
+                                currency: node.pot.currency,
+                                color: node.pot.color,
+                              })
+                            }
+                            title={t.qaTooltipPot}
+                            className="ml-1 inline-flex items-center justify-center w-4 h-4 rounded border border-teal-600/40 bg-white text-teal-700 hover:bg-teal-700 hover:text-white transition"
+                          >
+                            <Plus className="w-2.5 h-2.5 stroke-[2.5]" />
+                          </button>
+                        </div>
+
+                        <div className="text-right font-mono-num shrink-0 pl-2">
+                          <div className="font-semibold text-slate-900">{fmt(node.effectiveTotalDisplayMinor)}</div>
+                          {node.pot.envelopeMode && node.unallocatedEnvelopeDisplayMinor > 0 && (
+                            <div className="text-[10px] text-slate-400">
+                              {fmt(node.itemizedSpendDisplayMinor)} {t.loggedLabel} ·{' '}
+                              {fmt(node.unallocatedEnvelopeDisplayMinor)} {t.estLeftLabel}
+                            </div>
+                          )}
+                        </div>
                       </div>
-                      <div className="text-right font-mono-num">
-                        <div className="font-semibold text-slate-900">{fmt(node.effectiveTotalDisplayMinor)}</div>
-                        {node.pot.envelopeMode && node.unallocatedEnvelopeDisplayMinor > 0 && (
-                          <div className="text-[10px] text-slate-400">
-                            {fmt(node.itemizedSpendDisplayMinor)} logged · {fmt(node.unallocatedEnvelopeDisplayMinor)} est. left
+
+                      {/* Direct Leaf Obligations & Expenses inside this Pot (clicking '+' promotes item into a Pot!) */}
+                      {!isCollapsed &&
+                        directObs.map((ob) => (
+                          <div
+                            key={ob.id}
+                            className="px-4 py-1.5 flex items-center justify-between text-[11px] bg-[#FAF9F6]/60 hover:bg-slate-50 group"
+                          >
+                            <div
+                              className="flex items-center gap-1.5 min-w-0"
+                              style={{ paddingLeft: `${(depth + 1) * 18 + 14}px` }}
+                            >
+                              <span className="w-1.5 h-1.5 rounded-full bg-slate-400 shrink-0" />
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setDrawer({
+                                    entityType: 'obligation',
+                                    entityId: ob.id,
+                                    workspaceId: ob.workspaceId,
+                                    title: ob.name,
+                                    subtitle: `${ob.cadence} · ${t.dueLabel} ${ob.nextDueDate}`,
+                                    manageUrl: ob.manageUrl,
+                                    portalUrl: ob.portalUrl,
+                                    referenceNumber: ob.referenceNumber,
+                                    notes: ob.notes,
+                                    currency: ob.currency,
+                                  })
+                                }
+                                className="text-slate-700 hover:underline truncate text-left"
+                              >
+                                {ob.name}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setQuickAddTarget({
+                                    targetKind: 'obligation',
+                                    itemId: ob.id,
+                                    itemName: ob.name,
+                                    workspaceId: ob.workspaceId,
+                                    parentPotId: ob.potId,
+                                    amountMinor: ob.amountMinor,
+                                    currency: ob.currency,
+                                  })
+                                }
+                                title={t.qaTooltipPromote}
+                                className="inline-flex items-center justify-center w-4 h-4 rounded border border-slate-300 bg-white text-slate-500 hover:bg-teal-700 hover:text-white hover:border-teal-700 transition"
+                              >
+                                <Plus className="w-2.5 h-2.5 stroke-[2.5]" />
+                              </button>
+                            </div>
+                            <span className="font-mono-num text-slate-600">{fmt(ob.effectiveDisplayMinor)}</span>
                           </div>
-                        )}
-                      </div>
-                    </div>
+                        ))}
+
+                      {!isCollapsed &&
+                        directExps.map((exp) => (
+                          <div
+                            key={exp.id}
+                            className="px-4 py-1.5 flex items-center justify-between text-[11px] bg-[#FAF9F6]/60 hover:bg-slate-50 group"
+                          >
+                            <div
+                              className="flex items-center gap-1.5 min-w-0"
+                              style={{ paddingLeft: `${(depth + 1) * 18 + 14}px` }}
+                            >
+                              <span className="w-1.5 h-1.5 rounded-full bg-teal-600 shrink-0" />
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setDrawer({
+                                    entityType: 'expense',
+                                    entityId: exp.id,
+                                    workspaceId: exp.workspaceId,
+                                    title: exp.merchant,
+                                    subtitle: `${exp.spentDate} · ${exp.description}`,
+                                    portalUrl: exp.portalUrl,
+                                    items: exp.items,
+                                    currency: exp.currency,
+                                  })
+                                }
+                                className="text-slate-700 hover:underline truncate text-left"
+                              >
+                                {exp.merchant}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setQuickAddTarget({
+                                    targetKind: 'expense',
+                                    itemId: exp.id,
+                                    itemName: exp.merchant,
+                                    workspaceId: exp.workspaceId,
+                                    parentPotId: exp.potId,
+                                    amountMinor: exp.amountMinor,
+                                    currency: exp.currency,
+                                  })
+                                }
+                                title={t.qaTooltipPromote}
+                                className="inline-flex items-center justify-center w-4 h-4 rounded border border-slate-300 bg-white text-slate-500 hover:bg-teal-700 hover:text-white hover:border-teal-700 transition"
+                              >
+                                <Plus className="w-2.5 h-2.5 stroke-[2.5]" />
+                              </button>
+                            </div>
+                            <span className="font-mono-num text-slate-600">{fmt(exp.displayAmountMinor)}</span>
+                          </div>
+                        ))}
+                    </React.Fragment>
                   ))}
                 </div>
               </section>
 
-              {/* Itemized Receipts & Portal-Linked Items */}
+              {/* Subtree-Filtered Receipts & Actionable Bills */}
               <section className="bg-white border border-slate-200 rounded-lg overflow-hidden">
                 <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
                   <span className="text-xs font-mono-num uppercase tracking-wider text-slate-500 font-semibold">
-                    Logged Receipts & Actionable Bills
+                    {t.receiptsBillsTitle}
+                    {selectedPotId && potBreadcrumbs.get(selectedPotId)
+                      ? ` · ${potBreadcrumbs.get(selectedPotId)!.pathString}`
+                      : ''}
                   </span>
                   {selectedPotId && (
                     <button
@@ -926,13 +1469,14 @@ export const App: React.FC = () => {
                       onClick={() => setSelectedPotId(null)}
                       className="text-[11px] text-teal-700 hover:underline"
                     >
-                      Clear filter
+                      {t.clearFilter}
                     </button>
                   )}
                 </div>
-                <div className="divide-y divide-slate-100 max-h-[420px] overflow-y-auto">
+
+                <div className="divide-y divide-slate-100 max-h-[540px] overflow-y-auto">
                   {budget.expenses
-                    .filter((e) => !selectedPotId || e.potId === selectedPotId)
+                    .filter((e) => !activeSubtreePotIds || (e.potId && activeSubtreePotIds.has(e.potId)))
                     .map((exp) => (
                       <div
                         key={exp.id}
@@ -960,18 +1504,18 @@ export const App: React.FC = () => {
                             )}
                             {exp.items.length > 0 && (
                               <span className="text-[10px] text-slate-400 font-mono-num">
-                                ({exp.items.length} sub-items)
+                                {t.subItemsCount(exp.items.length)}
                               </span>
                             )}
                           </div>
                           <div className="text-[11px] text-slate-500">
-                            {exp.spentDate} · {exp.description || 'Expense'}
+                            {exp.spentDate} · {exp.description || t.btnAddExpense}
                           </div>
                         </div>
                         <div className="flex items-center gap-2 font-mono-num text-xs font-semibold text-slate-800">
                           <span>
                             {privacyMode
-                              ? fmt(exp.amountMinor)
+                              ? fmt(exp.displayAmountMinor)
                               : `${CURRENCY_SYMBOLS[exp.currency]}${(exp.amountMinor / 100).toFixed(2)}`}
                           </span>
                           <Paperclip className="w-3.5 h-3.5 text-slate-400" />
@@ -980,7 +1524,7 @@ export const App: React.FC = () => {
                     ))}
 
                   {budget.obligations
-                    .filter((o) => !selectedPotId || o.potId === selectedPotId)
+                    .filter((o) => !activeSubtreePotIds || (o.potId && activeSubtreePotIds.has(o.potId)))
                     .map((ob) => (
                       <div
                         key={ob.id}
@@ -990,7 +1534,7 @@ export const App: React.FC = () => {
                             entityId: ob.id,
                             workspaceId: ob.workspaceId,
                             title: ob.name,
-                            subtitle: `${ob.cadence} · Next due ${ob.nextDueDate}`,
+                            subtitle: `${ob.cadence} · ${t.dueLabel} ${ob.nextDueDate}`,
                             manageUrl: ob.manageUrl,
                             portalUrl: ob.portalUrl,
                             referenceNumber: ob.referenceNumber,
@@ -1005,12 +1549,12 @@ export const App: React.FC = () => {
                             <span>{ob.name}</span>
                             {ob.manageUrl && (
                               <span className="text-[10px] px-1.5 py-0.5 rounded bg-teal-50 text-teal-800 font-mono-num">
-                                Portal Link
+                                {t.portalLinkBadge}
                               </span>
                             )}
                           </div>
                           <div className="text-[11px] text-slate-500 font-mono-num">
-                            {ob.cadence} · Due {ob.nextDueDate}
+                            {ob.cadence} · {t.dueLabel} {ob.nextDueDate}
                           </div>
                         </div>
                         <div className="font-mono-num text-xs font-semibold text-slate-700">
@@ -1027,7 +1571,6 @@ export const App: React.FC = () => {
         {/* ======================== TAB 4: WEALTH & BELONGINGS ======================== */}
         {tab === 'wealth' && (
           <>
-            {/* Separate vs Combined Family Wealth Summary Cards */}
             <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
               <button
                 type="button"
@@ -1037,7 +1580,7 @@ export const App: React.FC = () => {
                 }`}
               >
                 <div className="text-[11px] font-mono-num uppercase tracking-wider text-slate-400">
-                  {boot.user.displayName} Net Worth (Incl. 50% Home)
+                  {t.myNetWorthCard(boot.user.displayName)}
                 </div>
                 <div className="mt-1 text-2xl font-mono-num font-semibold text-slate-900">
                   {formatIndexedWealth(
@@ -1048,14 +1591,14 @@ export const App: React.FC = () => {
                   )}
                 </div>
                 <div className="mt-1 text-xs text-slate-500 font-mono-num">
-                  Assets {fmt(wealth.myWealth.totalAssetsMinor, wealth.myWealth.totalAssetsMinor || 1, true)} · Debt{' '}
-                  {fmt(wealth.myWealth.totalLiabilitiesMinor, wealth.myWealth.totalAssetsMinor || 1, true)}
+                  {t.assetsShort} {fmt(wealth.myWealth.totalAssetsMinor, wealth.myWealth.totalAssetsMinor || 1, true)} ·{' '}
+                  {t.debtShort} {fmt(wealth.myWealth.totalLiabilitiesMinor, wealth.myWealth.totalAssetsMinor || 1, true)}
                 </div>
               </button>
 
               <div className="bg-white border border-slate-200 rounded-lg p-4">
                 <div className="text-[11px] font-mono-num uppercase tracking-wider text-slate-400">
-                  Partner Wealth ({wealth.partnerWealth.visibility})
+                  {t.partnerWealthCard} ({wealth.partnerWealth.visibility})
                 </div>
                 <div className="mt-1 text-2xl font-mono-num font-semibold text-slate-800">
                   {wealth.partnerWealth.netWorthMinor != null
@@ -1065,14 +1608,14 @@ export const App: React.FC = () => {
                         cur,
                         privacyMode
                       )
-                    : 'Private'}
+                    : t.privateLabel}
                 </div>
                 <div className="mt-1 text-xs text-slate-500">
                   {wealth.partnerWealth.visibility === 'private'
-                    ? 'Partner personal workspace is set to strictly private'
+                    ? t.visPrivateDesc
                     : wealth.partnerWealth.visibility === 'totals_only'
-                    ? 'Aggregate total included; personal items hidden'
-                    : 'Shared read-only'}
+                    ? t.visTotalsDesc
+                    : t.visReadonlyDesc}
                 </div>
               </div>
 
@@ -1084,7 +1627,7 @@ export const App: React.FC = () => {
                 }`}
               >
                 <div className="text-[11px] font-mono-num uppercase tracking-wider text-teal-700 font-semibold">
-                  Combined Family Wealth
+                  {t.combinedWealthCard}
                 </div>
                 <div className="mt-1 text-2xl font-mono-num font-semibold text-teal-900">
                   {formatIndexedWealth(
@@ -1095,13 +1638,13 @@ export const App: React.FC = () => {
                   )}
                 </div>
                 <div className="mt-1 text-xs text-slate-500 font-mono-num">
-                  Assets{' '}
+                  {t.assetsShort}{' '}
                   {fmt(
                     wealth.combinedFamilyWealth.totalAssetsMinor,
                     wealth.combinedFamilyWealth.totalAssetsMinor || 1,
                     true
                   )}{' '}
-                  · Mortgages/Loans{' '}
+                  · {t.debtShort}{' '}
                   {fmt(
                     wealth.combinedFamilyWealth.totalLiabilitiesMinor,
                     wealth.combinedFamilyWealth.totalAssetsMinor || 1,
@@ -1111,17 +1654,16 @@ export const App: React.FC = () => {
               </button>
             </div>
 
-            {/* Long-Horizon Forecast Graph */}
             <section className="bg-white border border-slate-200 rounded-lg p-5 space-y-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div>
                   <h2 className="text-xs font-mono-num uppercase tracking-wider text-slate-500 font-semibold">
-                    {wealthMode === 'combined' ? 'Combined Family' : boot.user.displayName} Net Worth Trajectory &{' '}
-                    {horizonYears}-Year Forecast
+                    {t.trajectoryTitle(
+                      wealthMode === 'combined' ? t.combinedWealthCard : boot.user.displayName,
+                      horizonYears
+                    )}
                   </h2>
-                  <p className="text-xs text-slate-400">
-                    Models house appreciation, vehicle/belonging depreciation curves, mortgage amortization & monthly surplus accumulation.
-                  </p>
+                  <p className="text-xs text-slate-400">{t.trajectorySub}</p>
                 </div>
                 <div className="flex items-center gap-1.5">
                   {[5, 10, 20].map((yr) => (
@@ -1142,28 +1684,26 @@ export const App: React.FC = () => {
               <WealthHorizonChart
                 history={wealthMode === 'combined' ? wealth.combinedFamilyWealth.history : []}
                 projection={
-                  wealthMode === 'combined'
-                    ? wealth.combinedFamilyWealth.projection
-                    : wealth.myWealth.projection
+                  wealthMode === 'combined' ? wealth.combinedFamilyWealth.projection : wealth.myWealth.projection
                 }
                 currency={cur}
                 privacyMode={privacyMode}
+                t={t}
               />
             </section>
 
-            {/* Assets / Belongings & Liabilities Registries */}
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
               <section className="bg-white border border-slate-200 rounded-lg overflow-hidden">
                 <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
                   <span className="text-xs font-mono-num uppercase tracking-wider text-slate-500 font-semibold">
-                    Belongings, Property & Investments
+                    {t.belongingsTitle}
                   </span>
                   <button
                     type="button"
                     onClick={() => setModal({ kind: 'asset' })}
                     className="inline-flex items-center gap-1 px-2 py-1 rounded bg-slate-900 text-white text-xs"
                   >
-                    <Plus className="w-3 h-3" /> Add Item
+                    <Plus className="w-3 h-3" /> {t.addItemBtn}
                   </button>
                 </div>
                 <div className="divide-y divide-slate-100">
@@ -1220,14 +1760,14 @@ export const App: React.FC = () => {
                 <section className="bg-white border border-slate-200 rounded-lg overflow-hidden">
                   <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
                     <span className="text-xs font-mono-num uppercase tracking-wider text-slate-500 font-semibold">
-                      Mortgages, Loans & Credit Cards
+                      {t.liabilitiesTitle}
                     </span>
                     <button
                       type="button"
                       onClick={() => setModal({ kind: 'liability' })}
                       className="inline-flex items-center gap-1 px-2 py-1 rounded border border-slate-200 text-xs text-slate-700"
                     >
-                      <Plus className="w-3 h-3" /> Add Liability
+                      <Plus className="w-3 h-3" /> {t.addLiabilityBtn}
                     </button>
                   </div>
                   <div className="divide-y divide-slate-100">
@@ -1252,8 +1792,8 @@ export const App: React.FC = () => {
                         <div>
                           <div className="text-xs font-medium text-slate-900">{lb.name}</div>
                           <div className="text-[11px] text-slate-500 font-mono-num">
-                            {(lb.aprBp / 100).toFixed(2)}% APR · Monthly{' '}
-                            {fmt(lb.displayMonthlyMinor, wealth.combinedFamilyWealth.totalAssetsMinor || 1)}
+                            {(lb.aprBp / 100).toFixed(2)}% APR ·{' '}
+                            {fmt(lb.displayMonthlyMinor, wealth.combinedFamilyWealth.totalAssetsMinor || 1)}/mo
                           </div>
                         </div>
                         <div className="font-mono-num text-xs font-semibold text-rose-700">
@@ -1264,18 +1804,17 @@ export const App: React.FC = () => {
                   </div>
                 </section>
 
-                {/* Historical & Current Salaries */}
                 <section className="bg-white border border-slate-200 rounded-lg overflow-hidden">
                   <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
                     <span className="text-xs font-mono-num uppercase tracking-wider text-slate-500 font-semibold">
-                      Salary & Income History
+                      {t.salaryHistoryTitle}
                     </span>
                     <button
                       type="button"
                       onClick={() => setModal({ kind: 'income' })}
                       className="inline-flex items-center gap-1 px-2 py-1 rounded border border-slate-200 text-xs text-slate-700"
                     >
-                      <Plus className="w-3 h-3" /> Add Income
+                      <Plus className="w-3 h-3" /> {t.addIncomeBtn}
                     </button>
                   </div>
                   <div className="divide-y divide-slate-100">
@@ -1284,7 +1823,7 @@ export const App: React.FC = () => {
                         <div>
                           <div className="font-medium text-slate-800">{inc.name}</div>
                           <div className="text-[11px] text-slate-400 font-mono-num">
-                            {inc.effectiveFrom} → {inc.effectiveTo || 'Present'} (Payday {inc.paydayDay})
+                            {inc.effectiveFrom} → {inc.effectiveTo || t.presentLabel} ({inc.paydayDay}.)
                           </div>
                         </div>
                         <div className="font-mono-num font-semibold text-slate-800">
@@ -1303,134 +1842,470 @@ export const App: React.FC = () => {
           </>
         )}
 
-        {/* ======================== TAB 5: SETTINGS, FX, PRIVACY & MCP ======================== */}
+        {/* ======================== TAB 5: SETTINGS, WORKSPACES, LOCAL USERS & MCP ======================== */}
         {tab === 'settings' && (
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
-            {/* Multi-Currency & Partner Privacy Scope */}
-            <section className="bg-white border border-slate-200 rounded-lg p-5 space-y-4">
-              <h2 className="text-xs font-mono-num uppercase tracking-wider text-slate-500 font-semibold">
-                Currency, Partner Privacy Scope & Household Split
-              </h2>
+            <div className="space-y-5">
+              {/* Preferences: Currency, Language (EN/PL), Partner Privacy & FX */}
+              <section className="bg-white border border-slate-200 rounded-lg p-5 space-y-4">
+                <h2 className="text-xs font-mono-num uppercase tracking-wider text-slate-500 font-semibold">
+                  {t.prefsSectionTitle}
+                </h2>
 
-              <form
-                className="space-y-4"
-                onSubmit={async (e) => {
-                  e.preventDefault();
-                  const fd = new FormData(e.currentTarget);
-                  const fxPayload = boot.fxRates
-                    .filter((r) => r.currency !== 'GBP')
-                    .map((r) => ({
-                      currency: r.currency,
-                      rateToGbp: Number(fd.get(`fx_${r.currency}`) || r.rateToGbp),
-                    }));
+                <form
+                  className="space-y-4"
+                  onSubmit={async (e) => {
+                    e.preventDefault();
+                    const fd = new FormData(e.currentTarget);
+                    const nextLoc = (fd.get('locale') as LocaleCode) || locale;
+                    setLocale(nextLoc);
+                    localStorage.setItem('skyday_locale', nextLoc);
 
-                  await apiFetch('/api/settings/preferences', {
-                    method: 'PATCH',
-                    body: JSON.stringify({
-                      defaultCurrency: fd.get('defaultCurrency'),
-                      partnerVisibility: fd.get('partnerVisibility') as PartnerVisibility,
-                      sharedSplitMode: fd.get('sharedSplitMode') as SplitMode,
-                    }),
-                  });
-                  await apiFetch('/api/settings/preferences', {
-                    method: 'PATCH',
-                    body: JSON.stringify({ fxRates: fxPayload }),
-                  });
-                  await reloadAll();
-                }}
-              >
-                <div className="grid grid-cols-2 gap-3">
+                    const fxPayload = boot.fxRates
+                      .filter((r) => r.currency !== 'GBP')
+                      .map((r) => ({
+                        currency: r.currency,
+                        rateToGbp: Number(fd.get(`fx_${r.currency}`) || r.rateToGbp),
+                      }));
+
+                    await apiFetch('/api/settings/preferences', {
+                      method: 'PATCH',
+                      body: JSON.stringify({
+                        defaultCurrency: fd.get('defaultCurrency'),
+                        locale: nextLoc,
+                        partnerVisibility: fd.get('partnerVisibility') as PartnerVisibility,
+                        sharedSplitMode: fd.get('sharedSplitMode') as SplitMode,
+                        fxRates: fxPayload,
+                      }),
+                    });
+                    await reloadAll();
+                  }}
+                >
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <label className="block text-xs space-y-1">
+                      <span className="text-slate-600 font-medium">{t.defaultCurrencyLabel}</span>
+                      <select
+                        name="defaultCurrency"
+                        defaultValue={boot.user.defaultCurrency}
+                        className="w-full border border-slate-200 rounded-md px-2.5 py-1.5 font-mono-num"
+                      >
+                        {(['GBP', 'EUR', 'PLN', 'USD', 'CHF'] as CurrencyCode[]).map((c) => (
+                          <option key={c} value={c}>
+                            {c} ({CURRENCY_SYMBOLS[c].trim()})
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+
+                    <label className="block text-xs space-y-1">
+                      <span className="text-slate-600 font-medium">{t.languageLabel}</span>
+                      <select
+                        name="locale"
+                        value={locale}
+                        onChange={(e) => void switchLocale(e.target.value as LocaleCode)}
+                        className="w-full border border-slate-200 rounded-md px-2.5 py-1.5"
+                      >
+                        <option value="en">English (EN)</option>
+                        <option value="pl">Polski (PL)</option>
+                      </select>
+                    </label>
+
+                    <label className="block text-xs space-y-1">
+                      <span className="text-slate-600 font-medium">{t.defaultSplitLabel}</span>
+                      <select
+                        name="sharedSplitMode"
+                        defaultValue={sharedWs?.defaultSplitMode || 'equal_50_50'}
+                        className="w-full border border-slate-200 rounded-md px-2.5 py-1.5"
+                      >
+                        <option value="equal_50_50">{t.splitEqual}</option>
+                        <option value="income_proportional">{t.splitProportional}</option>
+                        <option value="custom_bp">{t.splitCustom}</option>
+                      </select>
+                    </label>
+                  </div>
+
                   <label className="block text-xs space-y-1">
-                    <span className="text-slate-600 font-medium">My Default Display Currency</span>
+                    <span className="text-slate-600 font-medium">
+                      {t.privacyScopeLabel} ({boot.user.displayName})
+                    </span>
                     <select
-                      name="defaultCurrency"
-                      defaultValue={boot.user.defaultCurrency}
-                      className="w-full border border-slate-200 rounded-md px-2.5 py-1.5 font-mono-num"
-                    >
-                      {(['GBP', 'EUR', 'PLN', 'USD', 'CHF'] as CurrencyCode[]).map((c) => (
-                        <option key={c} value={c}>
-                          {c} ({CURRENCY_SYMBOLS[c].trim()})
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-
-                  <label className="block text-xs space-y-1">
-                    <span className="text-slate-600 font-medium">Default Shared Split</span>
-                    <select
-                      name="sharedSplitMode"
-                      defaultValue={sharedWs?.defaultSplitMode || 'equal_50_50'}
+                      name="partnerVisibility"
+                      defaultValue={myPersonalWs?.partnerVisibility || 'totals_only'}
                       className="w-full border border-slate-200 rounded-md px-2.5 py-1.5"
                     >
-                      <option value="equal_50_50">50 / 50 Equal Split</option>
-                      <option value="income_proportional">Proportional to Salary</option>
-                      <option value="custom_bp">Custom Percentage</option>
+                      <option value="private">{t.privStrict}</option>
+                      <option value="totals_only">{t.privTotals}</option>
+                      <option value="readonly">{t.privReadonly}</option>
                     </select>
                   </label>
-                </div>
 
-                <label className="block text-xs space-y-1">
-                  <span className="text-slate-600 font-medium">
-                    My Personal Workspace Privacy Scope ({boot.user.displayName})
-                  </span>
-                  <select
-                    name="partnerVisibility"
-                    defaultValue={myPersonalWs?.partnerVisibility || 'totals_only'}
-                    className="w-full border border-slate-200 rounded-md px-2.5 py-1.5"
+                  <div className="pt-2 border-t border-slate-100">
+                    <div className="text-xs font-medium text-slate-600 mb-2">{t.fxEstimatesLabel}</div>
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                      {boot.fxRates
+                        .filter((r) => r.currency !== 'GBP')
+                        .map((r) => (
+                          <label key={r.currency} className="block text-[11px] font-mono-num space-y-1">
+                            <span className="text-slate-500">1 {r.currency} = £</span>
+                            <input
+                              type="number"
+                              step="0.0001"
+                              name={`fx_${r.currency}`}
+                              defaultValue={r.rateToGbp}
+                              className="w-full border border-slate-200 rounded px-2 py-1"
+                            />
+                          </label>
+                        ))}
+                    </div>
+                  </div>
+
+                  <button
+                    type="submit"
+                    className="px-3.5 py-1.5 rounded-md bg-slate-900 text-white text-xs font-medium hover:bg-slate-800"
                   >
-                    <option value="private">Keep Strictly Private (hidden from partner & family totals)</option>
-                    <option value="totals_only">
-                      Include Aggregate Totals Only in Combined Family Wealth (hide individual items)
-                    </option>
-                    <option value="readonly">Share Read-Only with Partner</option>
-                  </select>
-                </label>
+                    {t.savePrefsBtn}
+                  </button>
+                </form>
+              </section>
 
-                <div className="pt-2 border-t border-slate-100">
-                  <div className="text-xs font-medium text-slate-600 mb-2">
-                    Fixed Multi-Currency Conversion Estimates (1 Unit → GBP)
-                  </div>
-                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                    {boot.fxRates
-                      .filter((r) => r.currency !== 'GBP')
-                      .map((r) => (
-                        <label key={r.currency} className="block text-[11px] font-mono-num space-y-1">
-                          <span className="text-slate-500">1 {r.currency} = £</span>
-                          <input
-                            type="number"
-                            step="0.0001"
-                            name={`fx_${r.currency}`}
-                            defaultValue={r.rateToGbp}
-                            className="w-full border border-slate-200 rounded px-2 py-1"
-                          />
-                        </label>
-                      ))}
-                  </div>
+              {/* Multi-Workspace Creation & Sharing (Company A, Company B, Household, Family) */}
+              <section className="bg-white border border-slate-200 rounded-lg p-5 space-y-4">
+                <div>
+                  <h2 className="text-xs font-mono-num uppercase tracking-wider text-slate-500 font-semibold flex items-center gap-1.5">
+                    <Building2 className="w-3.5 h-3.5 text-teal-700" /> {t.workspacesSectionTitle}
+                  </h2>
+                  <p className="text-[11px] text-slate-400 mt-0.5">{t.workspacesSectionSub}</p>
                 </div>
 
-                <button
-                  type="submit"
-                  className="px-3.5 py-1.5 rounded-md bg-slate-900 text-white text-xs font-medium hover:bg-slate-800"
+                <form
+                  className="flex flex-wrap items-center gap-2 text-xs"
+                  onSubmit={async (e) => {
+                    e.preventDefault();
+                    const fd = new FormData(e.currentTarget);
+                    const name = String(fd.get('name') || '').trim();
+                    const kind = (fd.get('kind') as WorkspaceKind) || 'company';
+                    if (!name) return;
+                    const res = await apiFetch<{ workspace: { id: string } }>('/api/workspaces', {
+                      method: 'POST',
+                      body: JSON.stringify({ name, kind }),
+                    });
+                    e.currentTarget.reset();
+                    await reloadAll();
+                    setScope(res.workspace.id);
+                  }}
                 >
-                  Save Preferences & FX Rates
-                </button>
-              </form>
-            </section>
+                  <input
+                    required
+                    name="name"
+                    placeholder={t.wsNamePlaceholder}
+                    className="flex-1 min-w-[160px] border border-slate-200 rounded px-2.5 py-1.5"
+                  />
+                  <select name="kind" defaultValue="company" className="border border-slate-200 rounded px-2 py-1.5">
+                    <option value="company">{t.wsKindCompany}</option>
+                    <option value="shared">{t.wsKindShared}</option>
+                    <option value="personal">{t.wsKindPersonal}</option>
+                  </select>
+                  <button
+                    type="submit"
+                    className="px-3 py-1.5 rounded bg-slate-900 text-white font-medium hover:bg-slate-800"
+                  >
+                    + {t.createWorkspaceBtn}
+                  </button>
+                </form>
 
-            {/* Bank Accounts + MCP Connector + Backups */}
+                <div className="divide-y divide-slate-100">
+                  {boot.workspaces.map((ws) => (
+                    <div key={ws.id} className="py-3 space-y-2 text-xs">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <span className="font-semibold text-slate-800">{ws.name}</span>
+                          <span className="text-[10px] font-mono-num px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 uppercase">
+                            {ws.kind}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setScope(ws.id);
+                              setTab('overview');
+                            }}
+                            className="px-2 py-1 rounded border border-slate-200 text-slate-700 hover:bg-slate-50 text-[11px]"
+                          >
+                            {t.openWorkspaceBtn}
+                          </button>
+                          {ws.canManage &&
+                            ws.id !== 'ws-home' &&
+                            ws.id !== 'ws-wadera' &&
+                            ws.id !== 'ws-walter' &&
+                            ws.id !== boot.user.personalWorkspaceId && (
+                              <button
+                                type="button"
+                                onClick={async () => {
+                                  if (!confirm(t.deleteWsConfirm(ws.name))) return;
+                                  await apiFetch(`/api/workspaces/${ws.id}`, { method: 'DELETE' });
+                                  if (scope === ws.id) setScope('all');
+                                  await reloadAll();
+                                }}
+                                className="text-rose-600 hover:underline text-[11px]"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            )}
+                        </div>
+                      </div>
+
+                      {/* Members & Sharing Controls */}
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        {ws.members.map((m) => (
+                          <span
+                            key={m.userId}
+                            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 text-[11px] text-slate-700"
+                          >
+                            <span>{m.displayName}</span>
+                            <span className="font-mono-num text-[10px] text-slate-400">({m.role})</span>
+                            {ws.canManage && m.userId !== ws.ownerUserId && (
+                              <button
+                                type="button"
+                                onClick={async () => {
+                                  await apiFetch(`/api/workspaces/${ws.id}/members/${m.userId}`, {
+                                    method: 'DELETE',
+                                  });
+                                  await reloadAll();
+                                }}
+                                className="text-slate-400 hover:text-rose-600 ml-0.5"
+                              >
+                                ×
+                              </button>
+                            )}
+                          </span>
+                        ))}
+                      </div>
+
+                      {ws.canManage && boot.users.length > 1 && (
+                        <form
+                          className="flex flex-wrap items-center gap-1.5 pt-1"
+                          onSubmit={async (e) => {
+                            e.preventDefault();
+                            const fd = new FormData(e.currentTarget);
+                            const targetUserId = String(fd.get('userId') || '');
+                            const role = (fd.get('role') as WorkspaceRole) || 'editor';
+                            if (!targetUserId) return;
+                            await apiFetch(`/api/workspaces/${ws.id}/members`, {
+                              method: 'POST',
+                              body: JSON.stringify({ userId: targetUserId, role }),
+                            });
+                            await reloadAll();
+                          }}
+                        >
+                          <select
+                            name="userId"
+                            defaultValue=""
+                            className="border border-slate-200 rounded px-2 py-1 text-[11px]"
+                          >
+                            <option value="" disabled>
+                              {t.shareWithUserPlaceholder}
+                            </option>
+                            {boot.users
+                              .filter((u) => u.id !== ws.ownerUserId)
+                              .map((u) => (
+                                <option key={u.id} value={u.id}>
+                                  {u.displayName} (@{u.handle})
+                                </option>
+                              ))}
+                          </select>
+                          <select
+                            name="role"
+                            defaultValue="editor"
+                            className="border border-slate-200 rounded px-2 py-1 text-[11px]"
+                          >
+                            <option value="editor">{t.roleEditor}</option>
+                            <option value="viewer">{t.roleViewer}</option>
+                            <option value="totals_only">{t.roleTotals}</option>
+                          </select>
+                          <button
+                            type="submit"
+                            className="px-2 py-1 rounded bg-teal-700 text-white text-[11px] font-medium hover:bg-teal-800"
+                          >
+                            {t.shareBtn}
+                          </button>
+                        </form>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </section>
+            </div>
+
             <div className="space-y-5">
+              {/* Users, Local Accounts (Brother / Friends outside Authentik SSO) & Password */}
+              <section className="bg-white border border-slate-200 rounded-lg p-5 space-y-4">
+                <div>
+                  <h2 className="text-xs font-mono-num uppercase tracking-wider text-slate-500 font-semibold flex items-center gap-1.5">
+                    <Users className="w-3.5 h-3.5 text-teal-700" /> {t.usersSectionTitle}
+                  </h2>
+                  <p className="text-[11px] text-slate-400 mt-0.5">{t.usersSectionSub}</p>
+                </div>
+
+                {inviteBanner && (
+                  <div className="p-2.5 rounded bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs flex items-center justify-between">
+                    <span>{inviteBanner}</span>
+                    <button type="button" onClick={() => setInviteBanner(null)}>
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                )}
+
+                {boot.user.isAdmin && (
+                  <form
+                    className="space-y-2.5 text-xs bg-[#FAF9F6] border border-slate-200 rounded-lg p-3.5"
+                    onSubmit={async (e) => {
+                      e.preventDefault();
+                      const formEl = e.currentTarget;
+                      const fd = new FormData(formEl);
+                      const handle = String(fd.get('handle') || '').trim();
+                      const displayName = String(fd.get('displayName') || '').trim();
+                      const email = String(fd.get('email') || '').trim();
+                      const password = String(fd.get('password') || '');
+                      const userLocale = (fd.get('locale') as LocaleCode) || locale;
+                      const defaultCurrency = (fd.get('defaultCurrency') as CurrencyCode) || cur;
+                      const shareWsId = String(fd.get('shareWsId') || '');
+
+                      const sharedWorkspaceGrants = shareWsId
+                        ? [{ workspaceId: shareWsId, role: 'editor' as WorkspaceRole }]
+                        : [];
+
+                      const res = await apiFetch<{ user: { handle: string; displayName: string } }>('/api/users/local', {
+                        method: 'POST',
+                        body: JSON.stringify({
+                          handle,
+                          displayName,
+                          email: email || undefined,
+                          password,
+                          locale: userLocale,
+                          defaultCurrency,
+                          sharedWorkspaceGrants,
+                        }),
+                      });
+
+                      const inviteText =
+                        userLocale === 'pl'
+                          ? `Zaproszenie do Skyday Finance (${window.location.origin}):\nLogin: ${res.user.handle}\nHasło: ${password}\n(Wybierz "lub zaloguj się kontem lokalnym")`
+                          : `Skyday Finance Invite (${window.location.origin}):\nUsername: ${res.user.handle}\nPassword: ${password}\n(Use "sign in with local account")`;
+                      await navigator.clipboard.writeText(inviteText).catch(() => {});
+                      setInviteBanner(t.inviteCopiedBanner);
+                      formEl.reset();
+                      await reloadAll();
+                    }}
+                  >
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      <input
+                        required
+                        name="handle"
+                        placeholder={t.localHandlePlaceholder}
+                        className="border border-slate-200 bg-white rounded px-2.5 py-1.5"
+                      />
+                      <input
+                        required
+                        name="displayName"
+                        placeholder={t.localDisplayPlaceholder}
+                        className="border border-slate-200 bg-white rounded px-2.5 py-1.5"
+                      />
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                      <input
+                        required
+                        type="password"
+                        minLength={6}
+                        name="password"
+                        placeholder={t.localPasswordPlaceholder}
+                        className="border border-slate-200 bg-white rounded px-2.5 py-1.5"
+                      />
+                      <select name="locale" defaultValue={locale} className="border border-slate-200 bg-white rounded px-2 py-1.5">
+                        <option value="en">English (EN)</option>
+                        <option value="pl">Polski (PL)</option>
+                      </select>
+                      <select
+                        name="defaultCurrency"
+                        defaultValue={cur}
+                        className="border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
+                      >
+                        {(['GBP', 'PLN', 'EUR', 'USD', 'CHF'] as CurrencyCode[]).map((c) => (
+                          <option key={c} value={c}>
+                            {c}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+                      <select
+                        name="shareWsId"
+                        defaultValue=""
+                        className="border border-slate-200 bg-white rounded px-2 py-1.5 text-[11px]"
+                      >
+                        <option value="">{t.noInitialShare}</option>
+                        {boot.workspaces
+                          .filter((w) => w.canManage)
+                          .map((w) => (
+                            <option key={w.id} value={w.id}>
+                              + {w.name}
+                            </option>
+                          ))}
+                      </select>
+                      <button
+                        type="submit"
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded bg-teal-700 text-white font-medium hover:bg-teal-800"
+                      >
+                        <UserPlus className="w-3.5 h-3.5" /> {t.createLocalUserBtn}
+                      </button>
+                    </div>
+                  </form>
+                )}
+
+                <div className="divide-y divide-slate-100">
+                  {boot.users.map((u) => (
+                    <div key={u.id} className="py-2 flex items-center justify-between text-xs">
+                      <div>
+                        <span className="font-medium text-slate-800">{u.displayName}</span>{' '}
+                        <span className="font-mono-num text-slate-400">@{u.handle}</span>{' '}
+                        <span className="text-[10px] font-mono-num px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 uppercase">
+                          {u.authProvider} · {u.locale}
+                        </span>
+                      </div>
+                      {boot.user.isAdmin && (
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            const nextPwd = prompt(t.resetPwdPrompt(u.displayName));
+                            if (!nextPwd || nextPwd.length < 6) return;
+                            await apiFetch(`/api/users/${u.id}`, {
+                              method: 'PATCH',
+                              body: JSON.stringify({ password: nextPwd }),
+                            });
+                            setInviteBanner(t.passwordUpdatedMsg);
+                          }}
+                          className="text-[11px] text-teal-700 hover:underline"
+                        >
+                          {t.resetPwdBtn}
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </section>
+
               {/* Bank Accounts */}
               <section className="bg-white border border-slate-200 rounded-lg p-5 space-y-3">
                 <div className="flex items-center justify-between">
                   <h2 className="text-xs font-mono-num uppercase tracking-wider text-slate-500 font-semibold flex items-center gap-1.5">
-                    <Landmark className="w-3.5 h-3.5" /> Bank & Runway Accounts
+                    <Landmark className="w-3.5 h-3.5" /> {t.bankAccountsTitle}
                   </h2>
                   <button
                     type="button"
                     onClick={() => setModal({ kind: 'account' })}
                     className="inline-flex items-center gap-1 px-2 py-1 rounded border border-slate-200 text-xs"
                   >
-                    <Plus className="w-3 h-3" /> Add Account
+                    <Plus className="w-3 h-3" /> {t.addAccountBtn}
                   </button>
                 </div>
                 <div className="divide-y divide-slate-100">
@@ -1453,11 +2328,9 @@ export const App: React.FC = () => {
                 <div className="space-y-2.5">
                   <div>
                     <h2 className="text-xs font-mono-num uppercase tracking-wider text-slate-500 font-semibold flex items-center gap-1.5">
-                      <Sparkles className="w-3.5 h-3.5 text-teal-700" /> AI / Receipt MCP Connector (`/api/mcp`)
+                      <Sparkles className="w-3.5 h-3.5 text-teal-700" /> {t.mcpSectionTitle}
                     </h2>
-                    <p className="text-[11px] text-slate-400">
-                      Mint a scoped key or 1-click copy a complete Agent Bootstrap Prompt (endpoint + token + MCP config) for any AI agent.
-                    </p>
+                    <p className="text-[11px] text-slate-400">{t.mcpSectionSub}</p>
                   </div>
 
                   <div className="flex flex-wrap items-center gap-2">
@@ -1492,23 +2365,7 @@ export const App: React.FC = () => {
                       }}
                       className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded bg-slate-900 text-white text-xs font-medium hover:bg-slate-800 transition"
                     >
-                      <Copy className="w-3.5 h-3.5 text-teal-400" /> Mint & Copy Bootstrap Prompt
-                    </button>
-                    <button
-                      type="button"
-                      onClick={async () => {
-                        const label = agentKeyLabel.trim() || `${boot.user.displayName} MCP Agent`;
-                        const res = await apiFetch<{ rawToken: string }>('/api/settings/api-keys', {
-                          method: 'POST',
-                          body: JSON.stringify({ label }),
-                        });
-                        setNewlyMintedKey(res.rawToken);
-                        setAgentKeyLabel('');
-                        await reloadAll();
-                      }}
-                      className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded border border-teal-700 text-teal-800 bg-teal-50/60 hover:bg-teal-100/70 text-xs font-medium transition"
-                    >
-                      <KeyRound className="w-3.5 h-3.5" /> Mint Key
+                      <Copy className="w-3.5 h-3.5 text-teal-400" /> {t.mintAndCopyBtn}
                     </button>
                   </div>
                 </div>
@@ -1521,66 +2378,10 @@ export const App: React.FC = () => {
                 )}
 
                 {newlyMintedKey && (
-                  <div className="p-3 rounded-lg bg-amber-50/80 border border-amber-200 text-xs space-y-2.5">
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <span className="font-semibold text-amber-900">
-                        New Scoped Token & Agent Bootstrap Prompt (shown once):
-                      </span>
-                      <div className="flex items-center gap-1.5">
-                        <button
-                          type="button"
-                          onClick={async () => {
-                            await navigator.clipboard.writeText(newlyMintedKey);
-                            setCopiedNotice('Raw token copied to clipboard!');
-                            setTimeout(() => setCopiedNotice(null), 3000);
-                          }}
-                          className="inline-flex items-center gap-1 px-2 py-1 rounded border border-amber-300 bg-white text-slate-700 text-[11px] hover:bg-amber-50"
-                        >
-                          <Copy className="w-3 h-3" /> Copy Token
-                        </button>
-                        <button
-                          type="button"
-                          onClick={async () => {
-                            const promptText = buildAgentBootstrapPrompt({
-                              origin: window.location.origin,
-                              displayName: boot.user.displayName,
-                              personalWorkspaceId: boot.user.personalWorkspaceId,
-                              defaultCurrency: boot.user.defaultCurrency,
-                              token: newlyMintedKey,
-                            });
-                            await navigator.clipboard.writeText(promptText);
-                            setCopiedNotice('Full Agent Bootstrap Prompt copied to clipboard!');
-                            setTimeout(() => setCopiedNotice(null), 3000);
-                          }}
-                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-teal-700 text-white text-[11px] font-medium hover:bg-teal-800"
-                        >
-                          <Copy className="w-3 h-3" /> Copy Bootstrap Prompt
-                        </button>
-                      </div>
-                    </div>
-
+                  <div className="p-3 rounded-lg bg-amber-50/80 border border-amber-200 text-xs space-y-2">
                     <div className="font-mono-num text-[11px] bg-white border border-amber-200 rounded px-2.5 py-1.5 break-all select-all text-slate-800">
                       {newlyMintedKey}
                     </div>
-
-                    <details className="group">
-                      <summary className="cursor-pointer text-[11px] font-medium text-teal-800 hover:underline">
-                        Preview / manually select full Agent Bootstrap Prompt
-                      </summary>
-                      <textarea
-                        readOnly
-                        rows={11}
-                        onFocus={(e) => e.currentTarget.select()}
-                        value={buildAgentBootstrapPrompt({
-                          origin: window.location.origin,
-                          displayName: boot.user.displayName,
-                          personalWorkspaceId: boot.user.personalWorkspaceId,
-                          defaultCurrency: boot.user.defaultCurrency,
-                          token: newlyMintedKey,
-                        })}
-                        className="mt-2 w-full font-mono-num text-[11px] bg-white border border-slate-200 rounded p-2.5 text-slate-700 leading-relaxed"
-                      />
-                    </details>
                   </div>
                 )}
 
@@ -1598,7 +2399,7 @@ export const App: React.FC = () => {
                         }}
                         className="text-rose-600 hover:underline"
                       >
-                        Revoke
+                        {t.revokeBtn}
                       </button>
                     </div>
                   ))}
@@ -1608,14 +2409,14 @@ export const App: React.FC = () => {
               {/* Persistent Storage Backup & Starter Data Controls */}
               <section className="bg-white border border-slate-200 rounded-lg p-5 space-y-3">
                 <h2 className="text-xs font-mono-num uppercase tracking-wider text-slate-500 font-semibold">
-                  Persistent Storage & Data Controls
+                  {t.storageSectionTitle}
                 </h2>
                 <div className="flex flex-wrap gap-2">
                   <a
                     href="/api/settings/backup"
                     className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50"
                   >
-                    <Download className="w-3.5 h-3.5" /> Download SQLite Backup
+                    <Download className="w-3.5 h-3.5" /> {t.downloadBackupBtn}
                   </a>
                   <button
                     type="button"
@@ -1628,12 +2429,12 @@ export const App: React.FC = () => {
                     }}
                     className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded border border-slate-200 text-xs text-slate-600 hover:bg-slate-50"
                   >
-                    <RefreshCw className="w-3.5 h-3.5" /> Reset Demo Data
+                    <RefreshCw className="w-3.5 h-3.5" /> {t.resetDemoBtn}
                   </button>
                   <button
                     type="button"
                     onClick={async () => {
-                      if (!confirm('Clear all financial entries and start from an empty ledger?')) return;
+                      if (!confirm('Clear all financial entries?')) return;
                       await apiFetch('/api/settings/sample-data', {
                         method: 'POST',
                         body: JSON.stringify({ action: 'clear' }),
@@ -1642,7 +2443,7 @@ export const App: React.FC = () => {
                     }}
                     className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded border border-rose-200 text-xs text-rose-700 hover:bg-rose-50"
                   >
-                    <Trash2 className="w-3.5 h-3.5" /> Clear All Entries
+                    <Trash2 className="w-3.5 h-3.5" /> {t.clearAllBtn}
                   </button>
                 </div>
               </section>
@@ -1661,7 +2462,7 @@ export const App: React.FC = () => {
             <div className="flex items-start justify-between gap-2">
               <div>
                 <div className="text-[10px] font-mono-num uppercase tracking-wider text-teal-700">
-                  {drawer.entityType} details
+                  {drawer.entityType} {t.detailsSuffix}
                 </div>
                 <h3 className="text-lg font-semibold text-slate-900">{drawer.title}</h3>
                 <p className="text-xs text-slate-500 font-mono-num">{drawer.subtitle}</p>
@@ -1671,11 +2472,10 @@ export const App: React.FC = () => {
               </button>
             </div>
 
-            {/* Actionable Portal Links */}
             {(drawer.manageUrl || drawer.portalUrl || drawer.referenceNumber) && (
               <div className="p-3.5 rounded-lg bg-[#FAF9F6] border border-slate-200 space-y-2">
                 <div className="text-[11px] font-mono-num uppercase text-slate-500 font-semibold">
-                  Actionable Links & Policy Reference
+                  {t.actionableLinksTitle}
                 </div>
                 {drawer.manageUrl && (
                   <a
@@ -1684,7 +2484,7 @@ export const App: React.FC = () => {
                     rel="noreferrer"
                     className="flex items-center justify-between text-xs font-medium text-teal-800 hover:underline"
                   >
-                    <span>Manage / Cancel / Renewal Portal</span>
+                    <span>{t.managePortalLink}</span>
                     <ExternalLink className="w-3.5 h-3.5" />
                   </a>
                 )}
@@ -1695,23 +2495,22 @@ export const App: React.FC = () => {
                     rel="noreferrer"
                     className="flex items-center justify-between text-xs font-medium text-slate-700 hover:underline"
                   >
-                    <span>Provider Account Login</span>
+                    <span>{t.providerLoginLink}</span>
                     <ExternalLink className="w-3.5 h-3.5" />
                   </a>
                 )}
                 {drawer.referenceNumber && (
                   <div className="text-xs font-mono-num text-slate-600">
-                    Ref / Policy #: <span className="font-semibold">{drawer.referenceNumber}</span>
+                    {t.refPolicyLabel} <span className="font-semibold">{drawer.referenceNumber}</span>
                   </div>
                 )}
               </div>
             )}
 
-            {/* Sub-items breakdown if receipt */}
             {drawer.items && drawer.items.length > 0 && (
               <div className="space-y-1.5">
                 <div className="text-[11px] font-mono-num uppercase text-slate-500 font-semibold">
-                  Itemized Sub-Categories
+                  {t.itemizedSubTitle}
                 </div>
                 <div className="border border-slate-200 rounded-md divide-y divide-slate-100">
                   {drawer.items.map((it) => (
@@ -1721,7 +2520,9 @@ export const App: React.FC = () => {
                         {it.subCategory && <span className="text-slate-400"> · {it.subCategory}</span>}
                       </div>
                       <span className="font-mono-num">
-                        {privacyMode ? '•••' : `${CURRENCY_SYMBOLS[drawer.currency]}${(it.amountMinor / 100).toFixed(2)}`}
+                        {privacyMode
+                          ? '•••'
+                          : `${CURRENCY_SYMBOLS[drawer.currency]}${(it.amountMinor / 100).toFixed(2)}`}
                       </span>
                     </div>
                   ))}
@@ -1735,14 +2536,13 @@ export const App: React.FC = () => {
               </div>
             )}
 
-            {/* Attachments / Invoices / Receipts Vault */}
             <div className="space-y-3 pt-2 border-t border-slate-200">
               <div className="flex items-center justify-between">
                 <span className="text-xs font-mono-num uppercase tracking-wider text-slate-500 font-semibold">
-                  Attached Invoices, PDFs & Photos ({drawerAttachments.length})
+                  {t.attachmentsTitle} ({drawerAttachments.length})
                 </span>
                 <label className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-slate-900 text-white text-xs cursor-pointer">
-                  <Upload className="w-3 h-3" /> Attach File
+                  <Upload className="w-3 h-3" /> {t.attachFileBtn}
                   <input
                     type="file"
                     accept="image/*,application/pdf"
@@ -1764,9 +2564,7 @@ export const App: React.FC = () => {
               </div>
 
               {drawerAttachments.length === 0 ? (
-                <div className="text-xs text-slate-400">
-                  No documents attached yet. Attach PDFs, insurance policies, or shop receipts here.
-                </div>
+                <div className="text-xs text-slate-400">{t.noAttachments}</div>
               ) : (
                 <div className="space-y-2">
                   {drawerAttachments.map((att) => (
@@ -1799,7 +2597,6 @@ export const App: React.FC = () => {
               )}
             </div>
 
-            {/* Delete Item */}
             <div className="pt-4 border-t border-slate-100">
               <button
                 type="button"
@@ -1812,6 +2609,8 @@ export const App: React.FC = () => {
                       ? `/api/expenses/${drawer.entityId}`
                       : drawer.entityType === 'asset'
                       ? `/api/assets/${drawer.entityId}`
+                      : drawer.entityType === 'pot'
+                      ? `/api/pots/${drawer.entityId}`
                       : `/api/liabilities/${drawer.entityId}`;
                   await apiFetch(endpoint, { method: 'DELETE' });
                   setDrawer(null);
@@ -1819,26 +2618,72 @@ export const App: React.FC = () => {
                 }}
                 className="text-xs text-rose-600 hover:underline inline-flex items-center gap-1"
               >
-                <Trash2 className="w-3.5 h-3.5" /> Delete record
+                <Trash2 className="w-3.5 h-3.5" /> {t.deleteRecordBtn}
               </button>
             </div>
           </div>
         </div>
       )}
 
-      {/* ======================== QUICK CREATION MODALS ======================== */}
+      {/* ======================== CREATION MODALS ======================== */}
       {modal && (
-        <div className="fixed inset-0 z-50 bg-slate-900/35 flex items-center justify-center p-4" onClick={() => setModal(null)}>
+        <div
+          className="fixed inset-0 z-50 bg-slate-900/35 flex items-center justify-center p-4"
+          onClick={() => setModal(null)}
+        >
           <div
             className="bg-white border border-slate-200 rounded-xl max-w-lg w-full p-6 space-y-4 shadow-lg"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center justify-between">
-              <h3 className="text-sm font-semibold text-slate-900 capitalize">Add {modal.kind}</h3>
+              <h3 className="text-sm font-semibold text-slate-900 capitalize">
+                {modal.kind === 'workspace' ? t.createWorkspaceBtn : `+ ${modal.kind}`}
+              </h3>
               <button type="button" onClick={() => setModal(null)}>
                 <X className="w-4 h-4 text-slate-400" />
               </button>
             </div>
+
+            {modal.kind === 'workspace' && (
+              <form
+                className="space-y-3 text-xs"
+                onSubmit={async (e) => {
+                  e.preventDefault();
+                  const fd = new FormData(e.currentTarget);
+                  const res = await apiFetch<{ workspace: { id: string } }>('/api/workspaces', {
+                    method: 'POST',
+                    body: JSON.stringify({
+                      name: fd.get('name'),
+                      kind: fd.get('kind'),
+                    }),
+                  });
+                  setModal(null);
+                  await reloadAll();
+                  setScope(res.workspace.id);
+                }}
+              >
+                <label className="block space-y-1">
+                  <span>Workspace Name</span>
+                  <input
+                    required
+                    name="name"
+                    placeholder={t.wsNamePlaceholder}
+                    className="w-full border border-slate-200 rounded px-2.5 py-1.5"
+                  />
+                </label>
+                <label className="block space-y-1">
+                  <span>Kind</span>
+                  <select name="kind" defaultValue="company" className="w-full border border-slate-200 rounded px-2 py-1.5">
+                    <option value="company">{t.wsKindCompany}</option>
+                    <option value="shared">{t.wsKindShared}</option>
+                    <option value="personal">{t.wsKindPersonal}</option>
+                  </select>
+                </label>
+                <button type="submit" className="w-full py-2 rounded bg-slate-900 text-white font-medium">
+                  {t.createWorkspaceBtn}
+                </button>
+              </form>
+            )}
 
             {modal.kind === 'obligation' && (
               <form
@@ -1869,8 +2714,12 @@ export const App: React.FC = () => {
               >
                 <div className="grid grid-cols-2 gap-2.5">
                   <label className="space-y-1">
-                    <span>Budget Scope</span>
-                    <select name="workspaceId" className="w-full border border-slate-200 rounded px-2 py-1.5">
+                    <span>Workspace</span>
+                    <select
+                      name="workspaceId"
+                      defaultValue={defaultActiveWsId}
+                      className="w-full border border-slate-200 rounded px-2 py-1.5"
+                    >
                       {writableWorkspaces.map((w) => (
                         <option key={w.id} value={w.id}>
                           {w.name}
@@ -1879,12 +2728,16 @@ export const App: React.FC = () => {
                     </select>
                   </label>
                   <label className="space-y-1">
-                    <span>Pot</span>
-                    <select name="potId" className="w-full border border-slate-200 rounded px-2 py-1.5">
+                    <span>Pot (any nesting depth)</span>
+                    <select
+                      name="potId"
+                      defaultValue={modal.defaultPotId || selectedPotId || ''}
+                      className="w-full border border-slate-200 rounded px-2 py-1.5"
+                    >
                       <option value="">— Unassigned —</option>
                       {budget.pots.map((p) => (
                         <option key={p.id} value={p.id}>
-                          {p.name}
+                          {potBreadcrumbs.get(p.id)?.pathString || p.name}
                         </option>
                       ))}
                     </select>
@@ -1896,7 +2749,7 @@ export const App: React.FC = () => {
                   <input
                     required
                     name="name"
-                    placeholder="e.g. Summer Vacation, Car Insurance, Netflix"
+                    placeholder="e.g. Electricity, Car Insurance, Netflix"
                     className="w-full border border-slate-200 rounded px-2.5 py-1.5"
                   />
                 </label>
@@ -1915,7 +2768,11 @@ export const App: React.FC = () => {
                   </label>
                   <label className="space-y-1">
                     <span>Currency</span>
-                    <select name="currency" defaultValue={cur} className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num">
+                    <select
+                      name="currency"
+                      defaultValue={cur}
+                      className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num"
+                    >
                       {(['GBP', 'EUR', 'PLN', 'USD', 'CHF'] as CurrencyCode[]).map((c) => (
                         <option key={c} value={c}>
                           {c}
@@ -1925,13 +2782,16 @@ export const App: React.FC = () => {
                   </label>
                   <label className="space-y-1">
                     <span>Cadence</span>
-                    <select name="cadence" defaultValue="monthly" className="w-full border border-slate-200 rounded px-2 py-1.5">
+                    <select
+                      name="cadence"
+                      defaultValue="monthly"
+                      className="w-full border border-slate-200 rounded px-2 py-1.5"
+                    >
                       <option value="monthly">Monthly</option>
                       <option value="annual">Yearly (12m)</option>
                       <option value="quarterly">Quarterly (3m)</option>
                       <option value="biannual">Every 6m</option>
                       <option value="once">One-Time Planned</option>
-                      <option value="custom_months">Custom N Months</option>
                     </select>
                   </label>
                 </div>
@@ -1943,7 +2803,7 @@ export const App: React.FC = () => {
                       required
                       type="date"
                       name="nextDueDate"
-                      defaultValue={`${yearMonth}-15`}
+                      defaultValue={`${yearMonth}-01`}
                       className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num"
                     />
                   </label>
@@ -1965,7 +2825,7 @@ export const App: React.FC = () => {
                 </label>
 
                 <label className="block space-y-1">
-                  <span>Manage / Cancel / Insurance Portal URL (optional)</span>
+                  <span>Manage / Cancel Portal URL (optional)</span>
                   <input
                     type="url"
                     name="manageUrl"
@@ -1975,7 +2835,7 @@ export const App: React.FC = () => {
                 </label>
 
                 <button type="submit" className="w-full py-2 rounded bg-slate-900 text-white font-medium">
-                  Save Scheduled Obligation
+                  {t.qaSave}
                 </button>
               </form>
             )}
@@ -2005,7 +2865,11 @@ export const App: React.FC = () => {
                 <div className="grid grid-cols-2 gap-2.5">
                   <label className="space-y-1">
                     <span>Workspace</span>
-                    <select name="workspaceId" className="w-full border border-slate-200 rounded px-2 py-1.5">
+                    <select
+                      name="workspaceId"
+                      defaultValue={defaultActiveWsId}
+                      className="w-full border border-slate-200 rounded px-2 py-1.5"
+                    >
                       {writableWorkspaces.map((w) => (
                         <option key={w.id} value={w.id}>
                           {w.name}
@@ -2015,11 +2879,15 @@ export const App: React.FC = () => {
                   </label>
                   <label className="space-y-1">
                     <span>Pot / Sub-Pot</span>
-                    <select name="potId" className="w-full border border-slate-200 rounded px-2 py-1.5">
+                    <select
+                      name="potId"
+                      defaultValue={modal.defaultPotId || selectedPotId || ''}
+                      className="w-full border border-slate-200 rounded px-2 py-1.5"
+                    >
                       <option value="">— Unassigned —</option>
                       {budget.pots.map((p) => (
                         <option key={p.id} value={p.id}>
-                          {p.name}
+                          {potBreadcrumbs.get(p.id)?.pathString || p.name}
                         </option>
                       ))}
                     </select>
@@ -2027,16 +2895,31 @@ export const App: React.FC = () => {
                 </div>
                 <label className="block space-y-1">
                   <span>Merchant / Shop</span>
-                  <input required name="merchant" placeholder="Aldi, Shell, Amazon..." className="w-full border border-slate-200 rounded px-2.5 py-1.5" />
+                  <input
+                    required
+                    name="merchant"
+                    placeholder="Aldi, Shell, Amazon..."
+                    className="w-full border border-slate-200 rounded px-2.5 py-1.5"
+                  />
                 </label>
                 <div className="grid grid-cols-3 gap-2">
                   <label className="space-y-1">
                     <span>Amount</span>
-                    <input required type="number" step="0.01" name="amountMajor" className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num" />
+                    <input
+                      required
+                      type="number"
+                      step="0.01"
+                      name="amountMajor"
+                      className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num"
+                    />
                   </label>
                   <label className="space-y-1">
                     <span>Currency</span>
-                    <select name="currency" defaultValue={cur} className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num">
+                    <select
+                      name="currency"
+                      defaultValue={cur}
+                      className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num"
+                    >
                       {(['GBP', 'EUR', 'PLN', 'USD', 'CHF'] as CurrencyCode[]).map((c) => (
                         <option key={c} value={c}>
                           {c}
@@ -2046,15 +2929,25 @@ export const App: React.FC = () => {
                   </label>
                   <label className="space-y-1">
                     <span>Date</span>
-                    <input required type="date" name="spentDate" defaultValue={new Date().toISOString().slice(0, 10)} className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num" />
+                    <input
+                      required
+                      type="date"
+                      name="spentDate"
+                      defaultValue={new Date().toISOString().slice(0, 10)}
+                      className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num"
+                    />
                   </label>
                 </div>
                 <label className="block space-y-1">
                   <span>Notes</span>
-                  <input name="description" placeholder="Optional details" className="w-full border border-slate-200 rounded px-2.5 py-1.5" />
+                  <input
+                    name="description"
+                    placeholder="Optional details"
+                    className="w-full border border-slate-200 rounded px-2.5 py-1.5"
+                  />
                 </label>
                 <button type="submit" className="w-full py-2 rounded bg-slate-900 text-white font-medium">
-                  Save Expense
+                  {t.qaSave}
                 </button>
               </form>
             )}
@@ -2085,7 +2978,11 @@ export const App: React.FC = () => {
                 <div className="grid grid-cols-2 gap-2.5">
                   <label className="space-y-1">
                     <span>Workspace</span>
-                    <select name="workspaceId" className="w-full border border-slate-200 rounded px-2 py-1.5">
+                    <select
+                      name="workspaceId"
+                      defaultValue={defaultActiveWsId}
+                      className="w-full border border-slate-200 rounded px-2 py-1.5"
+                    >
                       {writableWorkspaces.map((w) => (
                         <option key={w.id} value={w.id}>
                           {w.name}
@@ -2094,12 +2991,16 @@ export const App: React.FC = () => {
                     </select>
                   </label>
                   <label className="space-y-1">
-                    <span>Parent Pot (optional nesting)</span>
-                    <select name="parentId" className="w-full border border-slate-200 rounded px-2 py-1.5">
+                    <span>Parent Pot (unlimited nesting)</span>
+                    <select
+                      name="parentId"
+                      defaultValue={modal.defaultParentId || ''}
+                      className="w-full border border-slate-200 rounded px-2 py-1.5"
+                    >
                       <option value="">— Top-Level Pot —</option>
                       {budget.pots.map((p) => (
                         <option key={p.id} value={p.id}>
-                          {p.name}
+                          {potBreadcrumbs.get(p.id)?.pathString || p.name}
                         </option>
                       ))}
                     </select>
@@ -2108,19 +3009,35 @@ export const App: React.FC = () => {
                 <div className="grid grid-cols-3 gap-2">
                   <label className="col-span-2 space-y-1">
                     <span>Pot Name</span>
-                    <input required name="name" placeholder="e.g. Food, Butter, Car Maintenance" className="w-full border border-slate-200 rounded px-2.5 py-1.5" />
+                    <input
+                      required
+                      name="name"
+                      placeholder="e.g. Food, Butter, Car Maintenance"
+                      className="w-full border border-slate-200 rounded px-2.5 py-1.5"
+                    />
                   </label>
                   <label className="space-y-1">
                     <span>Color</span>
-                    <input type="color" name="color" defaultValue="#2E6F7E" className="w-full h-8 border border-slate-200 rounded" />
+                    <input
+                      type="color"
+                      name="color"
+                      defaultValue="#2E6F7E"
+                      className="w-full h-8 border border-slate-200 rounded"
+                    />
                   </label>
                 </div>
                 <label className="block space-y-1">
-                  <span>Rough Monthly Envelope Estimate (leave 0 if purely itemized/bill-driven)</span>
-                  <input type="number" step="1" name="monthlyEstimateMajor" defaultValue="0" className="w-full border border-slate-200 rounded px-2.5 py-1.5 font-mono-num" />
+                  <span>Rough Monthly Envelope Estimate (0 = container/itemized)</span>
+                  <input
+                    type="number"
+                    step="1"
+                    name="monthlyEstimateMajor"
+                    defaultValue="0"
+                    className="w-full border border-slate-200 rounded px-2.5 py-1.5 font-mono-num"
+                  />
                 </label>
                 <button type="submit" className="w-full py-2 rounded bg-slate-900 text-white font-medium">
-                  Create Pot
+                  {t.qaSave}
                 </button>
               </form>
             )}
@@ -2142,7 +3059,6 @@ export const App: React.FC = () => {
                       currency: fd.get('currency'),
                       annualRateBp: Math.round(Number(fd.get('annualRatePct') || 0) * 100),
                       residualFloorMinor: Math.round(Number(fd.get('residualFloorMajor') || 0) * 100),
-                      portalUrl: fd.get('portalUrl') || null,
                     }),
                   });
                   setModal(null);
@@ -2151,8 +3067,12 @@ export const App: React.FC = () => {
               >
                 <div className="grid grid-cols-2 gap-2.5">
                   <label className="space-y-1">
-                    <span>Owner Scope</span>
-                    <select name="workspaceId" className="w-full border border-slate-200 rounded px-2 py-1.5">
+                    <span>Workspace</span>
+                    <select
+                      name="workspaceId"
+                      defaultValue={defaultActiveWsId}
+                      className="w-full border border-slate-200 rounded px-2 py-1.5"
+                    >
                       {writableWorkspaces.map((w) => (
                         <option key={w.id} value={w.id}>
                           {w.name}
@@ -2172,16 +3092,30 @@ export const App: React.FC = () => {
                 </div>
                 <label className="block space-y-1">
                   <span>Item Name</span>
-                  <input required name="name" placeholder="e.g. Electric Mountain Bike, House, Car" className="w-full border border-slate-200 rounded px-2.5 py-1.5" />
+                  <input
+                    required
+                    name="name"
+                    className="w-full border border-slate-200 rounded px-2.5 py-1.5"
+                  />
                 </label>
                 <div className="grid grid-cols-3 gap-2">
                   <label className="space-y-1">
                     <span>Current Value</span>
-                    <input required type="number" step="1" name="currentValueMajor" className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num" />
+                    <input
+                      required
+                      type="number"
+                      step="1"
+                      name="currentValueMajor"
+                      className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num"
+                    />
                   </label>
                   <label className="space-y-1">
                     <span>Currency</span>
-                    <select name="currency" defaultValue={cur} className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num">
+                    <select
+                      name="currency"
+                      defaultValue={cur}
+                      className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num"
+                    >
                       {(['GBP', 'EUR', 'PLN', 'USD', 'CHF'] as CurrencyCode[]).map((c) => (
                         <option key={c} value={c}>
                           {c}
@@ -2191,21 +3125,18 @@ export const App: React.FC = () => {
                   </label>
                   <label className="space-y-1">
                     <span>Annual % (+ or -)</span>
-                    <input required type="number" step="0.1" name="annualRatePct" defaultValue="-15" className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num" />
-                  </label>
-                </div>
-                <div className="grid grid-cols-2 gap-2.5">
-                  <label className="space-y-1">
-                    <span>Purchase Price</span>
-                    <input type="number" step="1" name="purchasePriceMajor" defaultValue="0" className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num" />
-                  </label>
-                  <label className="space-y-1">
-                    <span>Minimum Residual Floor</span>
-                    <input type="number" step="1" name="residualFloorMajor" defaultValue="0" className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num" />
+                    <input
+                      required
+                      type="number"
+                      step="0.1"
+                      name="annualRatePct"
+                      defaultValue="-15"
+                      className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num"
+                    />
                   </label>
                 </div>
                 <button type="submit" className="w-full py-2 rounded bg-slate-900 text-white font-medium">
-                  Save Asset / Belonging
+                  {t.qaSave}
                 </button>
               </form>
             )}
@@ -2225,7 +3156,7 @@ export const App: React.FC = () => {
                       balanceMinor: Math.round(Number(fd.get('balanceMajor') || 0) * 100),
                       aprBp: Math.round(Number(fd.get('aprPct') || 0) * 100),
                       monthlyPaymentMinor: Math.round(Number(fd.get('monthlyMajor') || 0) * 100),
-                      currency: fd.get('currency'),
+                      currency: cur,
                     }),
                   });
                   setModal(null);
@@ -2234,8 +3165,12 @@ export const App: React.FC = () => {
               >
                 <div className="grid grid-cols-2 gap-2.5">
                   <label className="space-y-1">
-                    <span>Scope</span>
-                    <select name="workspaceId" className="w-full border border-slate-200 rounded px-2 py-1.5">
+                    <span>Workspace</span>
+                    <select
+                      name="workspaceId"
+                      defaultValue={defaultActiveWsId}
+                      className="w-full border border-slate-200 rounded px-2 py-1.5"
+                    >
                       {writableWorkspaces.map((w) => (
                         <option key={w.id} value={w.id}>
                           {w.name}
@@ -2259,20 +3194,38 @@ export const App: React.FC = () => {
                 <div className="grid grid-cols-3 gap-2">
                   <label className="space-y-1">
                     <span>Balance</span>
-                    <input required type="number" step="0.01" name="balanceMajor" className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num" />
+                    <input
+                      required
+                      type="number"
+                      step="0.01"
+                      name="balanceMajor"
+                      className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num"
+                    />
                   </label>
                   <label className="space-y-1">
                     <span>APR %</span>
-                    <input required type="number" step="0.01" name="aprPct" defaultValue="4.2" className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num" />
+                    <input
+                      required
+                      type="number"
+                      step="0.01"
+                      name="aprPct"
+                      defaultValue="4.2"
+                      className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num"
+                    />
                   </label>
                   <label className="space-y-1">
                     <span>Monthly Payment</span>
-                    <input required type="number" step="0.01" name="monthlyMajor" className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num" />
+                    <input
+                      required
+                      type="number"
+                      step="0.01"
+                      name="monthlyMajor"
+                      className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num"
+                    />
                   </label>
                 </div>
-                <input type="hidden" name="currency" value={cur} />
                 <button type="submit" className="w-full py-2 rounded bg-slate-900 text-white font-medium">
-                  Save Liability
+                  {t.qaSave}
                 </button>
               </form>
             )}
@@ -2286,12 +3239,12 @@ export const App: React.FC = () => {
                   await apiFetch('/api/incomes', {
                     method: 'POST',
                     body: JSON.stringify({
-                      workspaceId: boot.user.personalWorkspaceId,
+                      workspaceId: fd.get('workspaceId') || boot.user.personalWorkspaceId,
                       name: fd.get('name'),
                       amountMinor: Math.round(Number(fd.get('amountMajor') || 0) * 100),
                       currency: fd.get('currency'),
                       cadence: fd.get('cadence'),
-                      paydayDay: Number(fd.get('paydayDay') || 25),
+                      paydayDay: Number(fd.get('paydayDay') || 27),
                       effectiveFrom: fd.get('effectiveFrom'),
                       effectiveTo: fd.get('effectiveTo') || null,
                     }),
@@ -2300,18 +3253,49 @@ export const App: React.FC = () => {
                   await reloadAll();
                 }}
               >
-                <label className="block space-y-1">
-                  <span>Income / Salary Title</span>
-                  <input required name="name" placeholder="Net Monthly Salary" className="w-full border border-slate-200 rounded px-2.5 py-1.5" />
-                </label>
+                <div className="grid grid-cols-2 gap-2">
+                  <label className="space-y-1">
+                    <span>Workspace</span>
+                    <select
+                      name="workspaceId"
+                      defaultValue={defaultActiveWsId}
+                      className="w-full border border-slate-200 rounded px-2 py-1.5"
+                    >
+                      {writableWorkspaces.map((w) => (
+                        <option key={w.id} value={w.id}>
+                          {w.name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="space-y-1">
+                    <span>Income / Salary Title</span>
+                    <input
+                      required
+                      name="name"
+                      placeholder="Net Monthly Salary"
+                      className="w-full border border-slate-200 rounded px-2.5 py-1.5"
+                    />
+                  </label>
+                </div>
                 <div className="grid grid-cols-3 gap-2">
                   <label className="space-y-1">
                     <span>Net Amount</span>
-                    <input required type="number" step="0.01" name="amountMajor" className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num" />
+                    <input
+                      required
+                      type="number"
+                      step="0.01"
+                      name="amountMajor"
+                      className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num"
+                    />
                   </label>
                   <label className="space-y-1">
                     <span>Currency</span>
-                    <select name="currency" defaultValue={cur} className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num">
+                    <select
+                      name="currency"
+                      defaultValue={cur}
+                      className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num"
+                    >
                       {(['GBP', 'EUR', 'PLN', 'USD', 'CHF'] as CurrencyCode[]).map((c) => (
                         <option key={c} value={c}>
                           {c}
@@ -2321,7 +3305,11 @@ export const App: React.FC = () => {
                   </label>
                   <label className="space-y-1">
                     <span>Cadence</span>
-                    <select name="cadence" defaultValue="monthly" className="w-full border border-slate-200 rounded px-2 py-1.5">
+                    <select
+                      name="cadence"
+                      defaultValue="monthly"
+                      className="w-full border border-slate-200 rounded px-2 py-1.5"
+                    >
                       <option value="monthly">Monthly</option>
                       <option value="annual">Annual</option>
                     </select>
@@ -2330,19 +3318,36 @@ export const App: React.FC = () => {
                 <div className="grid grid-cols-3 gap-2">
                   <label className="space-y-1">
                     <span>Payday (1-28)</span>
-                    <input type="number" min={1} max={28} name="paydayDay" defaultValue={25} className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num" />
+                    <input
+                      type="number"
+                      min={1}
+                      max={28}
+                      name="paydayDay"
+                      defaultValue={27}
+                      className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num"
+                    />
                   </label>
                   <label className="space-y-1">
                     <span>From</span>
-                    <input required type="date" name="effectiveFrom" defaultValue={`${yearMonth}-01`} className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num" />
+                    <input
+                      required
+                      type="date"
+                      name="effectiveFrom"
+                      defaultValue={`${yearMonth}-01`}
+                      className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num"
+                    />
                   </label>
                   <label className="space-y-1">
                     <span>To (blank = current)</span>
-                    <input type="date" name="effectiveTo" className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num" />
+                    <input
+                      type="date"
+                      name="effectiveTo"
+                      className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num"
+                    />
                   </label>
                 </div>
                 <button type="submit" className="w-full py-2 rounded bg-slate-900 text-white font-medium">
-                  Save Income Stream
+                  {t.qaSave}
                 </button>
               </form>
             )}
@@ -2371,7 +3376,11 @@ export const App: React.FC = () => {
                 <div className="grid grid-cols-2 gap-2.5">
                   <label className="space-y-1">
                     <span>Workspace</span>
-                    <select name="workspaceId" className="w-full border border-slate-200 rounded px-2 py-1.5">
+                    <select
+                      name="workspaceId"
+                      defaultValue={defaultActiveWsId}
+                      className="w-full border border-slate-200 rounded px-2 py-1.5"
+                    >
                       {writableWorkspaces.map((w) => (
                         <option key={w.id} value={w.id}>
                           {w.name}
@@ -2381,21 +3390,40 @@ export const App: React.FC = () => {
                   </label>
                   <label className="space-y-1">
                     <span>Bank / Institution</span>
-                    <input name="institution" placeholder="Monzo, Starling, Revolut..." className="w-full border border-slate-200 rounded px-2 py-1.5" />
+                    <input
+                      name="institution"
+                      placeholder="Monzo, Starling, mBank..."
+                      className="w-full border border-slate-200 rounded px-2 py-1.5"
+                    />
                   </label>
                 </div>
                 <label className="block space-y-1">
                   <span>Account Name</span>
-                  <input required name="name" placeholder="Current Account" className="w-full border border-slate-200 rounded px-2.5 py-1.5" />
+                  <input
+                    required
+                    name="name"
+                    placeholder="Current Account"
+                    className="w-full border border-slate-200 rounded px-2.5 py-1.5"
+                  />
                 </label>
                 <div className="grid grid-cols-2 gap-2.5">
                   <label className="space-y-1">
                     <span>Current Balance</span>
-                    <input required type="number" step="0.01" name="balanceMajor" className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num" />
+                    <input
+                      required
+                      type="number"
+                      step="0.01"
+                      name="balanceMajor"
+                      className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num"
+                    />
                   </label>
                   <label className="space-y-1">
                     <span>Currency</span>
-                    <select name="currency" defaultValue={cur} className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num">
+                    <select
+                      name="currency"
+                      defaultValue={cur}
+                      className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num"
+                    >
                       {(['GBP', 'EUR', 'PLN', 'USD', 'CHF'] as CurrencyCode[]).map((c) => (
                         <option key={c} value={c}>
                           {c}
@@ -2409,7 +3437,7 @@ export const App: React.FC = () => {
                   <span>Include in monthly sufficiency runway check</span>
                 </label>
                 <button type="submit" className="w-full py-2 rounded bg-slate-900 text-white font-medium">
-                  Save Bank Account
+                  {t.qaSave}
                 </button>
               </form>
             )}
