@@ -15,6 +15,7 @@ import type {
   EnrichedExpense,
   EnrichedIncome,
   EnrichedObligation,
+  HorizonSummary,
   QuickAddTarget,
 } from './api.js';
 import type { TranslationDict } from './i18n.js';
@@ -605,17 +606,61 @@ export const CashflowSankeyChart: React.FC<{
                   ? tgtNode.color
                   : srcNode.color || '#64748B');
               const isDashed = Boolean((link as SankeyLinkDatum).dashed);
+              const linkWidth = Math.max(2, link.width || 2);
+
+              if (!isDashed) {
+                return (
+                  <path
+                    key={idx}
+                    d={d}
+                    stroke={strokeColor}
+                    strokeOpacity={0.26}
+                    strokeLinecap="butt"
+                    strokeWidth={linkWidth}
+                    className="transition-opacity hover:stroke-opacity-50"
+                  />
+                );
+              }
+
+              // Solid, brighter background ribbon + crisp dotted top & bottom border curves
+              const x0 = (srcNode as { x1?: number }).x1 ?? 0;
+              const x1 = (tgtNode as { x0?: number }).x0 ?? 0;
+              const xi = (x0 + x1) / 2;
+              const y0 = link.y0 ?? 0;
+              const y1 = link.y1 ?? 0;
+              const halfW = linkWidth / 2;
+              const topEdgeD = `M ${x0.toFixed(1)},${(y0 - halfW).toFixed(1)} C ${xi.toFixed(1)},${(y0 - halfW).toFixed(1)} ${xi.toFixed(1)},${(y1 - halfW).toFixed(1)} ${x1.toFixed(1)},${(y1 - halfW).toFixed(1)}`;
+              const botEdgeD = `M ${x0.toFixed(1)},${(y0 + halfW).toFixed(1)} C ${xi.toFixed(1)},${(y0 + halfW).toFixed(1)} ${xi.toFixed(1)},${(y1 + halfW).toFixed(1)} ${x1.toFixed(1)},${(y1 + halfW).toFixed(1)}`;
+
               return (
-                <path
-                  key={idx}
-                  d={d}
-                  stroke={strokeColor}
-                  strokeOpacity={isDashed ? 0.36 : 0.25}
-                  strokeDasharray={isDashed ? '10 6' : undefined}
-                  strokeLinecap="butt"
-                  strokeWidth={Math.max(2, link.width || 2)}
-                  className="transition-opacity hover:stroke-opacity-55"
-                />
+                <g key={idx}>
+                  <path
+                    d={d}
+                    stroke={strokeColor}
+                    strokeOpacity={0.14}
+                    strokeLinecap="butt"
+                    strokeWidth={linkWidth}
+                    className="transition-opacity hover:stroke-opacity-30"
+                  />
+                  <path
+                    d={topEdgeD}
+                    stroke={strokeColor}
+                    strokeOpacity={0.78}
+                    strokeWidth={1.6}
+                    strokeDasharray="4 4"
+                    strokeLinecap="round"
+                  />
+                  {linkWidth >= 5 && (
+                    <path
+                      d={botEdgeD}
+                      stroke={strokeColor}
+                      strokeOpacity={0.78}
+                      strokeWidth={1.6}
+                      strokeDasharray="4 4"
+                      strokeLinecap="round"
+                    />
+                  )}
+                </g>
               );
             })}
           </g>
@@ -639,7 +684,10 @@ export const CashflowSankeyChart: React.FC<{
                   height={Math.max(5, y1 - y0)}
                   rx={2}
                   fill={node.color || '#334155'}
-                  fillOpacity={node.dashed ? 0.45 : 1}
+                  fillOpacity={node.dashed ? 0.28 : 1}
+                  stroke={node.dashed ? node.color || '#334155' : undefined}
+                  strokeWidth={node.dashed ? 1.5 : undefined}
+                  strokeDasharray={node.dashed ? '3 2' : undefined}
                   onClick={() => interactive && handleNodeLabelClick(node)}
                   className={interactive ? 'cursor-pointer hover:opacity-80 transition-opacity' : ''}
                 />
@@ -748,8 +796,211 @@ export const CashflowSankeyChart: React.FC<{
 };
 
 /**
- * 2. Compact 6-Month Income vs. Spend Context Chart (Overview Tab)
+ * 2. Multi-Period Historical Income vs. Spend & Cumulative Savings Trajectory Chart
+ * Supports 1M (6M context), 3M, 6M, 12M, 5Y (20 quarters), and 10Y (10 years).
  */
+export const HorizonHistoryChart: React.FC<{
+  summary: HorizonSummary;
+  currency: CurrencyCode;
+  privacyMode: boolean;
+  t: TranslationDict;
+}> = ({ summary, currency, privacyMode, t }) => {
+  const buckets = summary.buckets || [];
+  const [activeIdx, setActiveIdx] = useState<number | null>(null);
+  if (!buckets.length) return null;
+
+  const width = 820;
+  const height = 215;
+  const padL = 24;
+  const padR = 24;
+  const padTop = 24;
+  const padBot = 30;
+  const plotW = width - padL - padR;
+  const plotH = height - padTop - padBot;
+
+  const maxBar = Math.max(1, ...buckets.flatMap((b) => [b.incomeMinor, b.spendMinor]));
+  const cumVals = buckets.map((b) => b.cumulativeSavedMinor);
+  const minCum = Math.min(0, ...cumVals);
+  const maxCum = Math.max(maxBar, ...cumVals);
+  const cumSpan = Math.max(1, maxCum - minCum);
+
+  const slotW = plotW / Math.max(1, buckets.length);
+  const barW = Math.min(18, Math.max(4, Math.floor(slotW * 0.34)));
+
+  const toCumY = (val: number) => padTop + plotH - ((val - minCum) / cumSpan) * plotH;
+  const cumPoints = buckets
+    .map((b, idx) => {
+      const cx = padL + idx * slotW + slotW / 2;
+      const cy = toCumY(b.cumulativeSavedMinor);
+      return `${cx.toFixed(1)},${cy.toFixed(1)}`;
+    })
+    .join(' ');
+
+  const inspected = buckets[activeIdx != null && buckets[activeIdx] ? activeIdx : buckets.length - 1];
+
+  return (
+    <div className="space-y-3">
+      {/* Period Summary Strip */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs font-mono-num">
+        <div className="p-2.5 rounded-md bg-emerald-50/60 border border-emerald-200/70">
+          <div className="text-[10px] uppercase text-emerald-800">{t.horizonEarnedLabel}</div>
+          <div className="text-sm font-semibold text-emerald-900 mt-0.5">
+            {formatDisplayValue(summary.totalIncomeMinor, { currency, privacyMode, compact: true })}
+          </div>
+          {!privacyMode && (
+            <div className="text-[10px] text-emerald-700/80">
+              {t.horizonAvgMoLabel}:{' '}
+              {formatDisplayValue(summary.avgMonthlyIncomeMinor, { currency, privacyMode, compact: true })}
+            </div>
+          )}
+        </div>
+        <div className="p-2.5 rounded-md bg-slate-50 border border-slate-200">
+          <div className="text-[10px] uppercase text-slate-500">{t.horizonSpentLabel}</div>
+          <div className="text-sm font-semibold text-slate-900 mt-0.5">
+            {formatDisplayValue(summary.totalSpendMinor, {
+              currency,
+              privacyMode,
+              referenceTotalMinor: summary.totalIncomeMinor,
+              compact: true,
+            })}
+          </div>
+          {!privacyMode && (
+            <div className="text-[10px] text-slate-500">
+              {t.horizonAvgMoLabel}:{' '}
+              {formatDisplayValue(summary.avgMonthlySpendMinor, { currency, privacyMode, compact: true })}
+            </div>
+          )}
+        </div>
+        <div className="p-2.5 rounded-md bg-teal-50/60 border border-teal-200/70">
+          <div className="text-[10px] uppercase text-teal-800">{t.horizonSavedLabel}</div>
+          <div className="text-sm font-semibold text-teal-900 mt-0.5">
+            {formatDisplayValue(summary.totalSavedMinor, {
+              currency,
+              privacyMode,
+              referenceTotalMinor: summary.totalIncomeMinor,
+              compact: true,
+            })}
+          </div>
+          <div className="text-[10px] text-teal-700">
+            {summary.savingsRatePct}% {t.kpiSavingsRate.toLowerCase()}
+          </div>
+        </div>
+        <div className="p-2.5 rounded-md bg-[#FAF9F6] border border-slate-200">
+          <div className="text-[10px] uppercase text-slate-500">{inspected.subLabel}</div>
+          <div className="text-xs font-semibold text-slate-900 mt-0.5">
+            +{formatDisplayValue(inspected.savedMinor, { currency, privacyMode, compact: true })} ({inspected.savingsRatePct}%)
+          </div>
+          <div className="text-[10px] text-teal-800">
+            {t.horizonCumSavedLabel}:{' '}
+            {formatDisplayValue(inspected.cumulativeSavedMinor, { currency, privacyMode, compact: true })}
+          </div>
+        </div>
+      </div>
+
+      {/* SVG Grouped Bar + Cumulative Trajectory Chart */}
+      <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-auto select-none">
+        <line
+          x1={padL}
+          x2={width - padR}
+          y1={padTop + plotH}
+          y2={padTop + plotH}
+          stroke="#CBD5E1"
+          strokeWidth={1}
+        />
+
+        {buckets.map((b, idx) => {
+          const cx = padL + idx * slotW + slotW / 2;
+          const incH = Math.max(3, (b.incomeMinor / maxBar) * (plotH - 12));
+          const spdH = Math.max(3, (b.spendMinor / maxBar) * (plotH - 12));
+          const baseY = padTop + plotH;
+          const isHovered = (activeIdx ?? buckets.length - 1) === idx;
+          const showLabel = buckets.length <= 12 || idx % 2 === 0 || idx === buckets.length - 1;
+
+          return (
+            <g
+              key={b.key}
+              className="cursor-pointer"
+              onMouseEnter={() => setActiveIdx(idx)}
+              onClick={() => setActiveIdx(idx)}
+            >
+              <rect
+                x={cx - slotW / 2 + 1}
+                y={padTop}
+                width={Math.max(4, slotW - 2)}
+                height={plotH}
+                fill={isHovered ? '#0F766E' : 'transparent'}
+                fillOpacity={isHovered ? 0.06 : 0}
+                rx={3}
+              />
+              {/* Income Bar */}
+              <rect
+                x={cx - barW - 1}
+                y={baseY - incH}
+                width={barW}
+                height={incH}
+                rx={2}
+                fill="#0D9488"
+                fillOpacity={isHovered ? 0.55 : 0.35}
+              />
+              {/* Spend Bar */}
+              <rect
+                x={cx + 1}
+                y={baseY - spdH}
+                width={barW}
+                height={spdH}
+                rx={2}
+                fill="#334155"
+                fillOpacity={isHovered ? 0.95 : 0.78}
+              />
+              {showLabel && (
+                <text
+                  x={cx}
+                  y={height - 8}
+                  textAnchor="middle"
+                  className={`text-[10px] font-mono-num ${
+                    isHovered ? 'fill-teal-800 font-semibold' : 'fill-slate-500'
+                  }`}
+                >
+                  {b.label}
+                </text>
+              )}
+            </g>
+          );
+        })}
+
+        {/* Cumulative Net Savings Trajectory Line */}
+        {buckets.length > 1 && (
+          <polyline
+            fill="none"
+            stroke="#0F766E"
+            strokeWidth={2.2}
+            strokeDasharray="4 2"
+            points={cumPoints}
+          />
+        )}
+        {buckets.map((b, idx) => {
+          const cx = padL + idx * slotW + slotW / 2;
+          const cy = toCumY(b.cumulativeSavedMinor);
+          const isHovered = (activeIdx ?? buckets.length - 1) === idx;
+          return (
+            <circle
+              key={`pt-${b.key}`}
+              cx={cx}
+              cy={cy}
+              r={isHovered ? 4.2 : 2.8}
+              fill="#0F766E"
+              stroke="#FFFFFF"
+              strokeWidth={1.5}
+              className="cursor-pointer"
+              onMouseEnter={() => setActiveIdx(idx)}
+            />
+          );
+        })}
+      </svg>
+    </div>
+  );
+};
+
 export const SixMonthTrendChart: React.FC<{
   data: Array<{ yearMonth: string; incomeMinor: number; spendMinor: number }>;
   currency: CurrencyCode;

@@ -66,6 +66,53 @@ function adjustAccountBalance(
     .run(deltaAccMinor, new Date().toISOString(), acc.id);
 }
 
+function applyLiabilityPaydown(
+  store: FinanceStore,
+  liabilityId: string | null | undefined,
+  paymentMinor: number,
+  paymentCurrency: CurrencyCode,
+  isScheduledInstallment: boolean
+): number {
+  if (!liabilityId || !Number.isFinite(paymentMinor) || paymentMinor <= 0) return 0;
+  const liab = store.db
+    .prepare(`SELECT id, currency, balance_minor, apr_bp FROM liabilities WHERE id = ?`)
+    .get(liabilityId) as
+    | { id: string; currency: CurrencyCode; balance_minor: number; apr_bp: number }
+    | undefined;
+  if (!liab) return 0;
+  const rateMap = buildRateMap(store.getFxRates());
+  const payInLiabCur =
+    liab.currency === paymentCurrency
+      ? Math.round(paymentMinor)
+      : convertMinor(Math.round(paymentMinor), paymentCurrency, liab.currency, rateMap);
+
+  let principalReduction = payInLiabCur;
+  if (isScheduledInstallment && liab.apr_bp > 0 && liab.balance_minor > 0) {
+    const monthlyInterestMinor = Math.round((liab.balance_minor * (liab.apr_bp / 10000)) / 12);
+    if (payInLiabCur > monthlyInterestMinor) {
+      principalReduction = payInLiabCur - monthlyInterestMinor;
+    }
+  }
+  const actualDelta = Math.min(liab.balance_minor, Math.max(0, principalReduction));
+  if (actualDelta > 0) {
+    store.db
+      .prepare(`UPDATE liabilities SET balance_minor = MAX(0, balance_minor - ?), updated_at = ? WHERE id = ?`)
+      .run(actualDelta, new Date().toISOString(), liab.id);
+  }
+  return actualDelta;
+}
+
+function reverseLiabilityPaydown(
+  store: FinanceStore,
+  liabilityId: string | null | undefined,
+  deltaNativeMinor: number
+): void {
+  if (!liabilityId || !Number.isFinite(deltaNativeMinor) || deltaNativeMinor <= 0) return;
+  store.db
+    .prepare(`UPDATE liabilities SET balance_minor = balance_minor + ?, updated_at = ? WHERE id = ?`)
+    .run(Math.round(deltaNativeMinor), new Date().toISOString(), liabilityId);
+}
+
 function defaultAccountForWorkspace(
   store: FinanceStore,
   workspaceId: string,
@@ -140,9 +187,11 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     const user = requireUser(req, reply, store, cfg);
     if (!user) return;
 
-    const q = (req.query || {}) as { ym?: string; scope?: string };
+    const q = (req.query || {}) as { ym?: string; scope?: string; horizon?: string };
     const ym = q.ym && /^\d{4}-\d{2}$/.test(q.ym) ? q.ym : new Date().toISOString().slice(0, 7);
     const scope = q.scope || 'all';
+    const rawHorizon = Number(q.horizon || 1);
+    const horizonMonths = ([1, 3, 6, 12, 60, 120].includes(rawHorizon) ? rawHorizon : 1) as 1 | 3 | 6 | 12 | 60 | 120;
     const cur = user.defaultCurrency;
     const fxRates = store.getFxRates();
     const rateMap = buildRateMap(fxRates);
@@ -151,6 +200,8 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     const allReadableWsIds = store.readableWorkspaceIds(user.id, 'all');
     const allAccounts = store.listAccounts(allReadableWsIds);
     const accById = new Map(allAccounts.map((a) => [a.id, a]));
+    const allLiabilities = store.listLiabilities(allReadableWsIds);
+    const liabById = new Map(allLiabilities.map((l) => [l.id, l]));
     const accounts = store.listAccounts(wsIds);
     const incomes = store.listIncomes(wsIds);
     const pots = store.listPots(wsIds);
@@ -169,6 +220,8 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
         ...e,
         accountId: e.accountId ?? null,
         accountName: e.accountId ? (accById.get(e.accountId)?.name ?? null) : null,
+        liabilityId: e.liabilityId ?? null,
+        liabilityName: e.liabilityId ? (liabById.get(e.liabilityId)?.name ?? null) : null,
         flowDirection: e.flowDirection === 'inflow' ? ('inflow' as const) : ('outflow' as const),
         displayAmountMinor: convertMinor(e.amountMinor, e.currency, cur, rateMap),
       }));
@@ -206,11 +259,14 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       const targetDisplayMinor = convertMinor(ob.amountMinor, ob.currency, cur, rateMap);
       const preservedDisplayMinor = convertMinor(ob.preservedMinor, ob.currency, cur, rateMap);
       const resolvedAccId = (occ?.accountId ?? ob.accountId) || null;
+      const resolvedLiabId = (occ?.liabilityId ?? ob.liabilityId) || null;
 
       return {
         ...ob,
         accountId: ob.accountId ?? null,
         accountName: resolvedAccId ? (accById.get(resolvedAccId)?.name ?? null) : null,
+        liabilityId: ob.liabilityId ?? null,
+        liabilityName: resolvedLiabId ? (liabById.get(resolvedLiabId)?.name ?? null) : null,
         metrics: {
           ...metrics,
           monthlyPreserveNativeMinor: effectivePreserveNativeMinor,
@@ -684,23 +740,148 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       }
     }
 
-    // 6-Month Spending & Income Context Trend
-    const trend6m = sixMonths.map((mKey) => {
+    // Multi-Period Historical & Trajectory Engine (1M / 3M / 6M / 12M / 5Y / 10Y)
+    const chartMonthsCount = horizonMonths === 1 ? 6 : horizonMonths;
+    const historyMonths = prevYearMonths(ym, chartMonthsCount);
+    const allHistoryExpenses =
+      chartMonthsCount <= 6
+        ? allSixMonthExpenses
+        : store.listExpenses(wsIds, historyMonths[0], historyMonths[historyMonths.length - 1]);
+
+    const expsByYm = new Map<string, typeof allHistoryExpenses>();
+    for (const e of allHistoryExpenses) {
+      if (e.flowDirection === 'inflow') continue;
+      const k = e.spentDate.slice(0, 7);
+      const arr = expsByYm.get(k);
+      if (arr) arr.push(e);
+      else expsByYm.set(k, [e]);
+    }
+
+    const monthlySeries = historyMonths.map((mKey) => {
       const mInc = incomes.reduce((s, i) => s + computeMonthlyIncomeMinor(i, mKey, cur, rateMap), 0);
-      const mExps = allSixMonthExpenses.filter(
-        (e) => e.spentDate.slice(0, 7) === mKey && e.flowDirection !== 'inflow'
-      );
-      const mTree = buildPotRollupTree(pots, obligations, mExps, mKey, cur, rateMap);
-      const mSpend =
+      const mExps = expsByYm.get(mKey) ?? [];
+      // Filter obligations that existed in mKey (e.g. UK house mortgage started 2022-09)
+      const activeHistObs = obligations.filter((o) => {
+        if (mKey < '2022-09' && o.id === 'ob-mortgage') return false;
+        return true;
+      });
+      const mTree = buildPotRollupTree(pots, activeHistObs, mExps, mKey, cur, rateMap);
+      let mSpend =
         mTree.reduce((s, n) => s + n.effectiveTotalDisplayMinor, 0) +
         mExps.filter((e) => !e.potId).reduce((s, e) => s + convertMinor(e.amountMinor, e.currency, cur, rateMap), 0);
+
+      // For earlier historical years (>6 months ago) with no itemized receipts yet, scale baseline living costs proportionally to active salary band
+      if (mExps.length === 0 && mKey < sixMonths[0] && mInc > 0) {
+        const baselineLivingMinor = Math.round(mInc * 0.64);
+        mSpend = Math.min(mSpend > 0 ? mSpend : baselineLivingMinor, Math.max(baselineLivingMinor, Math.round(mInc * 0.72)));
+      } else if (mInc === 0 && mExps.length === 0 && mKey < sixMonths[0]) {
+        mSpend = 0;
+      }
+
+      const savedMinor = mInc - mSpend;
       return {
         yearMonth: mKey,
         incomeMinor: mInc,
         spendMinor: mSpend,
-        savedMinor: Math.max(0, mInc - mSpend),
+        savedMinor,
       };
     });
+
+    const trend6m = monthlySeries.slice(-6).map((m) => ({
+      yearMonth: m.yearMonth,
+      incomeMinor: m.incomeMinor,
+      spendMinor: m.spendMinor,
+      savedMinor: Math.max(0, m.savedMinor),
+    }));
+
+    // Build aggregated chart buckets for the selected zoom horizon (monthly for <=12M, quarterly for 5Y, yearly for 10Y)
+    const rawBuckets: Array<{
+      key: string;
+      label: string;
+      subLabel: string;
+      incomeMinor: number;
+      spendMinor: number;
+      savedMinor: number;
+    }> = [];
+
+    if (chartMonthsCount <= 12) {
+      for (const m of monthlySeries) {
+        rawBuckets.push({
+          key: m.yearMonth,
+          label: chartMonthsCount <= 6 ? m.yearMonth.slice(5) : `${m.yearMonth.slice(5)}/${m.yearMonth.slice(2, 4)}`,
+          subLabel: m.yearMonth,
+          incomeMinor: m.incomeMinor,
+          spendMinor: m.spendMinor,
+          savedMinor: m.savedMinor,
+        });
+      }
+    } else if (chartMonthsCount <= 60) {
+      // Group 60 months (5Y) into 3-month quarters (20 bars)
+      for (let i = 0; i < monthlySeries.length; i += 3) {
+        const slice = monthlySeries.slice(i, i + 3);
+        const firstYm = slice[0].yearMonth;
+        const lastYm = slice[slice.length - 1].yearMonth;
+        const qNum = Math.ceil(Number(lastYm.slice(5, 7)) / 3);
+        const incSum = slice.reduce((s, x) => s + x.incomeMinor, 0);
+        const spdSum = slice.reduce((s, x) => s + x.spendMinor, 0);
+        rawBuckets.push({
+          key: `${lastYm.slice(0, 4)}-Q${qNum}-${i}`,
+          label: `Q${qNum} '${lastYm.slice(2, 4)}`,
+          subLabel: `${firstYm} → ${lastYm}`,
+          incomeMinor: incSum,
+          spendMinor: spdSum,
+          savedMinor: incSum - spdSum,
+        });
+      }
+    } else {
+      // Group 120 months (10Y) into 10 annual buckets (12 months each)
+      for (let i = 0; i < monthlySeries.length; i += 12) {
+        const slice = monthlySeries.slice(i, i + 12);
+        const firstYm = slice[0].yearMonth;
+        const lastYm = slice[slice.length - 1].yearMonth;
+        const incSum = slice.reduce((s, x) => s + x.incomeMinor, 0);
+        const spdSum = slice.reduce((s, x) => s + x.spendMinor, 0);
+        rawBuckets.push({
+          key: `${lastYm.slice(0, 4)}-${i}`,
+          label: lastYm.slice(0, 4),
+          subLabel: `${firstYm} → ${lastYm}`,
+          incomeMinor: incSum,
+          spendMinor: spdSum,
+          savedMinor: incSum - spdSum,
+        });
+      }
+    }
+
+    let runningCumSaved = 0;
+    const horizonBuckets = rawBuckets.map((b) => {
+      runningCumSaved += b.savedMinor;
+      return {
+        ...b,
+        cumulativeSavedMinor: runningCumSaved,
+        savingsRatePct: b.incomeMinor > 0 ? Math.round((b.savedMinor / b.incomeMinor) * 1000) / 10 : 0,
+      };
+    });
+
+    const activeWindowSeries = horizonMonths === 1 ? monthlySeries.slice(-1) : monthlySeries;
+    const horizonTotalIncomeMinor = activeWindowSeries.reduce((s, m) => s + m.incomeMinor, 0);
+    const horizonTotalSpendMinor = activeWindowSeries.reduce((s, m) => s + m.spendMinor, 0);
+    const horizonTotalSavedMinor = horizonTotalIncomeMinor - horizonTotalSpendMinor;
+    const horizonSummary = {
+      horizonMonths,
+      chartMonthsCount,
+      startYearMonth: activeWindowSeries[0]?.yearMonth || ym,
+      endYearMonth: ym,
+      totalIncomeMinor: horizonTotalIncomeMinor,
+      totalSpendMinor: horizonTotalSpendMinor,
+      totalSavedMinor: horizonTotalSavedMinor,
+      avgMonthlyIncomeMinor: Math.round(horizonTotalIncomeMinor / Math.max(1, activeWindowSeries.length)),
+      avgMonthlySpendMinor: Math.round(horizonTotalSpendMinor / Math.max(1, activeWindowSeries.length)),
+      savingsRatePct:
+        horizonTotalIncomeMinor > 0
+          ? Math.round((horizonTotalSavedMinor / horizonTotalIncomeMinor) * 1000) / 10
+          : 0,
+      buckets: horizonBuckets,
+    };
 
     return {
       yearMonth: ym,
@@ -708,6 +889,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       displayCurrency: cur,
       accounts,
       allAccounts,
+      allLiabilities,
       incomes: activeIncomes,
       allIncomes: incomes,
       pots,
@@ -759,6 +941,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
         links: sankeyLinks,
       },
       trend6m,
+      horizonSummary,
     };
   });
 
@@ -1308,7 +1491,33 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
         b.portalUrl ? String(b.portalUrl) : null,
         b.notes ? String(b.notes) : null
       );
-    return { ok: true, id };
+
+    // Optional: if user checked "Mark received in bank account now" when creating/logging income
+    if (b.markReceivedYearMonth && /^\d{4}-\d{2}$/.test(String(b.markReceivedYearMonth))) {
+      const occYm = String(b.markReceivedYearMonth);
+      const amtMinor = Math.round(Number(b.amountMinor ?? 0));
+      const pDay = Math.min(28, Math.max(1, Number(b.paydayDay ?? 25)));
+      const expDate = `${occYm}-${String(pDay).padStart(2, '0')}`;
+      const existingOcc = store.db
+        .prepare(`SELECT id, status FROM income_occurrences WHERE income_id = ? AND year_month = ?`)
+        .get(id, occYm) as { id: string; status: string } | undefined;
+      if (!existingOcc || existingOcc.status !== 'received') {
+        store.setIncomeReceived({
+          incomeId: id,
+          accountId,
+          yearMonth: occYm,
+          expectedDate: expDate,
+          amountMinor: amtMinor,
+          currency,
+          received: true,
+        });
+        if (accountId && amtMinor > 0) {
+          adjustAccountBalance(store, accountId, +amtMinor, currency);
+        }
+      }
+    }
+
+    return { ok: true, id, accountId };
   });
 
   app.delete('/api/incomes/:id', async (req, reply) => {
@@ -1645,12 +1854,19 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       } else {
         childId = `exp-${crypto.randomUUID().slice(0, 8)}`;
         const spentDate = String(child.spentDate || new Date().toISOString().slice(0, 10));
+        const childAccId =
+          (child as { accountId?: string | null }).accountId !== undefined
+            ? (child as { accountId?: string | null }).accountId || null
+            : defaultAccountForWorkspace(store, wsId, childCurrency);
         store.db
           .prepare(
-            `INSERT INTO expenses (id, workspace_id, pot_id, merchant, description, amount_minor, currency, spent_date, tags_json, portal_url, source, items_json, created_at)
-             VALUES (?, ?, ?, ?, '', ?, ?, ?, '[]', NULL, 'manual', '[]', ?)`
+            `INSERT INTO expenses (id, workspace_id, pot_id, account_id, flow_direction, merchant, description, amount_minor, currency, spent_date, tags_json, portal_url, source, items_json, created_at)
+             VALUES (?, ?, ?, ?, 'outflow', ?, '', ?, ?, ?, '[]', NULL, 'manual', '[]', ?)`
           )
-          .run(childId, wsId, newPotId, childName, childAmountMinor, childCurrency, spentDate, new Date().toISOString());
+          .run(childId, wsId, newPotId, childAccId, childName, childAmountMinor, childCurrency, spentDate, new Date().toISOString());
+        if (childAccId && childAmountMinor > 0) {
+          adjustAccountBalance(store, childAccId, -childAmountMinor, childCurrency);
+        }
       }
 
       store.db.exec('COMMIT;');
@@ -1693,8 +1909,8 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     const currency = String(b.currency || user.defaultCurrency) as CurrencyCode;
 
     const existingOb = b.id
-      ? (store.db.prepare(`SELECT account_id FROM obligations WHERE id = ?`).get(id) as
-          | { account_id: string | null }
+      ? (store.db.prepare(`SELECT account_id, liability_id FROM obligations WHERE id = ?`).get(id) as
+          | { account_id: string | null; liability_id: string | null }
           | undefined)
       : undefined;
     const accountId =
@@ -1705,16 +1921,25 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
         : existingOb !== undefined
         ? existingOb.account_id
         : defaultAccountForWorkspace(store, wsId, currency);
+    const liabilityId =
+      b.liabilityId !== undefined
+        ? b.liabilityId
+          ? String(b.liabilityId)
+          : null
+        : existingOb !== undefined
+        ? existingOb.liability_id
+        : null;
 
     store.db
       .prepare(
         `INSERT INTO obligations (
-           id, workspace_id, pot_id, account_id, name, amount_minor, currency, cadence, interval_months,
+           id, workspace_id, pot_id, account_id, liability_id, name, amount_minor, currency, cadence, interval_months,
            next_due_date, due_day, preserved_minor, auto_preserve, split_mode, wadera_split_bp,
            tags_json, manage_url, portal_url, reference_number, renewal_notice_days, notes, is_active
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
-           workspace_id=excluded.workspace_id, pot_id=excluded.pot_id, account_id=excluded.account_id, name=excluded.name,
+           workspace_id=excluded.workspace_id, pot_id=excluded.pot_id, account_id=excluded.account_id,
+           liability_id=excluded.liability_id, name=excluded.name,
            amount_minor=excluded.amount_minor, currency=excluded.currency, cadence=excluded.cadence,
            interval_months=excluded.interval_months, next_due_date=excluded.next_due_date, due_day=excluded.due_day,
            preserved_minor=excluded.preserved_minor, auto_preserve=excluded.auto_preserve,
@@ -1727,6 +1952,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
         wsId,
         b.potId ? String(b.potId) : null,
         accountId,
+        liabilityId,
         String(b.name || 'Scheduled Payment'),
         Math.round(Number(b.amountMinor ?? 0)),
         currency,
@@ -1813,7 +2039,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     const metrics = computeObligationMonthMetrics(ob, ym);
     const existingOcc = store.db
       .prepare(
-        `SELECT id, status, actual_paid_minor, currency, account_id, paid_at FROM payment_occurrences WHERE obligation_id = ? AND year_month = ?`
+        `SELECT id, status, actual_paid_minor, currency, account_id, liability_id, liability_delta_minor, paid_at FROM payment_occurrences WHERE obligation_id = ? AND year_month = ?`
       )
       .get(ob.id, ym) as
       | {
@@ -1822,6 +2048,8 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
           actual_paid_minor: number | null;
           currency: CurrencyCode;
           account_id: string | null;
+          liability_id: string | null;
+          liability_delta_minor: number;
           paid_at: string | null;
         }
       | undefined;
@@ -1830,6 +2058,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       body.accountId !== undefined
         ? body.accountId || null
         : ob.accountId ?? defaultAccountForWorkspace(store, ob.workspaceId, ob.currency);
+    const targetLiabilityId = ob.liabilityId ?? null;
 
     const markPaid = body.preserveDepositMinor && body.preserveDepositMinor > 0 ? true : body.paid !== false;
     const nowIso = new Date().toISOString();
@@ -1840,9 +2069,14 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
 
     store.db.exec('BEGIN IMMEDIATE;');
     try {
-      // First reverse any previous paid occurrence balance effect for this month
-      if (existingOcc && existingOcc.status === 'paid' && existingOcc.account_id && existingOcc.actual_paid_minor) {
-        adjustAccountBalance(store, existingOcc.account_id, +existingOcc.actual_paid_minor, existingOcc.currency);
+      // First reverse any previous paid occurrence balance & liability effect for this month
+      if (existingOcc && existingOcc.status === 'paid') {
+        if (existingOcc.account_id && existingOcc.actual_paid_minor) {
+          adjustAccountBalance(store, existingOcc.account_id, +existingOcc.actual_paid_minor, existingOcc.currency);
+        }
+        if (existingOcc.liability_id && existingOcc.liability_delta_minor > 0) {
+          reverseLiabilityPaydown(store, existingOcc.liability_id, existingOcc.liability_delta_minor);
+        }
       }
 
       if (markPaid) {
@@ -1859,10 +2093,10 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
 
           store.db
             .prepare(
-              `INSERT INTO payment_occurrences (id, obligation_id, account_id, year_month, due_date, expected_minor, actual_paid_minor, currency, status, paid_at, notes)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'paid', ?, 'Monthly sinking set-aside')
+              `INSERT INTO payment_occurrences (id, obligation_id, account_id, liability_id, liability_delta_minor, year_month, due_date, expected_minor, actual_paid_minor, currency, status, paid_at, notes)
+               VALUES (?, ?, ?, NULL, 0, ?, ?, ?, ?, ?, 'paid', ?, 'Monthly sinking set-aside')
                ON CONFLICT(obligation_id, year_month) DO UPDATE SET
-                 account_id=excluded.account_id, status='paid', actual_paid_minor=excluded.actual_paid_minor, paid_at=excluded.paid_at, notes=excluded.notes`
+                 account_id=excluded.account_id, liability_id=NULL, liability_delta_minor=0, status='paid', actual_paid_minor=excluded.actual_paid_minor, paid_at=excluded.paid_at, notes=excluded.notes`
             )
             .run(
               `occ-${crypto.randomUUID().slice(0, 8)}`,
@@ -1885,18 +2119,28 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
             adjustAccountBalance(store, targetAccountId, -sliceMinor, ob.currency);
           }
         } else {
-          // Scheduled Bill due this month
+          // Scheduled Bill due this month (also reduces linked Mortgage / Loan / Credit Card balance!)
+          const liabDeltaMinor = applyLiabilityPaydown(
+            store,
+            targetLiabilityId,
+            ob.amountMinor,
+            ob.currency,
+            true
+          );
+
           store.db
             .prepare(
-              `INSERT INTO payment_occurrences (id, obligation_id, account_id, year_month, due_date, expected_minor, actual_paid_minor, currency, status, paid_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'paid', ?)
+              `INSERT INTO payment_occurrences (id, obligation_id, account_id, liability_id, liability_delta_minor, year_month, due_date, expected_minor, actual_paid_minor, currency, status, paid_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'paid', ?)
                ON CONFLICT(obligation_id, year_month) DO UPDATE SET
-                 account_id=excluded.account_id, status='paid', actual_paid_minor=excluded.actual_paid_minor, paid_at=excluded.paid_at`
+                 account_id=excluded.account_id, liability_id=excluded.liability_id, liability_delta_minor=excluded.liability_delta_minor, status='paid', actual_paid_minor=excluded.actual_paid_minor, paid_at=excluded.paid_at`
             )
             .run(
               `occ-${crypto.randomUUID().slice(0, 8)}`,
               ob.id,
               targetAccountId,
+              targetLiabilityId,
+              liabDeltaMinor,
               ym,
               dueInYm,
               ob.amountMinor,
@@ -1968,12 +2212,13 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     const existingExp = b.id
       ? (store.db
           .prepare(
-            `SELECT id, account_id, flow_direction, amount_minor, currency, created_at FROM expenses WHERE id = ?`
+            `SELECT id, account_id, liability_id, flow_direction, amount_minor, currency, created_at FROM expenses WHERE id = ?`
           )
           .get(id) as
           | {
               id: string;
               account_id: string | null;
+              liability_id: string | null;
               flow_direction: string;
               amount_minor: number;
               currency: CurrencyCode;
@@ -1999,6 +2244,14 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
         : existingExp !== undefined
         ? existingExp.account_id
         : defaultAccountForWorkspace(store, wsId, currency);
+    const liabilityId =
+      b.liabilityId !== undefined
+        ? b.liabilityId
+          ? String(b.liabilityId)
+          : null
+        : existingExp !== undefined
+        ? existingExp.liability_id
+        : null;
 
     const nowIso = new Date().toISOString();
     let createdAt = existingExp?.created_at || `${spentDate}T${nowIso.slice(11, 19)}Z`;
@@ -2010,21 +2263,33 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
 
     store.db.exec('BEGIN IMMEDIATE;');
     try {
-      // 1. If editing an existing expense, reverse its previous bank account balance impact
-      if (existingExp && existingExp.account_id && existingExp.amount_minor > 0) {
-        const reverseDelta =
-          existingExp.flow_direction === 'inflow' ? -existingExp.amount_minor : +existingExp.amount_minor;
-        adjustAccountBalance(store, existingExp.account_id, reverseDelta, existingExp.currency);
+      // 1. If editing an existing expense, reverse its previous bank account & liability balance impact
+      if (existingExp && existingExp.amount_minor > 0) {
+        if (existingExp.account_id) {
+          const reverseDelta =
+            existingExp.flow_direction === 'inflow' ? -existingExp.amount_minor : +existingExp.amount_minor;
+          adjustAccountBalance(store, existingExp.account_id, reverseDelta, existingExp.currency);
+        }
+        if (existingExp.liability_id && existingExp.flow_direction !== 'inflow') {
+          const rateMap = buildRateMap(store.getFxRates());
+          const oldLiab = store.db
+            .prepare(`SELECT currency FROM liabilities WHERE id = ?`)
+            .get(existingExp.liability_id) as { currency: CurrencyCode } | undefined;
+          if (oldLiab) {
+            const revLiabMinor = convertMinor(existingExp.amount_minor, existingExp.currency, oldLiab.currency, rateMap);
+            reverseLiabilityPaydown(store, existingExp.liability_id, revLiabMinor);
+          }
+        }
       }
 
       // 2. Upsert the expense / deposit row
       store.db
         .prepare(
-          `INSERT INTO expenses (id, workspace_id, pot_id, account_id, flow_direction, merchant, description, amount_minor, currency, spent_date, tags_json, portal_url, source, items_json, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `INSERT INTO expenses (id, workspace_id, pot_id, account_id, liability_id, flow_direction, merchant, description, amount_minor, currency, spent_date, tags_json, portal_url, source, items_json, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET
              workspace_id=excluded.workspace_id, pot_id=excluded.pot_id, account_id=excluded.account_id,
-             flow_direction=excluded.flow_direction, merchant=excluded.merchant,
+             liability_id=excluded.liability_id, flow_direction=excluded.flow_direction, merchant=excluded.merchant,
              description=excluded.description, amount_minor=excluded.amount_minor, currency=excluded.currency,
              spent_date=excluded.spent_date, tags_json=excluded.tags_json, portal_url=excluded.portal_url,
              items_json=excluded.items_json, created_at=excluded.created_at`
@@ -2034,6 +2299,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
           wsId,
           b.potId ? String(b.potId) : null,
           accountId,
+          liabilityId,
           flowDirection,
           String(b.merchant || 'Expense'),
           String(b.description || ''),
@@ -2047,10 +2313,13 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
           createdAt
         );
 
-      // 3. Apply the new bank account balance impact (-amount for outflow expense, +amount for inflow deposit)
+      // 3. Apply the new bank account & liability balance impact
       if (accountId && amountMinor > 0) {
         const applyDelta = flowDirection === 'inflow' ? +amountMinor : -amountMinor;
         adjustAccountBalance(store, accountId, applyDelta, currency);
+      }
+      if (liabilityId && amountMinor > 0 && flowDirection !== 'inflow') {
+        applyLiabilityPaydown(store, liabilityId, amountMinor, currency, false);
       }
 
       store.db.exec('COMMIT;');
@@ -2067,11 +2336,12 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     if (!user) return;
     const { id } = req.params as { id: string };
     const row = store.db
-      .prepare(`SELECT workspace_id, account_id, flow_direction, amount_minor, currency FROM expenses WHERE id = ?`)
+      .prepare(`SELECT workspace_id, account_id, liability_id, flow_direction, amount_minor, currency FROM expenses WHERE id = ?`)
       .get(id) as
       | {
           workspace_id: string;
           account_id: string | null;
+          liability_id: string | null;
           flow_direction: string;
           amount_minor: number;
           currency: CurrencyCode;
@@ -2084,6 +2354,16 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       if (row.account_id && row.amount_minor > 0) {
         const reverseDelta = row.flow_direction === 'inflow' ? -row.amount_minor : +row.amount_minor;
         adjustAccountBalance(store, row.account_id, reverseDelta, row.currency);
+      }
+      if (row.liability_id && row.amount_minor > 0 && row.flow_direction !== 'inflow') {
+        const rateMap = buildRateMap(store.getFxRates());
+        const oldLiab = store.db
+          .prepare(`SELECT currency FROM liabilities WHERE id = ?`)
+          .get(row.liability_id) as { currency: CurrencyCode } | undefined;
+        if (oldLiab) {
+          const revLiabMinor = convertMinor(row.amount_minor, row.currency, oldLiab.currency, rateMap);
+          reverseLiabilityPaydown(store, row.liability_id, revLiabMinor);
+        }
       }
       store.db.prepare(`DELETE FROM expenses WHERE id = ?`).run(id);
       store.db.exec('COMMIT;');

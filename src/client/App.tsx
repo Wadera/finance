@@ -62,6 +62,7 @@ import {
 import {
   CashflowSankeyChart,
   DailyRunwayChart,
+  HorizonHistoryChart,
   PotProportionStrip,
   SixMonthTrendChart,
   WealthHorizonChart,
@@ -153,6 +154,7 @@ export const App: React.FC = () => {
 
   const [tab, setTab] = useState<TabKey>('overview');
   const [yearMonth, setYearMonth] = useState<string>(() => new Date().toISOString().slice(0, 7));
+  const [budgetHorizon, setBudgetHorizon] = useState<1 | 3 | 6 | 12 | 60 | 120>(1);
   const [scope, setScope] = useState<string>('all');
   const [horizonYears, setHorizonYears] = useState<number>(10);
   const [wealthMode, setWealthMode] = useState<'combined' | 'mine'>('combined');
@@ -241,7 +243,7 @@ export const App: React.FC = () => {
       const [b, m, w] = await Promise.all([
         apiFetch<BootstrapResponse>('/api/bootstrap'),
         apiFetch<BudgetMonthResponse>(
-          `/api/budget/month?ym=${encodeURIComponent(yearMonth)}&scope=${encodeURIComponent(scope)}`
+          `/api/budget/month?ym=${encodeURIComponent(yearMonth)}&scope=${encodeURIComponent(scope)}&horizon=${budgetHorizon}`
         ),
         apiFetch<WealthOverviewResponse>(
           `/api/wealth/overview?horizon=${horizonYears}&scope=${encodeURIComponent(scope)}`
@@ -253,7 +255,7 @@ export const App: React.FC = () => {
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Failed to load data');
     }
-  }, [yearMonth, scope, horizonYears]);
+  }, [yearMonth, scope, horizonYears, budgetHorizon]);
 
   useEffect(() => {
     void reloadAll();
@@ -501,6 +503,8 @@ export const App: React.FC = () => {
   };
 
   const allAvailableAccounts = budget.allAccounts && budget.allAccounts.length > 0 ? budget.allAccounts : budget.accounts;
+  const allAvailableLiabilities =
+    budget.allLiabilities && budget.allLiabilities.length > 0 ? budget.allLiabilities : wealth.liabilities;
   const defaultAccountForWs = (wsId: string) =>
     allAvailableAccounts.find((a) => a.workspaceId === wsId && a.isPrimaryRunway)?.id ||
     allAvailableAccounts.find((a) => a.workspaceId === wsId)?.id ||
@@ -601,7 +605,9 @@ export const App: React.FC = () => {
         });
       }
     } else if (entityType === 'liability') {
-      const lb = wealth.liabilities.find((l) => l.id === entityId);
+      const lb =
+        allAvailableLiabilities.find((l) => l.id === entityId) ||
+        wealth.liabilities.find((l) => l.id === entityId);
       if (lb) {
         setDrawer({
           entityType: 'liability',
@@ -658,27 +664,58 @@ export const App: React.FC = () => {
           </div>
 
           <div className="flex items-center gap-1.5 sm:gap-2">
-            {/* Month switcher */}
+            {/* Month switcher + Multi-Period Zoom (1M / 3M / 6M / 12M / 5Y / 10Y) */}
             {tab !== 'wealth' && tab !== 'settings' && (
-              <div className="inline-flex items-center border border-slate-200 bg-white rounded-md text-xs font-mono-num">
-                <button
-                  type="button"
-                  onClick={() => setYearMonth((ym) => shiftMonth(ym, -1))}
-                  className="p-1.5 text-slate-500 hover:text-slate-900"
-                  title={t.prevMonth}
+              <>
+                <div className="inline-flex items-center border border-slate-200 bg-white rounded-md text-xs font-mono-num">
+                  <button
+                    type="button"
+                    onClick={() => setYearMonth((ym) => shiftMonth(ym, -1))}
+                    className="p-1.5 text-slate-500 hover:text-slate-900"
+                    title={t.prevMonth}
+                  >
+                    <ChevronLeft className="w-3.5 h-3.5" />
+                  </button>
+                  <span className="px-1.5 font-medium text-slate-800">{yearMonth}</span>
+                  <button
+                    type="button"
+                    onClick={() => setYearMonth((ym) => shiftMonth(ym, 1))}
+                    className="p-1.5 text-slate-500 hover:text-slate-900"
+                    title={t.nextMonth}
+                  >
+                    <ChevronRight className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+
+                <div
+                  className="hidden sm:inline-flex items-center border border-slate-200 bg-white rounded-md p-0.5 text-[11px] font-mono-num"
+                  title={t.zoomLabel}
                 >
-                  <ChevronLeft className="w-3.5 h-3.5" />
-                </button>
-                <span className="px-1.5 font-medium text-slate-800">{yearMonth}</span>
-                <button
-                  type="button"
-                  onClick={() => setYearMonth((ym) => shiftMonth(ym, 1))}
-                  className="p-1.5 text-slate-500 hover:text-slate-900"
-                  title={t.nextMonth}
-                >
-                  <ChevronRight className="w-3.5 h-3.5" />
-                </button>
-              </div>
+                  {(
+                    [
+                      [1, '1M'],
+                      [3, '3M'],
+                      [6, '6M'],
+                      [12, '12M'],
+                      [60, '5Y'],
+                      [120, '10Y'],
+                    ] as Array<[1 | 3 | 6 | 12 | 60 | 120, string]>
+                  ).map(([hVal, hLabel]) => (
+                    <button
+                      key={hVal}
+                      type="button"
+                      onClick={() => setBudgetHorizon(hVal)}
+                      className={`px-1.5 py-0.5 rounded transition ${
+                        budgetHorizon === hVal
+                          ? 'bg-teal-700 text-white font-semibold'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      {hLabel}
+                    </button>
+                  ))}
+                </div>
+              </>
             )}
 
             {/* Multi-Workspace Switcher (Personal, Household, Company A, Company B, + New Workspace) */}
@@ -812,54 +849,86 @@ export const App: React.FC = () => {
         {/* ======================== TAB 1: OVERVIEW ======================== */}
         {tab === 'overview' && (
           <>
-            {/* KPI Strip */}
-            <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
-              <div className="bg-white border border-slate-200 rounded-lg p-4">
-                <div className="text-[11px] font-mono-num uppercase tracking-wider text-slate-400">
-                  {t.kpiIncome}
-                </div>
-                <div className="mt-1 text-2xl font-mono-num font-semibold text-slate-900">
-                  {privacyMode ? '100.0%' : fmt(budget.kpis.totalIncomeMinor)}
-                </div>
-                <div className="mt-1 text-xs text-slate-500">{t.kpiActiveStreams(budget.incomes.length)}</div>
-              </div>
+            {/* KPI Strip (scales dynamically when zoomed out to 3M / 6M / 12M / 5Y / 10Y) */}
+            {(() => {
+              const hs = budget.horizonSummary;
+              const isMulti = budgetHorizon > 1 && hs;
+              const periodTag =
+                budgetHorizon === 3
+                  ? ' (3M)'
+                  : budgetHorizon === 6
+                  ? ' (6M)'
+                  : budgetHorizon === 12
+                  ? ' (12M)'
+                  : budgetHorizon === 60
+                  ? ' (5Y)'
+                  : budgetHorizon === 120
+                  ? ' (10Y)'
+                  : '';
+              const kpiInc = isMulti ? hs.totalIncomeMinor : budget.kpis.totalIncomeMinor;
+              const kpiSpd = isMulti ? hs.totalSpendMinor : budget.kpis.potPlannedTotalMinor;
+              const kpiPrs = isMulti
+                ? budget.kpis.totalPreserveSliceMinor * budgetHorizon
+                : budget.kpis.totalPreserveSliceMinor;
+              const kpiSav = isMulti ? hs.totalSavedMinor : budget.kpis.netMonthlySurplusMinor;
+              const kpiRate = isMulti ? hs.savingsRatePct : budget.kpis.savingsRatePct;
 
-              <div className="bg-white border border-slate-200 rounded-lg p-4">
-                <div className="text-[11px] font-mono-num uppercase tracking-wider text-slate-400">
-                  {t.kpiPlannedSpent}
-                </div>
-                <div className="mt-1 text-2xl font-mono-num font-semibold text-slate-900">
-                  {fmt(budget.kpis.potPlannedTotalMinor)}
-                </div>
-                <div className="mt-1 text-xs text-slate-500">{t.kpiPlannedSub}</div>
-              </div>
+              return (
+                <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+                  <div className="bg-white border border-slate-200 rounded-lg p-4">
+                    <div className="text-[11px] font-mono-num uppercase tracking-wider text-slate-400">
+                      {t.kpiIncome}
+                      {periodTag}
+                    </div>
+                    <div className="mt-1 text-2xl font-mono-num font-semibold text-slate-900">
+                      {privacyMode ? '100.0%' : fmt(kpiInc)}
+                    </div>
+                    <div className="mt-1 text-xs text-slate-500">
+                      {isMulti && !privacyMode
+                        ? `${t.horizonAvgMoLabel}: ${fmt(hs.avgMonthlyIncomeMinor)}`
+                        : t.kpiActiveStreams(budget.incomes.length)}
+                    </div>
+                  </div>
 
-              <div className="bg-white border border-slate-200 rounded-lg p-4">
-                <div className="text-[11px] font-mono-num uppercase tracking-wider text-teal-700">
-                  {t.kpiPreserve}
-                </div>
-                <div className="mt-1 text-2xl font-mono-num font-semibold text-teal-800">
-                  {fmt(budget.kpis.totalPreserveSliceMinor)}
-                </div>
-                <div className="mt-1 text-xs text-slate-500">{t.kpiPreserveSub}</div>
-              </div>
+                  <div className="bg-white border border-slate-200 rounded-lg p-4">
+                    <div className="text-[11px] font-mono-num uppercase tracking-wider text-slate-400">
+                      {t.kpiPlannedSpent}
+                      {periodTag}
+                    </div>
+                    <div className="mt-1 text-2xl font-mono-num font-semibold text-slate-900">{fmt(kpiSpd)}</div>
+                    <div className="mt-1 text-xs text-slate-500">
+                      {isMulti && !privacyMode ? `${t.horizonAvgMoLabel}: ${fmt(hs.avgMonthlySpendMinor)}` : t.kpiPlannedSub}
+                    </div>
+                  </div>
 
-              <div className="bg-white border border-slate-200 rounded-lg p-4">
-                <div className="text-[11px] font-mono-num uppercase tracking-wider text-slate-400">
-                  {t.kpiSurplus}
+                  <div className="bg-white border border-slate-200 rounded-lg p-4">
+                    <div className="text-[11px] font-mono-num uppercase tracking-wider text-teal-700">
+                      {t.kpiPreserve}
+                      {periodTag}
+                    </div>
+                    <div className="mt-1 text-2xl font-mono-num font-semibold text-teal-800">{fmt(kpiPrs)}</div>
+                    <div className="mt-1 text-xs text-slate-500">{t.kpiPreserveSub}</div>
+                  </div>
+
+                  <div className="bg-white border border-slate-200 rounded-lg p-4">
+                    <div className="text-[11px] font-mono-num uppercase tracking-wider text-slate-400">
+                      {t.kpiSurplus}
+                      {periodTag}
+                    </div>
+                    <div
+                      className={`mt-1 text-2xl font-mono-num font-semibold ${
+                        kpiSav >= 0 ? 'text-emerald-700' : 'text-amber-700'
+                      }`}
+                    >
+                      {fmt(kpiSav)}
+                    </div>
+                    <div className="mt-1 text-xs text-slate-500 font-mono-num">
+                      {t.kpiSavingsRate}: {kpiRate}%
+                    </div>
+                  </div>
                 </div>
-                <div
-                  className={`mt-1 text-2xl font-mono-num font-semibold ${
-                    budget.kpis.netMonthlySurplusMinor >= 0 ? 'text-emerald-700' : 'text-amber-700'
-                  }`}
-                >
-                  {fmt(budget.kpis.netMonthlySurplusMinor)}
-                </div>
-                <div className="mt-1 text-xs text-slate-500 font-mono-num">
-                  {t.kpiSavingsRate}: {budget.kpis.savingsRatePct}%
-                </div>
-              </div>
-            </div>
+              );
+            })()}
 
             {/* Live Bank & Runway Accounts Bar (Click Edit on any account to rename or adjust balance) */}
             <section className="bg-white border border-slate-200 rounded-lg p-3.5">
@@ -939,6 +1008,13 @@ export const App: React.FC = () => {
                   </button>
                   <button
                     type="button"
+                    onClick={() => setModal({ kind: 'income' })}
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded border border-emerald-700/30 bg-emerald-50/50 text-xs font-medium text-emerald-900 hover:bg-emerald-100/70"
+                  >
+                    <Plus className="w-3.5 h-3.5" /> {t.addIncomeBtn}
+                  </button>
+                  <button
+                    type="button"
                     onClick={() => setModal({ kind: 'expense' })}
                     className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50"
                   >
@@ -954,14 +1030,14 @@ export const App: React.FC = () => {
                 </div>
               </div>
 
-              {/* Legend explaining Solid vs Dotted Payday Bridge */}
-              <div className="text-[11px] font-mono-num text-slate-500 bg-slate-50/80 border border-slate-100 rounded px-3 py-1.5 flex flex-wrap items-center gap-2">
-                <span className="inline-flex items-center gap-1 text-emerald-800 font-medium">
-                  <span className="w-3 h-1.5 rounded-xs bg-emerald-700 inline-block" />
+              {/* Legend explaining Solid vs Brighter Solid with Dotted Border Payday Bridge */}
+              <div className="text-[11px] font-mono-num text-slate-500 bg-slate-50/80 border border-slate-100 rounded px-3 py-1.5 flex flex-wrap items-center gap-3">
+                <span className="inline-flex items-center gap-1.5 text-emerald-800 font-medium">
+                  <span className="w-3.5 h-2 rounded-xs bg-emerald-700/60 inline-block" />
                   {t.sankeyLegendSolid}
                 </span>
-                <span className="inline-flex items-center gap-1 text-rose-700">
-                  <span className="w-3 h-0 border-t-2 border-dashed border-rose-600 inline-block" />
+                <span className="inline-flex items-center gap-1.5 text-rose-700">
+                  <span className="w-3.5 h-2 rounded-xs bg-rose-200/70 border border-dashed border-rose-600 inline-block" />
                   {t.sankeyLegendDotted}
                 </span>
               </div>
@@ -1006,16 +1082,63 @@ export const App: React.FC = () => {
               />
             </section>
 
-            {/* Bottom 2-column brief summary: 6-Month Trend + Active Sinking Reserves */}
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-              <section className="bg-white border border-slate-200 rounded-lg p-5">
-                <div className="flex items-center justify-between mb-1">
-                  <h3 className="text-xs font-mono-num uppercase tracking-wider text-slate-500 font-semibold">
-                    {t.trend6mTitle}
-                  </h3>
-                  <span className="text-[11px] font-mono-num text-slate-400">{t.trend6mLegend}</span>
+            {/* Multi-Period Historical Performance & Trajectory (3M / 6M / 12M / 5Y / 10Y) + Active Sinking Reserves */}
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+              <section className="lg:col-span-2 bg-white border border-slate-200 rounded-lg p-5 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <h3 className="text-xs font-mono-num uppercase tracking-wider text-slate-600 font-semibold">
+                      {budget.horizonSummary
+                        ? t.horizonHistoryTitle(
+                            budgetHorizon === 1
+                              ? '6M'
+                              : budgetHorizon === 60
+                              ? '5Y'
+                              : budgetHorizon === 120
+                              ? '10Y'
+                              : `${budgetHorizon}M`,
+                            `${budget.horizonSummary.startYearMonth} → ${budget.horizonSummary.endYearMonth}`
+                          )
+                        : t.trend6mTitle}
+                    </h3>
+                    <p className="text-[11px] text-slate-400">{t.horizonHistorySub}</p>
+                  </div>
+                  <div className="inline-flex items-center border border-slate-200 bg-[#FAF9F6] rounded-md p-0.5 text-[11px] font-mono-num">
+                    {(
+                      [
+                        [1, '1M'],
+                        [3, '3M'],
+                        [6, '6M'],
+                        [12, '12M'],
+                        [60, '5Y'],
+                        [120, '10Y'],
+                      ] as Array<[1 | 3 | 6 | 12 | 60 | 120, string]>
+                    ).map(([hVal, hLabel]) => (
+                      <button
+                        key={hVal}
+                        type="button"
+                        onClick={() => setBudgetHorizon(hVal)}
+                        className={`px-2 py-0.5 rounded transition ${
+                          budgetHorizon === hVal
+                            ? 'bg-teal-700 text-white font-semibold'
+                            : 'text-slate-600 hover:text-slate-900'
+                        }`}
+                      >
+                        {hLabel}
+                      </button>
+                    ))}
+                  </div>
                 </div>
-                <SixMonthTrendChart data={budget.trend6m} currency={cur} privacyMode={privacyMode} />
+                {budget.horizonSummary ? (
+                  <HorizonHistoryChart
+                    summary={budget.horizonSummary}
+                    currency={cur}
+                    privacyMode={privacyMode}
+                    t={t}
+                  />
+                ) : (
+                  <SixMonthTrendChart data={budget.trend6m} currency={cur} privacyMode={privacyMode} />
+                )}
               </section>
 
               <section className="bg-white border border-slate-200 rounded-lg p-5 flex flex-col justify-between">
@@ -1559,6 +1682,19 @@ export const App: React.FC = () => {
                                 }`}
                             {ob.accountName && (
                               <span className="ml-2 text-slate-600">· 🏦 {ob.accountName}</span>
+                            )}
+                            {ob.liabilityName && (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  if (ob.liabilityId) openEntityDrawer('liability', ob.liabilityId);
+                                }}
+                                className="ml-2 text-amber-800 hover:underline font-medium"
+                                title="Linked Mortgage / Loan (auto-updates balance when ticked)"
+                              >
+                                · 🏠 {ob.liabilityName}
+                              </button>
                             )}
                             {paidTimestamp && (
                               <span className="ml-2 text-emerald-700 font-semibold">· ✓ {paidTimestamp}</span>
@@ -2999,6 +3135,7 @@ export const App: React.FC = () => {
                           workspaceId: fd.get('workspaceId') || ob.workspaceId,
                           potId: fd.get('potId') || null,
                           accountId: fd.get('accountId') || null,
+                          liabilityId: fd.get('liabilityId') || null,
                           name: nextName,
                           amountMinor: Math.round(Number(fd.get('amountMajor') || 0) * 100),
                           currency: fd.get('currency') || ob.currency,
@@ -3082,21 +3219,38 @@ export const App: React.FC = () => {
                         </select>
                       </label>
                     </div>
-                    <label className="block space-y-1">
-                      <span className="text-slate-600">{t.paidFromAccountLabel}</span>
-                      <select
-                        name="accountId"
-                        defaultValue={ob.accountId || ''}
-                        className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
-                      >
-                        <option value="">{t.noAccountLinkOption}</option>
-                        {allAvailableAccounts.map((acc) => (
-                          <option key={acc.id} value={acc.id}>
-                            🏦 {acc.name} ({acc.institution} · {acc.currency})
-                          </option>
-                        ))}
-                      </select>
-                    </label>
+                    <div className="grid grid-cols-1 gap-2">
+                      <label className="block space-y-1">
+                        <span className="text-slate-600">{t.paidFromAccountLabel}</span>
+                        <select
+                          name="accountId"
+                          defaultValue={ob.accountId || ''}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
+                        >
+                          <option value="">{t.noAccountLinkOption}</option>
+                          {allAvailableAccounts.map((acc) => (
+                            <option key={acc.id} value={acc.id}>
+                              🏦 {acc.name} ({acc.institution} · {formatDisplayValue(acc.balanceMinor, { currency: acc.currency, privacyMode })})
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="block space-y-1">
+                        <span className="text-slate-600">{t.linkedLiabilityLabel}</span>
+                        <select
+                          name="liabilityId"
+                          defaultValue={ob.liabilityId || ''}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
+                        >
+                          <option value="">{t.noLiabilityLinkOption}</option>
+                          {allAvailableLiabilities.map((lb) => (
+                            <option key={lb.id} value={lb.id}>
+                              🏠 {lb.name} ({formatDisplayValue(lb.balanceMinor, { currency: lb.currency, privacyMode })} · {(lb.aprBp / 100).toFixed(2)}% APR)
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
                     <div className="grid grid-cols-3 gap-2">
                       <label className="space-y-1">
                         <span className="text-slate-600">{t.amountValueLabel}</span>
@@ -3252,6 +3406,7 @@ export const App: React.FC = () => {
                           workspaceId: fd.get('workspaceId') || exp.workspaceId,
                           potId: fd.get('potId') || null,
                           accountId: fd.get('accountId') || null,
+                          liabilityId: fd.get('liabilityId') || null,
                           flowDirection: fd.get('flowDirection') || 'outflow',
                           merchant: nextMerchant,
                           description: nextDesc,
@@ -3333,7 +3488,7 @@ export const App: React.FC = () => {
                           <option value="">{t.noAccountLinkOption}</option>
                           {allAvailableAccounts.map((acc) => (
                             <option key={acc.id} value={acc.id}>
-                              🏦 {acc.name} ({acc.currency})
+                              🏦 {acc.name} ({formatDisplayValue(acc.balanceMinor, { currency: acc.currency, privacyMode })})
                             </option>
                           ))}
                         </select>
@@ -3350,6 +3505,21 @@ export const App: React.FC = () => {
                         </select>
                       </label>
                     </div>
+                    <label className="block space-y-1">
+                      <span className="text-slate-600">{t.linkedLiabilityLabel}</span>
+                      <select
+                        name="liabilityId"
+                        defaultValue={exp.liabilityId || ''}
+                        className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
+                      >
+                        <option value="">{t.noLiabilityLinkOption}</option>
+                        {allAvailableLiabilities.map((lb) => (
+                          <option key={lb.id} value={lb.id}>
+                            🏠 {lb.name} ({formatDisplayValue(lb.balanceMinor, { currency: lb.currency, privacyMode })})
+                          </option>
+                        ))}
+                      </select>
+                    </label>
                     <div className="grid grid-cols-2 gap-2">
                       <label className="space-y-1">
                         <span className="text-slate-600">{t.amountValueLabel}</span>
@@ -4428,6 +4598,7 @@ export const App: React.FC = () => {
                       workspaceId: fd.get('workspaceId'),
                       potId: fd.get('potId') || null,
                       accountId: fd.get('accountId') || null,
+                      liabilityId: fd.get('liabilityId') || null,
                       name: fd.get('name'),
                       amountMinor: Math.round(Number(fd.get('amountMajor') || 0) * 100),
                       currency: fd.get('currency'),
@@ -4476,21 +4647,38 @@ export const App: React.FC = () => {
                   </label>
                 </div>
 
-                <label className="block space-y-1">
-                  <span>{t.paidFromAccountLabel}</span>
-                  <select
-                    name="accountId"
-                    defaultValue={defaultAccountForWs(defaultActiveWsId)}
-                    className="w-full border border-slate-200 rounded px-2 py-1.5"
-                  >
-                    <option value="">{t.noAccountLinkOption}</option>
-                    {allAvailableAccounts.map((acc) => (
-                      <option key={acc.id} value={acc.id}>
-                        🏦 {acc.name} ({acc.institution} · {acc.currency})
-                      </option>
-                    ))}
-                  </select>
-                </label>
+                <div className="p-2.5 rounded-md bg-teal-50/60 border border-teal-200/80 space-y-2">
+                  <label className="block space-y-1">
+                    <span className="font-semibold text-teal-950">{t.paidFromAccountLabel}</span>
+                    <select
+                      name="accountId"
+                      defaultValue={defaultAccountForWs(defaultActiveWsId)}
+                      className="w-full border border-teal-300 bg-white rounded px-2 py-1.5 font-medium"
+                    >
+                      <option value="">{t.noAccountLinkOption}</option>
+                      {allAvailableAccounts.map((acc) => (
+                        <option key={acc.id} value={acc.id}>
+                          🏦 {acc.name} ({acc.institution} · {formatDisplayValue(acc.balanceMinor, { currency: acc.currency, privacyMode })})
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="block space-y-1">
+                    <span className="font-medium text-slate-700">{t.linkedLiabilityLabel}</span>
+                    <select
+                      name="liabilityId"
+                      defaultValue=""
+                      className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
+                    >
+                      <option value="">{t.noLiabilityLinkOption}</option>
+                      {allAvailableLiabilities.map((lb) => (
+                        <option key={lb.id} value={lb.id}>
+                          🏠 {lb.name} ({formatDisplayValue(lb.balanceMinor, { currency: lb.currency, privacyMode })} · {(lb.aprBp / 100).toFixed(2)}% APR)
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
 
                 <label className="block space-y-1">
                   <span>Payment / Goal Name</span>
@@ -4600,6 +4788,7 @@ export const App: React.FC = () => {
                       workspaceId: fd.get('workspaceId'),
                       potId: fd.get('potId') || null,
                       accountId: fd.get('accountId') || null,
+                      liabilityId: fd.get('liabilityId') || null,
                       flowDirection: fd.get('flowDirection') || 'outflow',
                       merchant: fd.get('merchant'),
                       description: fd.get('description'),
@@ -4643,31 +4832,48 @@ export const App: React.FC = () => {
                     </select>
                   </label>
                 </div>
-                <div className="grid grid-cols-2 gap-2.5">
-                  <label className="space-y-1">
-                    <span>{t.bankAccountLabel}</span>
+                <div className="p-2.5 rounded-md bg-teal-50/60 border border-teal-200/80 space-y-2">
+                  <div className="grid grid-cols-2 gap-2.5">
+                    <label className="space-y-1">
+                      <span className="font-semibold text-teal-950">{t.bankAccountLabel}</span>
+                      <select
+                        name="accountId"
+                        defaultValue={defaultAccountForWs(defaultActiveWsId)}
+                        className="w-full border border-teal-300 bg-white rounded px-2 py-1.5 font-medium"
+                      >
+                        <option value="">{t.noAccountLinkOption}</option>
+                        {allAvailableAccounts.map((acc) => (
+                          <option key={acc.id} value={acc.id}>
+                            🏦 {acc.name} ({formatDisplayValue(acc.balanceMinor, { currency: acc.currency, privacyMode })})
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="space-y-1">
+                      <span className="font-semibold text-teal-950">{t.flowDirectionLabel}</span>
+                      <select
+                        name="flowDirection"
+                        defaultValue="outflow"
+                        className="w-full border border-teal-300 bg-white rounded px-2 py-1.5 font-medium"
+                      >
+                        <option value="outflow">{t.flowOutflowOption}</option>
+                        <option value="inflow">{t.flowInflowOption}</option>
+                      </select>
+                    </label>
+                  </div>
+                  <label className="block space-y-1">
+                    <span className="font-medium text-slate-700">{t.linkedLiabilityLabel}</span>
                     <select
-                      name="accountId"
-                      defaultValue={defaultAccountForWs(defaultActiveWsId)}
-                      className="w-full border border-slate-200 rounded px-2 py-1.5"
+                      name="liabilityId"
+                      defaultValue=""
+                      className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
                     >
-                      <option value="">{t.noAccountLinkOption}</option>
-                      {allAvailableAccounts.map((acc) => (
-                        <option key={acc.id} value={acc.id}>
-                          🏦 {acc.name} ({acc.institution} · {acc.currency})
+                      <option value="">{t.noLiabilityLinkOption}</option>
+                      {allAvailableLiabilities.map((lb) => (
+                        <option key={lb.id} value={lb.id}>
+                          🏠 {lb.name} ({formatDisplayValue(lb.balanceMinor, { currency: lb.currency, privacyMode })} · {(lb.aprBp / 100).toFixed(2)}% APR)
                         </option>
                       ))}
-                    </select>
-                  </label>
-                  <label className="space-y-1">
-                    <span>{t.flowDirectionLabel}</span>
-                    <select
-                      name="flowDirection"
-                      defaultValue="outflow"
-                      className="w-full border border-slate-200 rounded px-2 py-1.5"
-                    >
-                      <option value="outflow">{t.flowOutflowOption}</option>
-                      <option value="inflow">{t.flowInflowOption}</option>
                     </select>
                   </label>
                 </div>
@@ -5026,6 +5232,7 @@ export const App: React.FC = () => {
                       paydayDay: Number(fd.get('paydayDay') || 27),
                       effectiveFrom: fd.get('effectiveFrom'),
                       effectiveTo: fd.get('effectiveTo') || null,
+                      markReceivedYearMonth: fd.get('markReceivedNow') === 'on' ? yearMonth : undefined,
                     }),
                   });
                   setModal(null);
@@ -5057,21 +5264,27 @@ export const App: React.FC = () => {
                     />
                   </label>
                 </div>
-                <label className="block space-y-1">
-                  <span>{t.depositIntoAccountLabel}</span>
-                  <select
-                    name="accountId"
-                    defaultValue={defaultAccountForWs(defaultActiveWsId)}
-                    className="w-full border border-slate-200 rounded px-2 py-1.5"
-                  >
-                    <option value="">{t.noAccountLinkOption}</option>
-                    {allAvailableAccounts.map((acc) => (
-                      <option key={acc.id} value={acc.id}>
-                        🏦 {acc.name} ({acc.institution} · {acc.currency})
-                      </option>
-                    ))}
-                  </select>
-                </label>
+                <div className="p-2.5 rounded-md bg-emerald-50/70 border border-emerald-200 space-y-2">
+                  <label className="block space-y-1">
+                    <span className="font-semibold text-emerald-950">{t.depositIntoAccountLabel}</span>
+                    <select
+                      name="accountId"
+                      defaultValue={defaultAccountForWs(defaultActiveWsId)}
+                      className="w-full border border-emerald-300 bg-white rounded px-2 py-1.5 font-medium"
+                    >
+                      <option value="">{t.noAccountLinkOption}</option>
+                      {allAvailableAccounts.map((acc) => (
+                        <option key={acc.id} value={acc.id}>
+                          🏦 {acc.name} ({acc.institution} · {formatDisplayValue(acc.balanceMinor, { currency: acc.currency, privacyMode })})
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="flex items-center gap-2 text-emerald-900 font-medium">
+                    <input type="checkbox" name="markReceivedNow" defaultChecked />
+                    <span>{t.creditIncomeNowLabel}</span>
+                  </label>
+                </div>
                 <div className="grid grid-cols-3 gap-2">
                   <label className="space-y-1">
                     <span>Net Amount</span>

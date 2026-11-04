@@ -342,9 +342,13 @@ export class FinanceStore {
     };
 
     addColumnIfMissing('expenses', 'account_id', 'TEXT REFERENCES accounts(id) ON DELETE SET NULL');
+    addColumnIfMissing('expenses', 'liability_id', 'TEXT REFERENCES liabilities(id) ON DELETE SET NULL');
     addColumnIfMissing('expenses', 'flow_direction', "TEXT NOT NULL DEFAULT 'outflow'");
     addColumnIfMissing('obligations', 'account_id', 'TEXT REFERENCES accounts(id) ON DELETE SET NULL');
+    addColumnIfMissing('obligations', 'liability_id', 'TEXT REFERENCES liabilities(id) ON DELETE SET NULL');
     addColumnIfMissing('payment_occurrences', 'account_id', 'TEXT REFERENCES accounts(id) ON DELETE SET NULL');
+    addColumnIfMissing('payment_occurrences', 'liability_id', 'TEXT REFERENCES liabilities(id) ON DELETE SET NULL');
+    addColumnIfMissing('payment_occurrences', 'liability_delta_minor', 'INTEGER NOT NULL DEFAULT 0');
     addColumnIfMissing('income_streams', 'account_id', 'TEXT REFERENCES accounts(id) ON DELETE SET NULL');
     addColumnIfMissing('income_occurrences', 'account_id', 'TEXT REFERENCES accounts(id) ON DELETE SET NULL');
   }
@@ -414,6 +418,27 @@ export class FinanceStore {
       this.backfillDefaultAccountLinks();
       this.db.prepare(`INSERT OR REPLACE INTO app_meta (key, value) VALUES ('account_links_seeded_v1', 'done')`).run();
     }
+
+    const careerHistory10y = this.db.prepare(`SELECT value FROM app_meta WHERE key = 'career_history_10y_v1'`).get() as
+      | { value: string }
+      | undefined;
+    if (!careerHistory10y) {
+      const insHistInc = this.db.prepare(`
+        INSERT OR IGNORE INTO income_streams (id, workspace_id, account_id, name, source_kind, amount_minor, currency, cadence, payday_day, effective_from, effective_to, is_active, portal_url, notes)
+        VALUES (?, ?, ?, ?, 'salary', ?, 'GBP', 'monthly', 27, ?, ?, 1, NULL, ?)
+      `);
+      insHistInc.run('inc-wadera-2017', 'ws-wadera', 'acc-wadera-main', 'Senior Engineering Role (2017–2020)', 385000, '2016-01-01', '2020-12-31', 'Historical career band');
+      insHistInc.run('inc-wadera-2021', 'ws-wadera', 'acc-wadera-main', 'Staff Engineering Role (2021–2023)', 455000, '2021-01-01', '2023-12-31', 'Historical career band');
+      this.db.prepare(`INSERT OR REPLACE INTO app_meta (key, value) VALUES ('career_history_10y_v1', 'done')`).run();
+    }
+
+    const liabilityLinksSeeded = this.db.prepare(`SELECT value FROM app_meta WHERE key = 'liability_links_seeded_v1'`).get() as
+      | { value: string }
+      | undefined;
+    if (!liabilityLinksSeeded) {
+      this.backfillDefaultAccountLinks();
+      this.db.prepare(`INSERT OR REPLACE INTO app_meta (key, value) VALUES ('liability_links_seeded_v1', 'done')`).run();
+    }
   }
 
   public backfillDefaultAccountLinks(): void {
@@ -434,6 +459,12 @@ export class FinanceStore {
       )
       WHERE account_id IS NULL;
 
+      UPDATE obligations
+      SET liability_id = 'liab-mortgage'
+      WHERE (id = 'ob-mortgage' OR LOWER(name) LIKE '%mortgage%')
+        AND liability_id IS NULL
+        AND EXISTS (SELECT 1 FROM liabilities WHERE id = 'liab-mortgage');
+
       UPDATE expenses
       SET account_id = (
         SELECT a.id FROM accounts a
@@ -448,6 +479,13 @@ export class FinanceStore {
         WHERE o.id = payment_occurrences.obligation_id
       )
       WHERE account_id IS NULL;
+
+      UPDATE payment_occurrences
+      SET liability_id = (
+        SELECT o.liability_id FROM obligations o
+        WHERE o.id = payment_occurrences.obligation_id
+      )
+      WHERE liability_id IS NULL;
 
       UPDATE income_occurrences
       SET account_id = (
@@ -942,6 +980,7 @@ export class FinanceStore {
       workspaceId: String(r.workspace_id),
       potId: (r.pot_id as string | null) ?? null,
       accountId: (r.account_id as string | null) ?? null,
+      liabilityId: (r.liability_id as string | null) ?? null,
       name: String(r.name),
       amountMinor: Number(r.amount_minor),
       currency: r.currency as CurrencyCode,
@@ -975,6 +1014,8 @@ export class FinanceStore {
       id: String(r.id),
       obligationId: String(r.obligation_id),
       accountId: (r.account_id as string | null) ?? null,
+      liabilityId: (r.liability_id as string | null) ?? null,
+      liabilityDeltaMinor: Number(r.liability_delta_minor ?? 0),
       yearMonth: String(r.year_month),
       dueDate: String(r.due_date),
       expectedMinor: Number(r.expected_minor),
@@ -1077,6 +1118,7 @@ export class FinanceStore {
       workspaceId: String(r.workspace_id),
       potId: (r.pot_id as string | null) ?? null,
       accountId: (r.account_id as string | null) ?? null,
+      liabilityId: (r.liability_id as string | null) ?? null,
       flowDirection: r.flow_direction === 'inflow' ? 'inflow' : 'outflow',
       merchant: String(r.merchant),
       description: String(r.description ?? ''),
@@ -1230,6 +1272,8 @@ export class FinanceStore {
       INSERT INTO income_streams (id, workspace_id, name, source_kind, amount_minor, currency, cadence, payday_day, effective_from, effective_to, is_active, portal_url, notes)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
+    insInc.run('inc-wadera-2017', 'ws-wadera', 'Senior Engineering Role (2017–2020)', 'salary', 385000, 'GBP', 'monthly', 27, '2016-01-01', '2020-12-31', 1, null, 'Historical career band');
+    insInc.run('inc-wadera-2021', 'ws-wadera', 'Staff Engineering Role (2021–2023)', 'salary', 455000, 'GBP', 'monthly', 27, '2021-01-01', '2023-12-31', 1, null, 'Historical career band');
     insInc.run('inc-wadera-2024', 'ws-wadera', 'Principal Engineering Salary (2024)', 'salary', 510000, 'GBP', 'monthly', 27, '2024-01-01', '2025-03-31', 1, null, 'Previous role band');
     insInc.run('inc-wadera-cur', 'ws-wadera', 'Net Monthly Salary (Wadera)', 'salary', 595000, 'GBP', 'monthly', 27, '2025-04-01', null, 1, null, 'Primary take-home (27th payday)');
     insInc.run('inc-walter-cur', 'ws-walter', 'Net Monthly Salary (Walter)', 'salary', 465000, 'GBP', 'monthly', 28, '2025-01-01', null, 1, null, 'Primary take-home');

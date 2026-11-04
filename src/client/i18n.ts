@@ -277,6 +277,19 @@ export const I18N = {
     paidFromAccountLabel: 'Paid from Bank Account',
     depositIntoAccountLabel: 'Deposit into Bank Account',
     renameWorkspacePrompt: (name: string) => `Rename workspace "${name}":`,
+    creditIncomeNowLabel: 'Credit this income to the selected bank account now (mark received this month)',
+    zoomLabel: 'Period Zoom:',
+    horizonHistoryTitle: (label: string, range: string) =>
+      `Historical Performance & Savings Trajectory (${label} · ${range})`,
+    horizonHistorySub:
+      'Zoom out across 3M, 6M, 12M, 5Y, or 10Y to inspect your income vs. spending history and cumulative net savings.',
+    horizonEarnedLabel: 'Total Earned',
+    horizonSpentLabel: 'Total Spent & Preserved',
+    horizonSavedLabel: 'Net Saved',
+    horizonAvgMoLabel: 'Avg / mo',
+    horizonCumSavedLabel: 'Cumulative Net Saved',
+    linkedLiabilityLabel: 'Linked Mortgage / Loan / Credit Card (auto-reduces debt balance)',
+    noLiabilityLinkOption: '— Not linked to a loan / mortgage —',
   },
 
   pl: {
@@ -555,6 +568,19 @@ export const I18N = {
     paidFromAccountLabel: 'Płatność z konta bankowego',
     depositIntoAccountLabel: 'Wpływ na konto bankowe',
     renameWorkspacePrompt: (name: string) => `Zmień nazwę przestrzeni „${name}”:`,
+    creditIncomeNowLabel: 'Zaksięguj ten przychód na wybranym koncie bankowym od razu (oznacz jako otrzymany)',
+    zoomLabel: 'Okres (Zoom):',
+    horizonHistoryTitle: (label: string, range: string) =>
+      `Historia wyników i trajektoria oszczędności (${label} · ${range})`,
+    horizonHistorySub:
+      'Oddal widok do 3M, 6M, 12M, 5L lub 10L, aby prześledzić historię przychodów, wydatków i skumulowanych oszczędności.',
+    horizonEarnedLabel: 'Łączny przychód',
+    horizonSpentLabel: 'Łączne wydatki i rezerwy',
+    horizonSavedLabel: 'Zaoszczędzono netto',
+    horizonAvgMoLabel: 'Średnio / mies.',
+    horizonCumSavedLabel: 'Skumulowane oszczędności',
+    linkedLiabilityLabel: 'Powiązany kredyt hipoteczny / pożyczka / karta (automatycznie zmniejsza dług)',
+    noLiabilityLinkOption: '— Brak powiązania z kredytem / pożyczką —',
   },
 } as const;
 

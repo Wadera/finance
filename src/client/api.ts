@@ -89,11 +89,13 @@ export interface EnrichedObligation extends ObligationRecord {
   effectiveDisplayMinor: number;
   targetDisplayMinor: number;
   preservedDisplayMinor: number;
+  liabilityName?: string | null;
 }
 
 export type EnrichedExpense = ExpenseEntryRecord & {
   displayAmountMinor: number;
   accountName?: string | null;
+  liabilityName?: string | null;
 };
 
 export interface EnrichedIncome extends IncomeStreamRecord {
@@ -165,12 +167,38 @@ export interface DailyCurvePoint {
   }>;
 }
 
+export interface HorizonBucket {
+  key: string;
+  label: string;
+  subLabel: string;
+  incomeMinor: number;
+  spendMinor: number;
+  savedMinor: number;
+  cumulativeSavedMinor: number;
+  savingsRatePct: number;
+}
+
+export interface HorizonSummary {
+  horizonMonths: 1 | 3 | 6 | 12 | 60 | 120;
+  chartMonthsCount: number;
+  startYearMonth: string;
+  endYearMonth: string;
+  totalIncomeMinor: number;
+  totalSpendMinor: number;
+  totalSavedMinor: number;
+  avgMonthlyIncomeMinor: number;
+  avgMonthlySpendMinor: number;
+  savingsRatePct: number;
+  buckets: HorizonBucket[];
+}
+
 export interface BudgetMonthResponse {
   yearMonth: string;
   scope: string;
   displayCurrency: CurrencyCode;
   accounts: BankAccountRecord[];
   allAccounts?: BankAccountRecord[];
+  allLiabilities?: LiabilityRecord[];
   incomes: EnrichedIncome[];
   allIncomes: IncomeStreamRecord[];
   pots: PotRecord[];
@@ -208,6 +236,7 @@ export interface BudgetMonthResponse {
     links: Array<{ source: string; target: string; valueMinor: number }>;
   };
   trend6m: Array<{ yearMonth: string; incomeMinor: number; spendMinor: number; savedMinor: number }>;
+  horizonSummary?: HorizonSummary;
 }
 
 export interface WealthOverviewResponse {

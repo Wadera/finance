@@ -117,6 +117,7 @@ export interface ObligationRecord {
   workspaceId: string;
   potId: string | null;
   accountId?: string | null;
+  liabilityId?: string | null;
   name: string;
   amountMinor: number;
   currency: CurrencyCode;
@@ -143,6 +144,8 @@ export interface PaymentOccurrenceRecord {
   id: string;
   obligationId: string;
   accountId?: string | null;
+  liabilityId?: string | null;
+  liabilityDeltaMinor?: number;
   yearMonth: string; // YYYY-MM
   dueDate: string; // YYYY-MM-DD
   expectedMinor: number;
@@ -165,6 +168,7 @@ export interface ExpenseEntryRecord {
   workspaceId: string;
   potId: string | null;
   accountId?: string | null;
+  liabilityId?: string | null;
   flowDirection?: 'outflow' | 'inflow';
   merchant: string;
   description: string;

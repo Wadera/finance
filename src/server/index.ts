@@ -41,12 +41,22 @@ async function main() {
       root: clientDist,
       prefix: '/',
       wildcard: false,
+      setHeaders(res, filePath) {
+        if (filePath.endsWith('.html')) {
+          res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+          res.setHeader('Pragma', 'no-cache');
+          res.setHeader('Expires', '0');
+        } else if (filePath.includes('/assets/') || filePath.includes('\\assets\\')) {
+          res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+        }
+      },
     });
 
     app.setNotFoundHandler((req, reply) => {
       if (req.url.startsWith('/api/')) {
         return reply.code(404).send({ error: 'API route not found' });
       }
+      reply.header('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
       return reply.sendFile('index.html');
     });
   }
