@@ -883,6 +883,282 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       buckets: horizonBuckets,
     };
 
+    // When zoomed out (3M / 6M / 12M / 5Y / 10Y), expand BOTH `timelineLedger` (table history)
+    // and `dailyCurve` (Timeline graph) to span the entire selected horizon!
+    if (horizonMonths > 1) {
+      const periodMonths = prevYearMonths(ym, horizonMonths);
+      const startPeriodYm = periodMonths[0];
+
+      // 1. Add all historical logged expenses in [startPeriodYm .. prevYm] to timelineLedger
+      for (const exp of allHistoryExpenses) {
+        const expYm = exp.spentDate.slice(0, 7);
+        if (expYm >= ym || expYm < startPeriodYm) continue;
+        const timePart =
+          exp.createdAt && exp.createdAt.length >= 16 && /^\d{2}:\d{2}/.test(exp.createdAt.slice(11, 16))
+            ? exp.createdAt.slice(11, 16)
+            : '12:00';
+        const timestamp = `${exp.spentDate}T${timePart}:00Z`;
+        const day = Math.min(28, Math.max(1, Number(exp.spentDate.slice(8, 10)) || 1));
+        const pot = exp.potId ? potById.get(exp.potId) : undefined;
+        const dispMinor = convertMinor(exp.amountMinor, exp.currency, cur, rateMap);
+        timelineLedger.push({
+          id: `led-exp-${exp.id}`,
+          kind: 'expense',
+          flowDirection: exp.flowDirection === 'inflow' ? 'inflow' : 'outflow',
+          entityType: 'expense',
+          entityId: exp.id,
+          workspaceId: exp.workspaceId,
+          accountId: exp.accountId ?? null,
+          accountName: exp.accountId ? (accById.get(exp.accountId)?.name ?? null) : null,
+          potId: exp.potId,
+          potName: pot?.name ?? null,
+          potColor: pot?.color ?? (exp.flowDirection === 'inflow' ? '#10B981' : '#E11D48'),
+          title: exp.merchant,
+          subtitle: exp.description || '',
+          date: exp.spentDate,
+          timestamp,
+          day,
+          amountMinor: exp.amountMinor,
+          currency: exp.currency,
+          displayAmountMinor: dispMinor,
+        });
+      }
+
+      // 2. Add historical completed scheduled bills across past months in the period (up to 24 most recent months of bill rows)
+      const billHistoryMonths = periodMonths.slice(0, -1).slice(-24);
+      for (const mKey of billHistoryMonths) {
+        const mInc = incomes.reduce((s, i) => s + computeMonthlyIncomeMinor(i, mKey, cur, rateMap), 0);
+        if (mInc <= 0) continue;
+        const mOccs = store.listPaymentOccurrences(
+          mKey,
+          obligations.map((o) => o.id)
+        );
+        const mOccByOb = new Map(mOccs.map((o) => [o.obligationId, o]));
+
+        for (const ob of obligations) {
+          if (!ob.isActive) continue;
+          if (mKey < '2022-09' && ob.id === 'ob-mortgage') continue;
+          const occ = mOccByOb.get(ob.id);
+          if (occ && occ.status === 'paid') {
+            const eventDate =
+              occ.paidAt && occ.paidAt.slice(0, 7) === mKey
+                ? occ.paidAt.slice(0, 10)
+                : `${mKey}-${String(Math.min(28, Math.max(1, ob.dueDay || 1))).padStart(2, '0')}`;
+            const timePart =
+              occ.paidAt && occ.paidAt.length >= 16 && /^\d{2}:\d{2}/.test(occ.paidAt.slice(11, 16))
+                ? occ.paidAt.slice(11, 16)
+                : '09:00';
+            const actualNativeMinor = occ.actualPaidMinor ?? ob.amountMinor;
+            const dispMinor = convertMinor(actualNativeMinor, ob.currency, cur, rateMap);
+            const pot = ob.potId ? potById.get(ob.potId) : undefined;
+            const effAccId = (occ.accountId ?? ob.accountId) || null;
+            timelineLedger.push({
+              id: `led-occ-${occ.id}`,
+              kind: 'paid_bill',
+              flowDirection: 'outflow',
+              entityType: 'obligation',
+              entityId: ob.id,
+              occurrenceId: occ.id,
+              workspaceId: ob.workspaceId,
+              accountId: effAccId,
+              accountName: effAccId ? (accById.get(effAccId)?.name ?? null) : null,
+              potId: ob.potId,
+              potName: pot?.name ?? null,
+              potColor: pot?.color ?? '#059669',
+              title: ob.name,
+              subtitle: ob.cadence,
+              date: eventDate,
+              timestamp: `${eventDate}T${timePart}:00Z`,
+              day: Number(eventDate.slice(8, 10)) || ob.dueDay || 1,
+              amountMinor: actualNativeMinor,
+              currency: ob.currency,
+              displayAmountMinor: dispMinor,
+            });
+          } else if (!occ && ob.cadence === 'monthly') {
+            // Historical monthly bill completed on its scheduled due day in past month mKey
+            const dueDayClamped = String(Math.min(28, Math.max(1, ob.dueDay || 1))).padStart(2, '0');
+            const eventDate = `${mKey}-${dueDayClamped}`;
+            const dispMinor = convertMinor(ob.amountMinor, ob.currency, cur, rateMap);
+            const pot = ob.potId ? potById.get(ob.potId) : undefined;
+            const effAccId = ob.accountId || null;
+            timelineLedger.push({
+              id: `led-hist-${ob.id}-${mKey}`,
+              kind: 'paid_bill',
+              flowDirection: 'outflow',
+              entityType: 'obligation',
+              entityId: ob.id,
+              workspaceId: ob.workspaceId,
+              accountId: effAccId,
+              accountName: effAccId ? (accById.get(effAccId)?.name ?? null) : null,
+              potId: ob.potId,
+              potName: pot?.name ?? null,
+              potColor: pot?.color ?? '#059669',
+              title: ob.name,
+              subtitle: `${ob.cadence} (${mKey})`,
+              date: eventDate,
+              timestamp: `${eventDate}T09:00:00Z`,
+              day: Number(dueDayClamped),
+              amountMinor: ob.amountMinor,
+              currency: ob.currency,
+              displayAmountMinor: dispMinor,
+            });
+          }
+        }
+      }
+
+      timelineLedger.sort((a, b) => b.timestamp.localeCompare(a.timestamp) || a.id.localeCompare(b.id));
+
+      // 3. Rebuild `dailyCurve` to plot the multi-period trajectory across the selected horizon
+      dailyCurve.length = 0;
+      if (horizonMonths <= 12) {
+        // For 3M / 6M / 12M: plot 3 intra-month checkpoints per month (01 Early Bills, 15 Mid-Month Bills & Expenses, 27 Salary Arrival)
+        const rawPoints: Array<{
+          date: string;
+          label?: string;
+          deltaMinor: number;
+          events: (typeof dailyCurve)[number]['events'];
+        }> = [];
+
+        for (const mKey of periodMonths) {
+          const isCurrentMo = mKey === ym;
+          const mLedger = timelineLedger.filter((e) => e.date.slice(0, 7) === mKey);
+
+          // Checkpoint 1: Early-month (Days 1..10)
+          const earlyEvents: (typeof dailyCurve)[number]['events'] = [];
+          let earlyDelta = 0;
+          for (const e of mLedger.filter((x) => x.day <= 10)) {
+            if (e.flowDirection === 'inflow') {
+              earlyDelta += e.displayAmountMinor;
+              earlyEvents.push({ id: e.id, kind: 'income', title: e.title, timestamp: e.timestamp, displayMinor: e.displayAmountMinor });
+            } else {
+              earlyDelta -= e.displayAmountMinor;
+              earlyEvents.push({ id: e.id, kind: e.kind, title: e.title, timestamp: e.timestamp, displayMinor: e.displayAmountMinor });
+            }
+          }
+          if (isCurrentMo) {
+            for (const ob of enrichedObligations.filter((o) => !o.isPaidThisMonth && (o.dueDay || 1) <= 10)) {
+              const amt = ob.metrics.isDueThisMonth ? ob.dueDisplayMinor : ob.preserveDisplayMinor;
+              if (amt > 0) {
+                earlyDelta -= amt;
+                earlyEvents.push({ id: ob.id, kind: 'unpaid_bill', title: ob.name, displayMinor: amt });
+              }
+            }
+          }
+          rawPoints.push({
+            date: `${mKey}-01`,
+            label: `${mKey.slice(5)}/${mKey.slice(2, 4)}`,
+            deltaMinor: earlyDelta,
+            events: earlyEvents,
+          });
+
+          // Checkpoint 2: Mid-month bills & shop expenses (Days 11..25)
+          const midEvents: (typeof dailyCurve)[number]['events'] = [];
+          let midDelta = 0;
+          for (const e of mLedger.filter((x) => x.day >= 11 && x.day <= 25)) {
+            if (e.flowDirection === 'inflow') {
+              midDelta += e.displayAmountMinor;
+              midEvents.push({ id: e.id, kind: 'income', title: e.title, timestamp: e.timestamp, displayMinor: e.displayAmountMinor });
+            } else {
+              midDelta -= e.displayAmountMinor;
+              midEvents.push({ id: e.id, kind: e.kind, title: e.title, timestamp: e.timestamp, displayMinor: e.displayAmountMinor });
+            }
+          }
+          if (isCurrentMo) {
+            for (const ob of enrichedObligations.filter((o) => !o.isPaidThisMonth && (o.dueDay || 1) >= 11 && (o.dueDay || 1) <= 25)) {
+              const amt = ob.metrics.isDueThisMonth ? ob.dueDisplayMinor : ob.preserveDisplayMinor;
+              if (amt > 0) {
+                midDelta -= amt;
+                midEvents.push({ id: ob.id, kind: 'unpaid_bill', title: ob.name, displayMinor: amt });
+              }
+            }
+          }
+          rawPoints.push({
+            date: `${mKey}-15`,
+            deltaMinor: midDelta,
+            events: midEvents,
+          });
+
+          // Checkpoint 3: Payday & Month-End (Days 26..31)
+          const lateEvents: (typeof dailyCurve)[number]['events'] = [];
+          let lateDelta = 0;
+          for (const inc of incomes) {
+            const incMinor = computeMonthlyIncomeMinor(inc, mKey, cur, rateMap);
+            if (incMinor > 0) {
+              lateDelta += incMinor;
+              lateEvents.push({
+                id: `inc-${inc.id}-${mKey}`,
+                kind: 'income',
+                title: isCurrentMo && !activeIncomes.find((a) => a.id === inc.id)?.isReceivedThisMonth
+                  ? `${inc.name} (expected)`
+                  : `${inc.name} ✓`,
+                timestamp: `${mKey}-${String(Math.min(28, Math.max(1, inc.paydayDay))).padStart(2, '0')}`,
+                displayMinor: incMinor,
+              });
+            }
+          }
+          for (const e of mLedger.filter((x) => x.day >= 26)) {
+            if (e.flowDirection === 'inflow') {
+              lateDelta += e.displayAmountMinor;
+              lateEvents.push({ id: e.id, kind: 'income', title: e.title, timestamp: e.timestamp, displayMinor: e.displayAmountMinor });
+            } else {
+              lateDelta -= e.displayAmountMinor;
+              lateEvents.push({ id: e.id, kind: e.kind, title: e.title, timestamp: e.timestamp, displayMinor: e.displayAmountMinor });
+            }
+          }
+          rawPoints.push({
+            date: `${mKey}-27`,
+            deltaMinor: lateDelta,
+            events: lateEvents,
+          });
+        }
+
+        // Compute running balance anchored so the final point equals projectedEndBalanceMinor
+        const totalDelta = rawPoints.reduce((s, p) => s + p.deltaMinor, 0);
+        let bal = projectedEndBalanceMinor - totalDelta;
+        rawPoints.forEach((pt, idx) => {
+          bal += pt.deltaMinor;
+          dailyCurve.push({
+            day: idx + 1,
+            date: pt.date,
+            balanceMinor: bal,
+            label: pt.label,
+            events: pt.events,
+          });
+        });
+      } else {
+        // For 5Y (60M) and 10Y (120M): plot quarterly / annual trajectory buckets with summarized events
+        const totalSaved = horizonBuckets.reduce((s, b) => s + b.savedMinor, 0);
+        let bal = Math.max(0, projectedEndBalanceMinor - totalSaved);
+        horizonBuckets.forEach((b, idx) => {
+          bal += b.savedMinor;
+          const bEvents: (typeof dailyCurve)[number]['events'] = [];
+          if (b.incomeMinor > 0) {
+            bEvents.push({
+              id: `b-inc-${b.key}`,
+              kind: 'income',
+              title: `Salary & Income (${b.label})`,
+              displayMinor: b.incomeMinor,
+            });
+          }
+          if (b.spendMinor > 0) {
+            bEvents.push({
+              id: `b-spd-${b.key}`,
+              kind: 'paid_bill',
+              title: `Bills & Living Spend (${b.label})`,
+              displayMinor: b.spendMinor,
+            });
+          }
+          dailyCurve.push({
+            day: idx + 1,
+            date: b.subLabel,
+            balanceMinor: bal,
+            label: b.label,
+            events: bEvents,
+          });
+        });
+      }
+    }
+
     return {
       yearMonth: ym,
       scope,

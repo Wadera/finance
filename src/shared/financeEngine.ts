@@ -102,7 +102,7 @@ export function computeObligationMonthMetrics(
   }
 
   // Standard monthly cadence
-  if (ob.cadence === 'monthly' && monthsDiff <= 0) {
+  if (ob.cadence === 'monthly') {
     return {
       obligationId: ob.id,
       isDueThisMonth: true,

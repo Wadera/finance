@@ -1071,6 +1071,11 @@ export const DailyRunwayChart: React.FC<{
   const areaPoints = `${toX(0).toFixed(1)},${zeroY.toFixed(1)} ${linePoints} ${toX(curve.length - 1).toFixed(1)},${zeroY.toFixed(1)}`;
   const startRef = Math.max(1, Math.abs(curve[0]?.balanceMinor || maxV));
 
+  const firstDateStr = curve[0]?.date || '';
+  const lastDateStr = curve[curve.length - 1]?.date || '';
+  const isMultiPeriod =
+    curve.length > 1 && firstDateStr.slice(0, 7) !== lastDateStr.slice(0, 7);
+
   const inspectedPoint =
     curve.find((pt) => pt.day === activeDay) ||
     curve.filter((pt) => (pt.events?.length || 0) > 0).slice(-1)[0] ||
@@ -1171,26 +1176,28 @@ export const DailyRunwayChart: React.FC<{
                   fill={hasPaid && hasExpense ? '#059669' : '#334155'}
                 />
               )}
-              <text
-                x={cx}
-                y={height - 5}
-                textAnchor="middle"
-                className="fill-slate-400 text-[9px] font-mono-num"
-              >
-                {pt.day}.
-              </text>
+              {(!isMultiPeriod || pt.label) && (
+                <text
+                  x={cx}
+                  y={height - 5}
+                  textAnchor="middle"
+                  className="fill-slate-400 text-[9px] font-mono-num"
+                >
+                  {isMultiPeriod ? pt.label : `${pt.day}.`}
+                </text>
+              )}
             </g>
           );
         })}
 
         <text x={padX} y={13} className="fill-slate-500 text-[10px] font-mono-num">
-          {t.day1}:{' '}
+          {isMultiPeriod ? firstDateStr.split(' ')[0] : t.day1}:{' '}
           {privacyMode
             ? '100%'
             : formatDisplayValue(curve[0].balanceMinor, { currency, privacyMode: false, compact: true })}
         </text>
         <text x={width - padX} y={13} textAnchor="end" className="fill-slate-600 text-[10px] font-mono-num">
-          {t.endOfMonth}:{' '}
+          {isMultiPeriod ? lastDateStr.split(' ').slice(-1)[0] : t.endOfMonth}:{' '}
           {formatDisplayValue(curve[curve.length - 1].balanceMinor, {
             currency,
             privacyMode,

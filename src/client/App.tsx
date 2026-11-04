@@ -628,16 +628,16 @@ export const App: React.FC = () => {
     <div className="min-h-screen flex flex-col bg-[#FAF9F6] text-slate-800">
       {/* Editorial Top Bar */}
       <header className="sticky top-0 z-20 bg-[#FAF9F6]/95 backdrop-blur border-b border-slate-200">
-        <div className="max-w-6xl mx-auto px-4 sm:px-6 h-14 flex items-center justify-between gap-2">
-          <div className="flex items-center gap-4">
-            <div className="flex items-center gap-2">
-              <span className="w-2.5 h-2.5 rounded-xs bg-teal-700" />
-              <span className="font-mono-num text-sm font-semibold tracking-tight text-slate-900">
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 h-14 flex items-center justify-between gap-2 overflow-x-auto no-scrollbar">
+          <div className="flex items-center gap-3 shrink-0">
+            <div className="flex items-center gap-2 whitespace-nowrap shrink-0">
+              <span className="w-2.5 h-2.5 rounded-xs bg-teal-700 shrink-0" />
+              <span className="font-mono-num text-sm font-semibold tracking-tight text-slate-900 whitespace-nowrap">
                 {t.loginBadge}
               </span>
             </div>
 
-            <nav className="hidden md:flex items-center gap-1">
+            <nav className="hidden md:flex items-center gap-0.5 shrink-0">
               {(
                 [
                   ['overview', t.tabOverview],
@@ -651,7 +651,7 @@ export const App: React.FC = () => {
                   key={k}
                   type="button"
                   onClick={() => setTab(k)}
-                  className={`px-3 py-1.5 rounded-md text-xs font-medium transition ${
+                  className={`px-2.5 py-1.5 rounded-md text-xs font-medium whitespace-nowrap transition ${
                     tab === k
                       ? 'bg-slate-900 text-white'
                       : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/50'
@@ -663,11 +663,11 @@ export const App: React.FC = () => {
             </nav>
           </div>
 
-          <div className="flex items-center gap-1.5 sm:gap-2">
+          <div className="flex items-center gap-1.5 shrink-0">
             {/* Month switcher + Multi-Period Zoom (1M / 3M / 6M / 12M / 5Y / 10Y) */}
             {tab !== 'wealth' && tab !== 'settings' && (
-              <>
-                <div className="inline-flex items-center border border-slate-200 bg-white rounded-md text-xs font-mono-num">
+              <div className="inline-flex items-center border border-slate-200 bg-white rounded-md text-xs font-mono-num whitespace-nowrap shrink-0 divide-x divide-slate-200">
+                <div className="inline-flex items-center">
                   <button
                     type="button"
                     onClick={() => setYearMonth((ym) => shiftMonth(ym, -1))}
@@ -676,7 +676,7 @@ export const App: React.FC = () => {
                   >
                     <ChevronLeft className="w-3.5 h-3.5" />
                   </button>
-                  <span className="px-1.5 font-medium text-slate-800">{yearMonth}</span>
+                  <span className="px-1.5 font-medium text-slate-800 whitespace-nowrap">{yearMonth}</span>
                   <button
                     type="button"
                     onClick={() => setYearMonth((ym) => shiftMonth(ym, 1))}
@@ -688,7 +688,7 @@ export const App: React.FC = () => {
                 </div>
 
                 <div
-                  className="hidden sm:inline-flex items-center border border-slate-200 bg-white rounded-md p-0.5 text-[11px] font-mono-num"
+                  className="hidden sm:inline-flex items-center p-0.5 text-[11px] font-mono-num whitespace-nowrap"
                   title={t.zoomLabel}
                 >
                   {(
@@ -705,7 +705,7 @@ export const App: React.FC = () => {
                       key={hVal}
                       type="button"
                       onClick={() => setBudgetHorizon(hVal)}
-                      className={`px-1.5 py-0.5 rounded transition ${
+                      className={`px-1.5 py-0.5 rounded whitespace-nowrap transition ${
                         budgetHorizon === hVal
                           ? 'bg-teal-700 text-white font-semibold'
                           : 'text-slate-600 hover:text-slate-900'
@@ -715,7 +715,7 @@ export const App: React.FC = () => {
                     </button>
                   ))}
                 </div>
-              </>
+              </div>
             )}
 
             {/* Multi-Workspace Switcher (Personal, Household, Company A, Company B, + New Workspace) */}
@@ -731,7 +731,7 @@ export const App: React.FC = () => {
                   setScope(val);
                   setSelectedPotId(null);
                 }}
-                className="border border-slate-200 bg-white rounded-md px-2 py-1.5 text-xs font-medium text-slate-700 max-w-[165px] truncate"
+                className="border border-slate-200 bg-white rounded-md px-2 py-1.5 text-xs font-medium text-slate-700 w-[136px] sm:w-[148px] truncate shrink-0"
               >
                 <option value="all">{t.allWorkspaces}</option>
                 {readableWorkspaces.map((ws) => (
@@ -749,9 +749,9 @@ export const App: React.FC = () => {
               type="button"
               onClick={() => void switchLocale(locale === 'en' ? 'pl' : 'en')}
               title="Switch Language (English / Polski)"
-              className="inline-flex items-center gap-1 px-2 py-1.5 rounded-md border border-slate-200 bg-white text-slate-700 hover:border-slate-300 text-xs font-mono-num uppercase"
+              className="inline-flex items-center gap-1 px-2 py-1.5 rounded-md border border-slate-200 bg-white text-slate-700 hover:border-slate-300 text-xs font-mono-num uppercase whitespace-nowrap shrink-0"
             >
-              <Globe className="w-3.5 h-3.5 text-teal-700" />
+              <Globe className="w-3.5 h-3.5 text-teal-700 shrink-0" />
               <span>{locale}</span>
             </button>
 
@@ -760,13 +760,13 @@ export const App: React.FC = () => {
               type="button"
               onClick={togglePrivacy}
               title="Toggle Friends %-Only Privacy View (Shortcut: P)"
-              className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md border text-xs font-mono-num transition ${
+              className={`inline-flex items-center gap-1.5 px-2 py-1.5 rounded-md border text-xs font-mono-num whitespace-nowrap shrink-0 transition ${
                 privacyMode
                   ? 'border-teal-700 bg-teal-700 text-white'
                   : 'border-slate-200 bg-white text-slate-700 hover:border-slate-300'
               }`}
             >
-              {privacyMode ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+              {privacyMode ? <EyeOff className="w-3.5 h-3.5 shrink-0" /> : <Eye className="w-3.5 h-3.5 shrink-0" />}
               <span>{privacyMode ? t.pctOnly : cur}</span>
             </button>
 
@@ -781,7 +781,7 @@ export const App: React.FC = () => {
                   });
                   await reloadAll();
                 }}
-                className="border border-slate-200 bg-white rounded-md px-2 py-1 text-xs font-medium text-slate-700"
+                className="border border-slate-200 bg-white rounded-md px-2 py-1 text-xs font-medium text-slate-700 shrink-0"
               >
                 {auth.devUsers.map((u) => (
                   <option key={u.handle} value={u.handle}>
@@ -790,8 +790,8 @@ export const App: React.FC = () => {
                 ))}
               </select>
             ) : (
-              <div className="inline-flex items-center gap-1 pl-1 text-xs text-slate-600">
-                <span className="font-medium text-slate-800 hidden sm:inline">{boot.user.displayName}</span>
+              <div className="inline-flex items-center gap-1 pl-0.5 text-xs text-slate-600 whitespace-nowrap shrink-0">
+                <span className="font-medium text-slate-800 hidden lg:inline">{boot.user.displayName}</span>
                 <button
                   type="button"
                   title={t.signOut}
@@ -1310,7 +1310,11 @@ export const App: React.FC = () => {
                     )}
                     <div>
                       <div className="text-xs font-mono-num uppercase tracking-wider text-slate-700 font-semibold group-hover:text-teal-800">
-                        {t.ledgerFoldedTitle(budget.timelineLedger.length)} ·{' '}
+                        {t.ledgerFoldedTitle(budget.timelineLedger.length)}
+                        {budgetHorizon > 1 && budget.horizonSummary
+                          ? ` (${budget.horizonSummary.startYearMonth} → ${budget.horizonSummary.endYearMonth})`
+                          : ` (${yearMonth})`}{' '}
+                        ·{' '}
                         <span className="text-slate-900">
                           {fmt(budget.timelineLedger.reduce((s, e) => s + e.displayAmountMinor, 0))}
                         </span>
@@ -1331,12 +1335,12 @@ export const App: React.FC = () => {
                 </div>
 
                 {ledgerOpen && (
-                  <div className="mt-3 border border-slate-200 rounded-lg overflow-x-auto bg-white">
+                  <div className="mt-3 border border-slate-200 rounded-lg overflow-x-auto max-h-[460px] overflow-y-auto bg-white">
                     {budget.timelineLedger.length === 0 ? (
                       <div className="p-4 text-xs text-slate-400 font-mono-num text-center">{t.emptyLedgerMsg}</div>
                     ) : (
                       <table className="w-full text-left border-collapse text-xs">
-                        <thead>
+                        <thead className="sticky top-0 z-10">
                           <tr className="border-b border-slate-200 bg-[#FAF9F6] text-[10px] font-mono-num uppercase text-slate-500">
                             <th className="py-2 px-3">{t.colDateTime}</th>
                             <th className="py-2 px-3">{t.colItemMerchant}</th>
