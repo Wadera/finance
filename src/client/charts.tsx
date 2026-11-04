@@ -1,6 +1,6 @@
-import { ChevronDown, ChevronRight, Plus } from 'lucide-react';
+import { ChevronDown, ChevronRight, Pencil, Plus } from 'lucide-react';
 import { sankey, sankeyLeft, sankeyLinkHorizontal } from 'd3-sankey';
-import React, { useMemo } from 'react';
+import React, { useMemo, useState } from 'react';
 import { formatDisplayValue, formatIndexedWealth } from '../shared/currency.js';
 import { buildPotBreadcrumbs } from '../shared/financeEngine.js';
 import type {
@@ -11,6 +11,7 @@ import type {
 } from '../shared/types.js';
 import type {
   CashflowBridgeData,
+  DailyCurvePoint,
   EnrichedExpense,
   EnrichedIncome,
   EnrichedObligation,
@@ -72,7 +73,7 @@ export const CashflowSankeyChart: React.FC<{
   onTogglePot: (potId: string) => void;
   onToggleExpense: (expId: string) => void;
   onQuickAdd: (target: QuickAddTarget) => void;
-  onInspectItem?: (kind: 'obligation' | 'expense', id: string) => void;
+  onInspectItem?: (kind: 'pot' | 'obligation' | 'expense', id: string) => void;
   t: TranslationDict;
 }> = ({
   incomes,
@@ -697,6 +698,26 @@ export const CashflowSankeyChart: React.FC<{
                     <span className="truncate">{node.name}</span>
                   </button>
 
+                  {canAddInside && onInspectItem && (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (node.nodeKind === 'pot' && node.potRef) {
+                          onInspectItem('pot', node.potRef.pot.id);
+                        } else if (node.nodeKind === 'obligation' && node.obRef) {
+                          onInspectItem('obligation', node.obRef.id);
+                        } else if (node.nodeKind === 'expense' && node.expRef) {
+                          onInspectItem('expense', node.expRef.id);
+                        }
+                      }}
+                      title={t.editBtn}
+                      className="shrink-0 inline-flex items-center justify-center w-4 h-4 rounded border border-slate-300/80 bg-white/90 text-slate-500 opacity-75 group-hover:opacity-100 hover:bg-slate-900 hover:text-white hover:border-slate-900 transition"
+                    >
+                      <Pencil className="w-2.5 h-2.5" />
+                    </button>
+                  )}
+
                   {canAddInside && (
                     <button
                       type="button"
@@ -770,18 +791,21 @@ export const SixMonthTrendChart: React.FC<{
 
 /**
  * 3. Account Sufficiency Daily Runway Curve (Timeline Tab)
+ * Plots ALL logged expenses, completed checklist items (with timestamps), scheduled bills, and salary arrivals.
  */
 export const DailyRunwayChart: React.FC<{
-  curve: Array<{ day: number; balanceMinor: number; label?: string }>;
+  curve: DailyCurvePoint[];
   currency: CurrencyCode;
   privacyMode: boolean;
   t: TranslationDict;
-}> = ({ curve, currency, privacyMode, t }) => {
+  onSelectDay?: (day: number) => void;
+}> = ({ curve, currency, privacyMode, t, onSelectDay }) => {
+  const [activeDay, setActiveDay] = useState<number | null>(null);
   if (!curve.length) return null;
   const width = 760;
-  const height = 150;
+  const height = 168;
   const padX = 28;
-  const padY = 18;
+  const padY = 22;
 
   const vals = curve.map((c) => c.balanceMinor);
   const minV = Math.min(0, ...vals);
@@ -796,42 +820,191 @@ export const DailyRunwayChart: React.FC<{
   const areaPoints = `${toX(0).toFixed(1)},${zeroY.toFixed(1)} ${linePoints} ${toX(curve.length - 1).toFixed(1)},${zeroY.toFixed(1)}`;
   const startRef = Math.max(1, Math.abs(curve[0]?.balanceMinor || maxV));
 
+  const inspectedPoint =
+    curve.find((pt) => pt.day === activeDay) ||
+    curve.filter((pt) => (pt.events?.length || 0) > 0).slice(-1)[0] ||
+    null;
+
   return (
-    <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-auto">
-      <line
-        x1={padX}
-        x2={width - padX}
-        y1={zeroY}
-        y2={zeroY}
-        stroke="#EF4444"
-        strokeDasharray="4 4"
-        strokeOpacity={0.45}
-      />
-      <polygon points={areaPoints} fill="#0F766E" fillOpacity={0.1} />
-      <polyline fill="none" stroke="#0F766E" strokeWidth={2} points={linePoints} />
-      {curve.map((pt, idx) =>
-        pt.label ? (
-          <g key={pt.day}>
-            <circle cx={toX(idx)} cy={toY(pt.balanceMinor)} r={3.5} fill="#0F766E" />
-          </g>
-        ) : null
-      )}
-      <text x={padX} y={12} className="fill-slate-500 text-[10px] font-mono-num">
-        {t.day1}:{' '}
-        {privacyMode
-          ? '100%'
-          : formatDisplayValue(curve[0].balanceMinor, { currency, privacyMode: false, compact: true })}
-      </text>
-      <text x={width - padX} y={12} textAnchor="end" className="fill-slate-600 text-[10px] font-mono-num">
-        {t.endOfMonth}:{' '}
-        {formatDisplayValue(curve[curve.length - 1].balanceMinor, {
-          currency,
-          privacyMode,
-          referenceTotalMinor: startRef,
-          compact: true,
+    <div className="space-y-2">
+      {/* Event Marker Legend */}
+      <div className="flex flex-wrap items-center gap-3 text-[11px] font-mono-num text-slate-500">
+        <span className="inline-flex items-center gap-1.5">
+          <span className="w-2.5 h-2.5 rounded-full bg-rose-600 inline-block" />
+          {t.timelineLegendExpense}
+        </span>
+        <span className="inline-flex items-center gap-1.5">
+          <span className="w-2.5 h-2.5 rounded-full bg-emerald-600 inline-block" />
+          {t.timelineLegendPaidBill}
+        </span>
+        <span className="inline-flex items-center gap-1.5">
+          <span className="w-2.5 h-2.5 rounded-full border-2 border-amber-500 bg-white inline-block" />
+          {t.timelineLegendUnpaid}
+        </span>
+        <span className="inline-flex items-center gap-1.5">
+          <span className="w-2.5 h-2.5 rounded-full bg-teal-700 inline-block" />
+          {t.timelineLegendIncome}
+        </span>
+      </div>
+
+      <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-auto select-none">
+        <line
+          x1={padX}
+          x2={width - padX}
+          y1={zeroY}
+          y2={zeroY}
+          stroke="#EF4444"
+          strokeDasharray="4 4"
+          strokeOpacity={0.45}
+        />
+        <polygon points={areaPoints} fill="#0F766E" fillOpacity={0.1} />
+        <polyline fill="none" stroke="#0F766E" strokeWidth={2} points={linePoints} />
+
+        {curve.map((pt, idx) => {
+          const evs = pt.events ?? [];
+          if (!evs.length && !pt.label) return null;
+          const cx = toX(idx);
+          const cy = toY(pt.balanceMinor);
+          const hasExpense = evs.some((e) => e.kind === 'expense');
+          const hasPaid = evs.some((e) => e.kind === 'paid_bill' || e.kind === 'sinking_set_aside');
+          const hasIncome = evs.some((e) => e.kind === 'income');
+          const hasUnpaid = evs.some((e) => e.kind === 'unpaid_bill');
+
+          let fill = '#0F766E';
+          let stroke = '#FFFFFF';
+          if (hasExpense) {
+            fill = '#E11D48';
+          } else if (hasPaid) {
+            fill = '#059669';
+          } else if (hasIncome) {
+            fill = '#0F766E';
+          } else if (hasUnpaid) {
+            fill = '#FFFFFF';
+            stroke = '#D97706';
+          }
+
+          const isSelected = inspectedPoint?.day === pt.day;
+
+          return (
+            <g
+              key={pt.day}
+              className="cursor-pointer"
+              onMouseEnter={() => setActiveDay(pt.day)}
+              onClick={() => {
+                setActiveDay(pt.day);
+                onSelectDay?.(pt.day);
+              }}
+            >
+              <line
+                x1={cx}
+                x2={cx}
+                y1={cy}
+                y2={height - padY}
+                stroke={hasExpense ? '#E11D48' : hasPaid ? '#059669' : '#94A3B8'}
+                strokeDasharray="2 2"
+                strokeOpacity={isSelected ? 0.65 : 0.25}
+              />
+              <circle
+                cx={cx}
+                cy={cy}
+                r={isSelected ? 5.5 : 4.2}
+                fill={fill}
+                stroke={stroke}
+                strokeWidth={2}
+              />
+              {evs.length > 1 && (
+                <circle
+                  cx={cx + 4}
+                  cy={cy - 4}
+                  r={2.5}
+                  fill={hasPaid && hasExpense ? '#059669' : '#334155'}
+                />
+              )}
+              <text
+                x={cx}
+                y={height - 5}
+                textAnchor="middle"
+                className="fill-slate-400 text-[9px] font-mono-num"
+              >
+                {pt.day}.
+              </text>
+            </g>
+          );
         })}
-      </text>
-    </svg>
+
+        <text x={padX} y={13} className="fill-slate-500 text-[10px] font-mono-num">
+          {t.day1}:{' '}
+          {privacyMode
+            ? '100%'
+            : formatDisplayValue(curve[0].balanceMinor, { currency, privacyMode: false, compact: true })}
+        </text>
+        <text x={width - padX} y={13} textAnchor="end" className="fill-slate-600 text-[10px] font-mono-num">
+          {t.endOfMonth}:{' '}
+          {formatDisplayValue(curve[curve.length - 1].balanceMinor, {
+            currency,
+            privacyMode,
+            referenceTotalMinor: startRef,
+            compact: true,
+          })}
+        </text>
+      </svg>
+
+      {/* Interactive Day Callout Pill showing plotted Expenses & Completed Checklist Items on hovered/selected day */}
+      {inspectedPoint && (inspectedPoint.events?.length || 0) > 0 && (
+        <div className="px-3 py-2 rounded-md bg-[#FAF9F6] border border-slate-200 flex flex-wrap items-center justify-between gap-2 text-xs font-mono-num">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="font-semibold text-slate-800">
+              {inspectedPoint.date || `Day ${inspectedPoint.day}`}:
+            </span>
+            {inspectedPoint.events!.map((ev) => {
+              const badgeCls =
+                ev.kind === 'expense'
+                  ? 'bg-rose-50 text-rose-800 border-rose-200'
+                  : ev.kind === 'paid_bill' || ev.kind === 'sinking_set_aside'
+                  ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                  : ev.kind === 'income'
+                  ? 'bg-teal-50 text-teal-800 border-teal-200'
+                  : 'bg-amber-50 text-amber-800 border-amber-200';
+              const timeStr =
+                ev.timestamp && ev.timestamp.length >= 16 && ev.timestamp.includes('T')
+                  ? ` ${ev.timestamp.slice(11, 16)}`
+                  : '';
+              return (
+                <span
+                  key={ev.id}
+                  className={`inline-flex items-center gap-1 px-2 py-0.5 rounded border text-[11px] ${badgeCls}`}
+                >
+                  <span>
+                    {ev.title}
+                    {timeStr}
+                  </span>
+                  <span className="font-semibold">
+                    {ev.kind === 'income' ? '+' : '-'}
+                    {formatDisplayValue(ev.displayMinor, {
+                      currency,
+                      privacyMode,
+                      referenceTotalMinor: startRef,
+                      compact: true,
+                    })}
+                  </span>
+                </span>
+              );
+            })}
+          </div>
+          <span className="text-slate-500 text-[11px]">
+            Bal:{' '}
+            <strong className="text-slate-800">
+              {formatDisplayValue(inspectedPoint.balanceMinor, {
+                currency,
+                privacyMode,
+                referenceTotalMinor: startRef,
+                compact: true,
+              })}
+            </strong>
+          </span>
+        </div>
+      )}
+    </div>
   );
 };
 

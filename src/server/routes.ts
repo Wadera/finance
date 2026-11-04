@@ -147,14 +147,26 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       const userShareBp = user.handle === 'wadera' ? waderaBp : 10000 - waderaBp;
 
       const dueDisplayMinor = convertMinor(metrics.dueThisMonthNativeMinor, ob.currency, cur, rateMap);
-      const preserveDisplayMinor = convertMinor(metrics.monthlyPreserveNativeMinor, ob.currency, cur, rateMap);
-      const effectiveDisplayMinor = convertMinor(metrics.effectiveMonthlyBurdenNativeMinor, ob.currency, cur, rateMap);
+      const effectivePreserveNativeMinor =
+        !metrics.isDueThisMonth && isPaidThisMonth && occ?.actualPaidMinor != null
+          ? occ.actualPaidMinor
+          : metrics.monthlyPreserveNativeMinor;
+      const effectiveBurdenNativeMinor =
+        !metrics.isDueThisMonth && isPaidThisMonth && occ?.actualPaidMinor != null
+          ? occ.actualPaidMinor
+          : metrics.effectiveMonthlyBurdenNativeMinor;
+      const preserveDisplayMinor = convertMinor(effectivePreserveNativeMinor, ob.currency, cur, rateMap);
+      const effectiveDisplayMinor = convertMinor(effectiveBurdenNativeMinor, ob.currency, cur, rateMap);
       const targetDisplayMinor = convertMinor(ob.amountMinor, ob.currency, cur, rateMap);
       const preservedDisplayMinor = convertMinor(ob.preservedMinor, ob.currency, cur, rateMap);
 
       return {
         ...ob,
-        metrics,
+        metrics: {
+          ...metrics,
+          monthlyPreserveNativeMinor: effectivePreserveNativeMinor,
+          effectiveMonthlyBurdenNativeMinor: effectiveBurdenNativeMinor,
+        },
         occurrence: occ,
         isPaidThisMonth,
         userShareBp,
@@ -328,11 +340,15 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       return s + sumEnv(n);
     }, 0);
 
+    const unpaidPreserveSliceMinor = enrichedObligations
+      .filter((o) => !o.metrics.isDueThisMonth && !o.isPaidThisMonth && o.preserveDisplayMinor > 0)
+      .reduce((s, o) => s + o.preserveDisplayMinor, 0);
+
     const totalNeededBeforePaydayMinor = unpaidPrePaydayBillsMinor + unallocatedEnvelopeRemainingMinor;
     const prePaydayBufferMinor = runwayCashMinor - totalNeededBeforePaydayMinor;
 
     const totalNeededTillMonthEndMinor =
-      unpaidBillsMinor + totalPreserveSliceMinor + unallocatedEnvelopeRemainingMinor;
+      unpaidBillsMinor + unpaidPreserveSliceMinor + unallocatedEnvelopeRemainingMinor;
     // Available now without relying on unticked salary:
     const currentCashAfterMonthBillsMinor = runwayCashMinor - totalNeededTillMonthEndMinor;
     // Projected after unticked payday arrives (before reserving next month's pre-salary bills):
@@ -343,31 +359,189 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       projectedEndBalanceMinor - nextMonthPreSalaryMinor;
     const shortfallMinor = Math.max(0, -prePaydayBufferMinor);
 
-    // Daily Runway Curve (days 1..daysInMonth)
-    const dailyCurve: Array<{ day: number; balanceMinor: number; label?: string }> = [];
-    let runningBal = runwayCashMinor;
+    // Unified Chronological Ledger of all Month Expenses + Completed Checklist Payments (with Timestamps)
+    const potById = new Map(pots.map((p) => [p.id, p]));
+    const timelineLedger: Array<{
+      id: string;
+      kind: 'expense' | 'paid_bill' | 'sinking_set_aside';
+      entityType: 'expense' | 'obligation';
+      entityId: string;
+      occurrenceId?: string;
+      workspaceId: string;
+      potId: string | null;
+      potName: string | null;
+      potColor: string;
+      title: string;
+      subtitle: string;
+      date: string;
+      timestamp: string;
+      day: number;
+      amountMinor: number;
+      currency: CurrencyCode;
+      displayAmountMinor: number;
+    }> = [];
+
+    for (const exp of expenses) {
+      const timePart =
+        exp.createdAt && exp.createdAt.length >= 16 && /^\d{2}:\d{2}/.test(exp.createdAt.slice(11, 16))
+          ? exp.createdAt.slice(11, 16)
+          : '12:00';
+      const timestamp = `${exp.spentDate}T${timePart}:00Z`;
+      const day = Math.min(daysInMonth, Math.max(1, Number(exp.spentDate.slice(8, 10)) || 1));
+      const pot = exp.potId ? potById.get(exp.potId) : undefined;
+      timelineLedger.push({
+        id: `led-exp-${exp.id}`,
+        kind: 'expense',
+        entityType: 'expense',
+        entityId: exp.id,
+        workspaceId: exp.workspaceId,
+        potId: exp.potId,
+        potName: pot?.name ?? null,
+        potColor: pot?.color ?? '#E11D48',
+        title: exp.merchant,
+        subtitle: exp.description || '',
+        date: exp.spentDate,
+        timestamp,
+        day,
+        amountMinor: exp.amountMinor,
+        currency: exp.currency,
+        displayAmountMinor: exp.displayAmountMinor,
+      });
+    }
+
+    for (const ob of enrichedObligations) {
+      if (!ob.isPaidThisMonth || !ob.occurrence) continue;
+      const occ = ob.occurrence;
+      const fallbackDate = `${ym}-${String(Math.min(daysInMonth, Math.max(1, ob.dueDay || 1))).padStart(2, '0')}`;
+      const eventDate =
+        occ.paidAt && occ.paidAt.slice(0, 7) === ym
+          ? occ.paidAt.slice(0, 10)
+          : occ.dueDate && occ.dueDate.slice(0, 7) === ym
+          ? occ.dueDate.slice(0, 10)
+          : fallbackDate;
+      const timePart =
+        occ.paidAt && occ.paidAt.length >= 16 && /^\d{2}:\d{2}/.test(occ.paidAt.slice(11, 16))
+          ? occ.paidAt.slice(11, 16)
+          : '09:00';
+      const timestamp = `${eventDate}T${timePart}:00Z`;
+      const day = Math.min(daysInMonth, Math.max(1, Number(eventDate.slice(8, 10)) || ob.dueDay || 1));
+      const actualNativeMinor =
+        occ.actualPaidMinor ??
+        (ob.metrics.isDueThisMonth ? ob.amountMinor : ob.metrics.monthlyPreserveNativeMinor || ob.amountMinor);
+      const displayAmountMinor = convertMinor(actualNativeMinor, ob.currency, cur, rateMap);
+      const pot = ob.potId ? potById.get(ob.potId) : undefined;
+      timelineLedger.push({
+        id: `led-occ-${occ.id}`,
+        kind: ob.metrics.isDueThisMonth ? 'paid_bill' : 'sinking_set_aside',
+        entityType: 'obligation',
+        entityId: ob.id,
+        occurrenceId: occ.id,
+        workspaceId: ob.workspaceId,
+        potId: ob.potId,
+        potName: pot?.name ?? null,
+        potColor: pot?.color ?? '#059669',
+        title: ob.name,
+        subtitle: ob.metrics.isDueThisMonth ? ob.cadence : `Preserve (${ob.nextDueDate})`,
+        date: eventDate,
+        timestamp,
+        day,
+        amountMinor: actualNativeMinor,
+        currency: ob.currency,
+        displayAmountMinor,
+      });
+    }
+
+    timelineLedger.sort((a, b) => b.timestamp.localeCompare(a.timestamp) || a.id.localeCompare(b.id));
+
+    // Daily Runway Curve (days 1..daysInMonth) plotting ALL expenses, completed checklist items, upcoming bills & salary
+    const completedOutflowsThisMonthMinor = timelineLedger.reduce((s, e) => s + e.displayAmountMinor, 0);
+    const receivedIncomesThisMonthMinor = activeIncomes
+      .filter((i) => i.isReceivedThisMonth)
+      .reduce((s, i) => s + i.monthlyDisplayMinor, 0);
+    const startOfMonthCashMinor =
+      runwayCashMinor + completedOutflowsThisMonthMinor - receivedIncomesThisMonthMinor;
+
+    const dailyCurve: Array<{
+      day: number;
+      date: string;
+      balanceMinor: number;
+      label?: string;
+      events: Array<{
+        id: string;
+        kind: 'expense' | 'paid_bill' | 'sinking_set_aside' | 'unpaid_bill' | 'income';
+        title: string;
+        timestamp?: string;
+        displayMinor: number;
+      }>;
+    }> = [];
+
+    let runningBal = startOfMonthCashMinor;
     for (let d = 1; d <= daysInMonth; d++) {
-      const labels: string[] = [];
+      const dateStr = `${ym}-${String(d).padStart(2, '0')}`;
+      const dayEvents: (typeof dailyCurve)[number]['events'] = [];
+
+      // 1. Income arrivals (received or expected on paydayDay)
       for (const inc of activeIncomes) {
-        if (!inc.isReceivedThisMonth && inc.paydayDay === d) {
+        const incDay =
+          inc.isReceivedThisMonth && inc.receivedAt && inc.receivedAt.slice(0, 7) === ym
+            ? Math.min(daysInMonth, Math.max(1, Number(inc.receivedAt.slice(8, 10)) || inc.paydayDay))
+            : Math.min(daysInMonth, Math.max(1, inc.paydayDay));
+        if (incDay === d) {
           runningBal += inc.monthlyDisplayMinor;
-          labels.push(`+${inc.name} (expected)`);
+          dayEvents.push({
+            id: inc.id,
+            kind: 'income',
+            title: inc.isReceivedThisMonth ? `${inc.name} ✓` : `${inc.name} (expected)`,
+            timestamp: inc.receivedAt || inc.expectedDate,
+            displayMinor: inc.monthlyDisplayMinor,
+          });
         }
       }
+
+      // 2. Logged expenses & completed checklist items on day d
+      for (const entry of timelineLedger) {
+        if (entry.day === d) {
+          runningBal -= entry.displayAmountMinor;
+          dayEvents.push({
+            id: entry.id,
+            kind: entry.kind,
+            title: entry.title,
+            timestamp: entry.timestamp,
+            displayMinor: entry.displayAmountMinor,
+          });
+        }
+      }
+
+      // 3. Remaining unpaid scheduled obligations & unpaid monthly sinking set-asides
       for (const ob of enrichedObligations) {
-        if (ob.metrics.isDueThisMonth && !ob.isPaidThisMonth && ob.dueDay === d) {
+        if (ob.isPaidThisMonth) continue;
+        const obDay = Math.min(daysInMonth, Math.max(1, ob.dueDay || 1));
+        if (ob.metrics.isDueThisMonth && obDay === d) {
           runningBal -= ob.dueDisplayMinor;
-          labels.push(`-${ob.name}`);
+          dayEvents.push({
+            id: ob.id,
+            kind: 'unpaid_bill',
+            title: ob.name,
+            displayMinor: ob.dueDisplayMinor,
+          });
+        } else if (!ob.metrics.isDueThisMonth && ob.preserveDisplayMinor > 0 && obDay === d) {
+          runningBal -= ob.preserveDisplayMinor;
+          dayEvents.push({
+            id: ob.id,
+            kind: 'unpaid_bill',
+            title: `${ob.name} (Preserve)`,
+            displayMinor: ob.preserveDisplayMinor,
+          });
         }
       }
-      if (d === daysInMonth && totalPreserveSliceMinor > 0) {
-        runningBal -= totalPreserveSliceMinor;
-        labels.push('Preserve Transfers');
-      }
+
+      const labels = dayEvents.map((ev) => `${ev.kind === 'income' ? '+' : '-'}${ev.title}`);
       dailyCurve.push({
         day: d,
+        date: dateStr,
         balanceMinor: runningBal,
         label: labels.length ? labels.join(', ') : undefined,
+        events: dayEvents,
       });
     }
 
@@ -461,6 +635,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       potTree,
       obligations: enrichedObligations,
       expenses,
+      timelineLedger,
       kpis: {
         totalIncomeMinor,
         potPlannedTotalMinor,
@@ -976,7 +1151,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
         `INSERT INTO accounts (id, workspace_id, name, institution, currency, balance_minor, is_primary_runway, portal_url, notes, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
-           name=excluded.name, institution=excluded.institution, currency=excluded.currency,
+           workspace_id=excluded.workspace_id, name=excluded.name, institution=excluded.institution, currency=excluded.currency,
            balance_minor=excluded.balance_minor, is_primary_runway=excluded.is_primary_runway,
            portal_url=excluded.portal_url, notes=excluded.notes, updated_at=excluded.updated_at`
       )
@@ -1018,7 +1193,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
         `INSERT INTO income_streams (id, workspace_id, name, source_kind, amount_minor, currency, cadence, payday_day, effective_from, effective_to, is_active, portal_url, notes)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
-           name=excluded.name, source_kind=excluded.source_kind, amount_minor=excluded.amount_minor,
+           workspace_id=excluded.workspace_id, name=excluded.name, source_kind=excluded.source_kind, amount_minor=excluded.amount_minor,
            currency=excluded.currency, cadence=excluded.cadence, payday_day=excluded.payday_day,
            effective_from=excluded.effective_from, effective_to=excluded.effective_to,
            is_active=excluded.is_active, portal_url=excluded.portal_url, notes=excluded.notes`
@@ -1415,15 +1590,39 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
         b.notes ? String(b.notes) : null,
         b.isActive === false ? 0 : 1
       );
+
+    // If caller also edited the completed occurrence timestamp or amount for a specific yearMonth
+    if (b.occurrenceYearMonth && (b.occurrencePaidAt || b.occurrenceActualPaidMinor != null)) {
+      const occYm = String(b.occurrenceYearMonth);
+      const existingOcc = store.db
+        .prepare(`SELECT id, paid_at, actual_paid_minor FROM payment_occurrences WHERE obligation_id = ? AND year_month = ?`)
+        .get(id, occYm) as { id: string; paid_at: string | null; actual_paid_minor: number | null } | undefined;
+      if (existingOcc) {
+        const nextPaidAt = b.occurrencePaidAt ? String(b.occurrencePaidAt) : existingOcc.paid_at;
+        const nextActual =
+          b.occurrenceActualPaidMinor != null
+            ? Math.round(Number(b.occurrenceActualPaidMinor))
+            : existingOcc.actual_paid_minor;
+        store.db
+          .prepare(`UPDATE payment_occurrences SET paid_at = ?, actual_paid_minor = ? WHERE id = ?`)
+          .run(nextPaidAt, nextActual, existingOcc.id);
+      }
+    }
+
     return { ok: true, id };
   });
 
-  // Tick / Untick "[✓] Mark as Paid" (resets Preserve counter & advances nextDueDate for multi-month bills)
+  // Tick / Untick "[✓] Mark as Paid / Set Aside" (logs timestamped occurrence; handles both due bills & monthly Preserve slices)
   app.post('/api/obligations/:id/toggle-paid', async (req, reply) => {
     const user = requireUser(req, reply, store, cfg);
     if (!user) return;
     const { id } = req.params as { id: string };
-    const body = (req.body || {}) as { yearMonth?: string; paid?: boolean; preserveDepositMinor?: number };
+    const body = (req.body || {}) as {
+      yearMonth?: string;
+      paid?: boolean;
+      preserveDepositMinor?: number;
+      paidAt?: string;
+    };
     const ym = body.yearMonth || new Date().toISOString().slice(0, 7);
 
     const wsIds = store.readableWorkspaceIds(user.id, 'all');
@@ -1432,43 +1631,81 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       return reply.code(403).send({ error: 'Obligation not found or write denied' });
     }
 
-    // Optional action: deposit monthly 'Preserve' slice into the obligation's preservedMinor pot!
-    if (body.preserveDepositMinor && body.preserveDepositMinor > 0) {
-      const nextPreserved = Math.min(ob.amountMinor, ob.preservedMinor + Math.round(body.preserveDepositMinor));
-      store.db.prepare(`UPDATE obligations SET preserved_minor = ? WHERE id = ?`).run(nextPreserved, ob.id);
-      return { ok: true, preservedMinor: nextPreserved };
-    }
+    const metrics = computeObligationMonthMetrics(ob, ym);
+    const existingOcc = store.db
+      .prepare(
+        `SELECT id, status, actual_paid_minor, paid_at FROM payment_occurrences WHERE obligation_id = ? AND year_month = ?`
+      )
+      .get(ob.id, ym) as
+      | { id: string; status: string; actual_paid_minor: number | null; paid_at: string | null }
+      | undefined;
 
-    const markPaid = body.paid !== false;
+    const markPaid = body.preserveDepositMinor && body.preserveDepositMinor > 0 ? true : body.paid !== false;
+    const nowIso = new Date().toISOString();
+    const defaultDay = String(Math.min(28, Math.max(1, ob.dueDay || 1))).padStart(2, '0');
+    const dueInYm = `${ym}-${defaultDay}`;
+    const defaultTimestampInYm = nowIso.slice(0, 7) === ym ? nowIso : `${dueInYm}T${nowIso.slice(11, 19)}Z`;
+    const paidAtIso = body.paidAt || defaultTimestampInYm;
+
     if (markPaid) {
-      store.db
-        .prepare(
-          `INSERT INTO payment_occurrences (id, obligation_id, year_month, due_date, expected_minor, actual_paid_minor, currency, status, paid_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'paid', ?)
-           ON CONFLICT(obligation_id, year_month) DO UPDATE SET status='paid', actual_paid_minor=excluded.actual_paid_minor, paid_at=excluded.paid_at`
-        )
-        .run(
-          `occ-${crypto.randomUUID().slice(0, 8)}`,
-          ob.id,
-          ym,
-          ob.nextDueDate,
-          ob.amountMinor,
-          ob.amountMinor,
-          ob.currency,
-          new Date().toISOString()
-        );
+      if (!metrics.isDueThisMonth) {
+        // Monthly Sinking-Fund ("Preserve") Set-Aside for a future/multi-month goal
+        const sliceMinor =
+          body.preserveDepositMinor && body.preserveDepositMinor > 0
+            ? Math.round(body.preserveDepositMinor)
+            : existingOcc?.actual_paid_minor || metrics.monthlyPreserveNativeMinor || ob.amountMinor;
 
-      // If this was a multi-month or one-off obligation due this month, advance nextDueDate & reset Preserve counter!
-      if (ob.cadence !== 'monthly' && ob.nextDueDate.slice(0, 7) <= ym) {
-        const reset = applyObligationPaymentReset(ob);
         store.db
-          .prepare(`UPDATE obligations SET next_due_date = ?, preserved_minor = ?, is_active = ? WHERE id = ?`)
-          .run(reset.nextDueDate, reset.preservedMinor, reset.isActive ? 1 : 0, ob.id);
+          .prepare(
+            `INSERT INTO payment_occurrences (id, obligation_id, year_month, due_date, expected_minor, actual_paid_minor, currency, status, paid_at, notes)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'paid', ?, 'Monthly sinking set-aside')
+             ON CONFLICT(obligation_id, year_month) DO UPDATE SET
+               status='paid', actual_paid_minor=excluded.actual_paid_minor, paid_at=excluded.paid_at, notes=excluded.notes`
+          )
+          .run(`occ-${crypto.randomUUID().slice(0, 8)}`, ob.id, ym, dueInYm, sliceMinor, sliceMinor, ob.currency, paidAtIso);
+
+        if (!existingOcc || existingOcc.status !== 'paid') {
+          const nextPreserved = Math.min(ob.amountMinor, ob.preservedMinor + sliceMinor);
+          store.db.prepare(`UPDATE obligations SET preserved_minor = ? WHERE id = ?`).run(nextPreserved, ob.id);
+        }
+      } else {
+        // Scheduled Bill due this month
+        store.db
+          .prepare(
+            `INSERT INTO payment_occurrences (id, obligation_id, year_month, due_date, expected_minor, actual_paid_minor, currency, status, paid_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'paid', ?)
+             ON CONFLICT(obligation_id, year_month) DO UPDATE SET status='paid', actual_paid_minor=excluded.actual_paid_minor, paid_at=excluded.paid_at`
+          )
+          .run(
+            `occ-${crypto.randomUUID().slice(0, 8)}`,
+            ob.id,
+            ym,
+            dueInYm,
+            ob.amountMinor,
+            ob.amountMinor,
+            ob.currency,
+            paidAtIso
+          );
+
+        // If this was a multi-month or one-off obligation due this month, advance nextDueDate & reset Preserve counter!
+        if (ob.cadence !== 'monthly' && ob.nextDueDate.slice(0, 7) <= ym) {
+          const reset = applyObligationPaymentReset(ob);
+          store.db
+            .prepare(`UPDATE obligations SET next_due_date = ?, preserved_minor = ?, is_active = ? WHERE id = ?`)
+            .run(reset.nextDueDate, reset.preservedMinor, reset.isActive ? 1 : 0, ob.id);
+        }
       }
     } else {
+      // Unticking [✓] or clicking Undo in the Timeline table
+      if (existingOcc && existingOcc.status === 'paid' && !metrics.isDueThisMonth) {
+        const reversedPreserved = Math.max(0, ob.preservedMinor - (existingOcc.actual_paid_minor || 0));
+        store.db.prepare(`UPDATE obligations SET preserved_minor = ? WHERE id = ?`).run(reversedPreserved, ob.id);
+      }
+
       store.db
         .prepare(`DELETE FROM payment_occurrences WHERE obligation_id = ? AND year_month = ?`)
         .run(ob.id, ym);
+
       if (ob.cadence !== 'monthly' && ob.cadence !== 'once' && ob.nextDueDate.slice(0, 7) > ym) {
         const rolledBack = addMonthsToDate(ob.nextDueDate, -cadenceIntervalMonths(ob.cadence, ob.intervalMonths));
         if (rolledBack.slice(0, 7) === ym) {
@@ -1497,6 +1734,18 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     const wsId = String(b.workspaceId || 'ws-home');
     if (!store.canWriteWorkspace(user.id, wsId)) return reply.code(403).send({ error: 'Write denied' });
     const id = b.id ? String(b.id) : `exp-${crypto.randomUUID().slice(0, 8)}`;
+    const spentDate = String(b.spentDate || new Date().toISOString().slice(0, 10));
+    const existingExp = b.id
+      ? (store.db.prepare(`SELECT created_at FROM expenses WHERE id = ?`).get(id) as { created_at: string } | undefined)
+      : undefined;
+    const nowIso = new Date().toISOString();
+    let createdAt = existingExp?.created_at || `${spentDate}T${nowIso.slice(11, 19)}Z`;
+    if (b.spentTime && /^\d{2}:\d{2}/.test(String(b.spentTime))) {
+      createdAt = `${spentDate}T${String(b.spentTime).slice(0, 5)}:00Z`;
+    } else if (b.createdAt) {
+      createdAt = String(b.createdAt);
+    }
+
     store.db
       .prepare(
         `INSERT INTO expenses (id, workspace_id, pot_id, merchant, description, amount_minor, currency, spent_date, tags_json, portal_url, source, items_json, created_at)
@@ -1505,7 +1754,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
            workspace_id=excluded.workspace_id, pot_id=excluded.pot_id, merchant=excluded.merchant,
            description=excluded.description, amount_minor=excluded.amount_minor, currency=excluded.currency,
            spent_date=excluded.spent_date, tags_json=excluded.tags_json, portal_url=excluded.portal_url,
-           items_json=excluded.items_json`
+           items_json=excluded.items_json, created_at=excluded.created_at`
       )
       .run(
         id,
@@ -1515,12 +1764,12 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
         String(b.description || ''),
         Math.round(Number(b.amountMinor ?? 0)),
         String(b.currency || user.defaultCurrency),
-        String(b.spentDate || new Date().toISOString().slice(0, 10)),
+        spentDate,
         JSON.stringify(Array.isArray(b.tags) ? b.tags : []),
         b.portalUrl ? String(b.portalUrl) : null,
         String(b.source || 'manual'),
         JSON.stringify(Array.isArray(b.items) ? b.items : []),
-        new Date().toISOString()
+        createdAt
       );
     return { ok: true, id };
   });

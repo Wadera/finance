@@ -123,6 +123,40 @@ export interface CashflowBridgeData {
   nextMonthBreakdown: NextMonthBreakdownItem[];
 }
 
+export interface TimelineLedgerEntry {
+  id: string;
+  kind: 'expense' | 'paid_bill' | 'sinking_set_aside';
+  entityType: 'expense' | 'obligation';
+  entityId: string;
+  occurrenceId?: string;
+  workspaceId: string;
+  potId: string | null;
+  potName: string | null;
+  potColor: string;
+  title: string;
+  subtitle: string;
+  date: string;
+  timestamp: string;
+  day: number;
+  amountMinor: number;
+  currency: CurrencyCode;
+  displayAmountMinor: number;
+}
+
+export interface DailyCurvePoint {
+  day: number;
+  date?: string;
+  balanceMinor: number;
+  label?: string;
+  events?: Array<{
+    id: string;
+    kind: 'expense' | 'paid_bill' | 'sinking_set_aside' | 'unpaid_bill' | 'income';
+    title: string;
+    timestamp?: string;
+    displayMinor: number;
+  }>;
+}
+
 export interface BudgetMonthResponse {
   yearMonth: string;
   scope: string;
@@ -134,6 +168,7 @@ export interface BudgetMonthResponse {
   potTree: PotRollupNode[];
   obligations: EnrichedObligation[];
   expenses: EnrichedExpense[];
+  timelineLedger: TimelineLedgerEntry[];
   kpis: {
     totalIncomeMinor: number;
     potPlannedTotalMinor: number;
@@ -156,7 +191,7 @@ export interface BudgetMonthResponse {
     projectedAfterNextMonthReserveMinor: number;
     shortfallMinor: number;
     isSufficient: boolean;
-    dailyCurve: Array<{ day: number; balanceMinor: number; label?: string }>;
+    dailyCurve: DailyCurvePoint[];
   };
   cashflowBridge: CashflowBridgeData;
   sankey: {

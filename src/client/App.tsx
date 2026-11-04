@@ -19,9 +19,11 @@ import {
   Lock,
   LogOut,
   Paperclip,
+  Pencil,
   PiggyBank,
   Plus,
   RefreshCw,
+  RotateCcw,
   Shield,
   Sparkles,
   Trash2,
@@ -81,7 +83,7 @@ type ModalKind =
   | { kind: 'workspace' };
 
 interface DrawerSubject {
-  entityType: 'obligation' | 'expense' | 'asset' | 'liability' | 'pot';
+  entityType: 'obligation' | 'expense' | 'asset' | 'liability' | 'pot' | 'income' | 'account';
   entityId: string;
   workspaceId: string;
   title: string;
@@ -182,6 +184,8 @@ export const App: React.FC = () => {
   const [modal, setModal] = useState<ModalKind>(null);
   const [drawer, setDrawer] = useState<DrawerSubject | null>(null);
   const [drawerAttachments, setDrawerAttachments] = useState<AttachmentRecord[]>([]);
+  const [drawerSavedMsg, setDrawerSavedMsg] = useState<string | null>(null);
+  const [ledgerOpen, setLedgerOpen] = useState<boolean>(false);
   const [newlyMintedKey, setNewlyMintedKey] = useState<string | null>(null);
   const [agentKeyLabel, setAgentKeyLabel] = useState<string>('');
   const [copiedNotice, setCopiedNotice] = useState<string | null>(null);
@@ -496,20 +500,114 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleDepositPreserve = async (ob: EnrichedObligation) => {
-    if (ob.metrics.monthlyPreserveNativeMinor <= 0) return;
-    setBusy(true);
-    try {
-      await apiFetch(`/api/obligations/${ob.id}/toggle-paid`, {
-        method: 'POST',
-        body: JSON.stringify({
-          yearMonth,
-          preserveDepositMinor: ob.metrics.monthlyPreserveNativeMinor,
-        }),
-      });
-      await reloadAll();
-    } finally {
-      setBusy(false);
+  const openEntityDrawer = (
+    entityType: DrawerSubject['entityType'],
+    entityId: string
+  ) => {
+    setDrawerSavedMsg(null);
+    if (entityType === 'obligation') {
+      const ob = budget.obligations.find((o) => o.id === entityId);
+      if (ob) {
+        setDrawer({
+          entityType: 'obligation',
+          entityId: ob.id,
+          workspaceId: ob.workspaceId,
+          title: ob.name,
+          subtitle: `${ob.cadence} · ${t.dueLabel} ${ob.nextDueDate}`,
+          manageUrl: ob.manageUrl,
+          portalUrl: ob.portalUrl,
+          referenceNumber: ob.referenceNumber,
+          notes: ob.notes,
+          currency: ob.currency,
+        });
+      }
+    } else if (entityType === 'expense') {
+      const exp = budget.expenses.find((e) => e.id === entityId);
+      if (exp) {
+        setDrawer({
+          entityType: 'expense',
+          entityId: exp.id,
+          workspaceId: exp.workspaceId,
+          title: exp.merchant,
+          subtitle: `${exp.spentDate}${exp.description ? ` · ${exp.description}` : ''}`,
+          portalUrl: exp.portalUrl,
+          items: exp.items,
+          currency: exp.currency,
+        });
+      }
+    } else if (entityType === 'pot') {
+      const pot = budget.pots.find((p) => p.id === entityId);
+      if (pot) {
+        setDrawer({
+          entityType: 'pot',
+          entityId: pot.id,
+          workspaceId: pot.workspaceId,
+          title: pot.name,
+          subtitle: potBreadcrumbs.get(pot.id)?.pathString || pot.name,
+          currency: pot.currency,
+        });
+      }
+    } else if (entityType === 'income') {
+      const inc =
+        budget.allIncomes.find((i) => i.id === entityId) ||
+        wealth.salaryHistory.find((i) => i.id === entityId);
+      if (inc) {
+        setDrawer({
+          entityType: 'income',
+          entityId: inc.id,
+          workspaceId: inc.workspaceId,
+          title: inc.name,
+          subtitle: `${inc.cadence} · Payday ${inc.paydayDay}.`,
+          portalUrl: inc.portalUrl,
+          notes: inc.notes,
+          currency: inc.currency,
+        });
+      }
+    } else if (entityType === 'account') {
+      const acc = budget.accounts.find((a) => a.id === entityId);
+      if (acc) {
+        setDrawer({
+          entityType: 'account',
+          entityId: acc.id,
+          workspaceId: acc.workspaceId,
+          title: acc.name,
+          subtitle: acc.institution || 'Bank Account',
+          portalUrl: acc.portalUrl,
+          notes: acc.notes,
+          currency: acc.currency,
+        });
+      }
+    } else if (entityType === 'asset') {
+      const ast = wealth.assets.find((a) => a.id === entityId);
+      if (ast) {
+        setDrawer({
+          entityType: 'asset',
+          entityId: ast.id,
+          workspaceId: ast.workspaceId,
+          title: ast.name,
+          subtitle: `${ast.assetClass} · ${(ast.annualRateBp / 100).toFixed(1)}%/yr`,
+          manageUrl: ast.manageUrl,
+          portalUrl: ast.portalUrl,
+          referenceNumber: ast.referenceNumber,
+          notes: ast.notes,
+          currency: ast.currency,
+        });
+      }
+    } else if (entityType === 'liability') {
+      const lb = wealth.liabilities.find((l) => l.id === entityId);
+      if (lb) {
+        setDrawer({
+          entityType: 'liability',
+          entityId: lb.id,
+          workspaceId: lb.workspaceId,
+          title: lb.name,
+          subtitle: `${lb.kind} · ${(lb.aprBp / 100).toFixed(2)}% APR`,
+          portalUrl: lb.portalUrl,
+          referenceNumber: lb.referenceNumber,
+          notes: lb.notes,
+          currency: lb.currency,
+        });
+      }
     }
   };
 
@@ -848,39 +946,7 @@ export const App: React.FC = () => {
                 onTogglePot={handleToggleSankeyPot}
                 onToggleExpense={handleToggleSankeyExpense}
                 onQuickAdd={(target) => setQuickAddTarget(target)}
-                onInspectItem={(kind, id) => {
-                  if (kind === 'obligation') {
-                    const ob = budget.obligations.find((o) => o.id === id);
-                    if (ob) {
-                      setDrawer({
-                        entityType: 'obligation',
-                        entityId: ob.id,
-                        workspaceId: ob.workspaceId,
-                        title: ob.name,
-                        subtitle: `${ob.cadence} · ${t.dueLabel} ${ob.nextDueDate}`,
-                        manageUrl: ob.manageUrl,
-                        portalUrl: ob.portalUrl,
-                        referenceNumber: ob.referenceNumber,
-                        notes: ob.notes,
-                        currency: ob.currency,
-                      });
-                    }
-                  } else {
-                    const exp = budget.expenses.find((e) => e.id === id);
-                    if (exp) {
-                      setDrawer({
-                        entityType: 'expense',
-                        entityId: exp.id,
-                        workspaceId: exp.workspaceId,
-                        title: exp.merchant,
-                        subtitle: `${exp.spentDate} · ${exp.description}`,
-                        portalUrl: exp.portalUrl,
-                        items: exp.items,
-                        currency: exp.currency,
-                      });
-                    }
-                  }
-                }}
+                onInspectItem={(kind, id) => openEntityDrawer(kind, id)}
                 t={t}
               />
             </section>
@@ -899,12 +965,13 @@ export const App: React.FC = () => {
 
               <section className="bg-white border border-slate-200 rounded-lg p-5 flex flex-col justify-between">
                 <div>
-                  <div className="flex items-center justify-between mb-3">
+                  <div className="flex items-center justify-between mb-2">
                     <h3 className="text-xs font-mono-num uppercase tracking-wider text-slate-500 font-semibold">
                       {t.preserveGoalsTitle}
                     </h3>
                     <PiggyBank className="w-4 h-4 text-teal-700" />
                   </div>
+                  <p className="text-[11px] text-slate-500 mb-3">{t.preserveExplainer}</p>
                   <div className="space-y-2.5">
                     {budget.obligations
                       .filter((o) => !o.metrics.isDueThisMonth && o.preserveDisplayMinor > 0)
@@ -913,9 +980,16 @@ export const App: React.FC = () => {
                         const progressPct =
                           ob.amountMinor > 0 ? Math.min(100, Math.round((ob.preservedMinor / ob.amountMinor) * 100)) : 0;
                         return (
-                          <div key={ob.id} className="border border-slate-100 rounded-md p-2.5 bg-[#FAF9F6]/60">
+                          <div
+                            key={ob.id}
+                            onClick={() => openEntityDrawer('obligation', ob.id)}
+                            className="border border-slate-100 rounded-md p-2.5 bg-[#FAF9F6]/60 hover:border-teal-600/40 cursor-pointer transition"
+                          >
                             <div className="flex items-center justify-between text-xs">
-                              <span className="font-medium text-slate-800">{ob.name}</span>
+                              <span className="font-medium text-slate-800 inline-flex items-center gap-1.5">
+                                <span>{ob.name}</span>
+                                <Pencil className="w-3 h-3 text-slate-400" />
+                              </span>
                               <span className="font-mono-num font-semibold text-teal-800">
                                 +{fmt(ob.preserveDisplayMinor)}/mo
                               </span>
@@ -946,7 +1020,7 @@ export const App: React.FC = () => {
         {/* ======================== TAB 2: TIMELINE & SUFFICIENCY ======================== */}
         {tab === 'timeline' && (
           <>
-            {/* Pre-Payday Sufficiency Banner + Runway Curve */}
+            {/* Pre-Payday Sufficiency Banner + Plotted Runway Curve + Folded-by-Default Expenses & Completed Payments Table */}
             <section className="bg-white border border-slate-200 rounded-lg p-5 space-y-4">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
@@ -980,7 +1054,7 @@ export const App: React.FC = () => {
                   </div>
                   <div
                     className={`text-xl font-semibold ${
-                      budget.runway.isSufficient ? 'text-emerald-700' : 'text-amber-700'
+                      budget.runway.isSufficient ? 'text-emerald-700' : 'bg-amber-700'
                     }`}
                   >
                     {budget.runway.isSufficient
@@ -995,7 +1069,167 @@ export const App: React.FC = () => {
                 currency={cur}
                 privacyMode={privacyMode}
                 t={t}
+                onSelectDay={() => setLedgerOpen(true)}
               />
+
+              {/* Folded-by-Default Chronological Table of All Month Expenses & Completed Checklist Payments */}
+              <div className="border-t border-slate-200 pt-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setLedgerOpen((prev) => !prev)}
+                    className="flex items-center gap-2 text-left group"
+                  >
+                    {ledgerOpen ? (
+                      <ChevronDown className="w-4 h-4 text-teal-700 shrink-0" />
+                    ) : (
+                      <ChevronRight className="w-4 h-4 text-slate-400 group-hover:text-teal-700 shrink-0" />
+                    )}
+                    <div>
+                      <div className="text-xs font-mono-num uppercase tracking-wider text-slate-700 font-semibold group-hover:text-teal-800">
+                        {t.ledgerFoldedTitle(budget.timelineLedger.length)} ·{' '}
+                        <span className="text-slate-900">
+                          {fmt(budget.timelineLedger.reduce((s, e) => s + e.displayAmountMinor, 0))}
+                        </span>
+                      </div>
+                      <div className="text-[11px] text-slate-400">{t.ledgerFoldedSub}</div>
+                    </div>
+                  </button>
+
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setModal({ kind: 'expense' })}
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded border border-slate-200 bg-white text-xs font-medium text-slate-700 hover:bg-slate-50"
+                    >
+                      <Plus className="w-3.5 h-3.5" /> {t.btnAddExpense}
+                    </button>
+                  </div>
+                </div>
+
+                {ledgerOpen && (
+                  <div className="mt-3 border border-slate-200 rounded-lg overflow-x-auto bg-white">
+                    {budget.timelineLedger.length === 0 ? (
+                      <div className="p-4 text-xs text-slate-400 font-mono-num text-center">{t.emptyLedgerMsg}</div>
+                    ) : (
+                      <table className="w-full text-left border-collapse text-xs">
+                        <thead>
+                          <tr className="border-b border-slate-200 bg-[#FAF9F6] text-[10px] font-mono-num uppercase text-slate-500">
+                            <th className="py-2 px-3">{t.colDateTime}</th>
+                            <th className="py-2 px-3">{t.colItemMerchant}</th>
+                            <th className="py-2 px-3">{t.colPot}</th>
+                            <th className="py-2 px-3">{t.colType}</th>
+                            <th className="py-2 px-3 text-right">{t.colAmount}</th>
+                            <th className="py-2 px-3 text-right">{t.colActions}</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                          {budget.timelineLedger.map((entry) => {
+                            const formattedTs = `${entry.date} ${entry.timestamp.slice(11, 16) || '12:00'}`;
+                            const potPath = entry.potId
+                              ? potBreadcrumbs.get(entry.potId)?.pathString || entry.potName
+                              : '—';
+                            return (
+                              <tr key={entry.id} className="hover:bg-slate-50/80">
+                                <td className="py-2.5 px-3 font-mono-num text-[11px] text-slate-600 whitespace-nowrap">
+                                  {formattedTs}
+                                </td>
+                                <td className="py-2.5 px-3">
+                                  <button
+                                    type="button"
+                                    onClick={() => openEntityDrawer(entry.entityType, entry.entityId)}
+                                    className="font-medium text-slate-900 hover:text-teal-800 hover:underline text-left"
+                                  >
+                                    {entry.title}
+                                  </button>
+                                  {entry.subtitle && (
+                                    <div className="text-[11px] text-slate-400 truncate max-w-[220px]">
+                                      {entry.subtitle}
+                                    </div>
+                                  )}
+                                </td>
+                                <td className="py-2.5 px-3">
+                                  <span className="inline-flex items-center gap-1.5 text-[11px] text-slate-600">
+                                    <span
+                                      className="w-2 h-2 rounded-full shrink-0"
+                                      style={{ backgroundColor: entry.potColor }}
+                                    />
+                                    <span className="truncate max-w-[180px]">{potPath}</span>
+                                  </span>
+                                </td>
+                                <td className="py-2.5 px-3 whitespace-nowrap">
+                                  <span
+                                    className={`inline-flex px-2 py-0.5 rounded text-[10px] font-mono-num ${
+                                      entry.kind === 'expense'
+                                        ? 'bg-rose-50 text-rose-800 border border-rose-200'
+                                        : entry.kind === 'paid_bill'
+                                        ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
+                                        : 'bg-teal-50 text-teal-800 border border-teal-200'
+                                    }`}
+                                  >
+                                    {entry.kind === 'expense'
+                                      ? t.typeExpense
+                                      : entry.kind === 'paid_bill'
+                                      ? t.typePaidBill
+                                      : t.typeSinkingSetAside}
+                                  </span>
+                                </td>
+                                <td className="py-2.5 px-3 text-right font-mono-num font-semibold text-slate-900 whitespace-nowrap">
+                                  -{fmt(entry.displayAmountMinor)}
+                                  {entry.currency !== cur && !privacyMode && (
+                                    <div className="text-[10px] text-slate-400 font-normal">
+                                      {CURRENCY_SYMBOLS[entry.currency]}
+                                      {(entry.amountMinor / 100).toFixed(2)}
+                                    </div>
+                                  )}
+                                </td>
+                                <td className="py-2.5 px-3 text-right whitespace-nowrap">
+                                  <div className="inline-flex items-center gap-1.5">
+                                    <button
+                                      type="button"
+                                      onClick={() => openEntityDrawer(entry.entityType, entry.entityId)}
+                                      className="inline-flex items-center gap-1 px-2 py-1 rounded border border-slate-200 bg-white text-[11px] text-slate-700 hover:bg-slate-900 hover:text-white transition"
+                                    >
+                                      <Pencil className="w-3 h-3" /> {t.editBtn}
+                                    </button>
+                                    {entry.entityType === 'expense' ? (
+                                      <button
+                                        type="button"
+                                        onClick={async () => {
+                                          if (!confirm(`Delete "${entry.title}"?`)) return;
+                                          await apiFetch(`/api/expenses/${entry.entityId}`, { method: 'DELETE' });
+                                          await reloadAll();
+                                        }}
+                                        className="inline-flex items-center gap-1 px-2 py-1 rounded border border-rose-200 bg-rose-50/60 text-[11px] text-rose-700 hover:bg-rose-600 hover:text-white transition"
+                                      >
+                                        <Trash2 className="w-3 h-3" /> {t.deleteBtn}
+                                      </button>
+                                    ) : (
+                                      <button
+                                        type="button"
+                                        onClick={async () => {
+                                          await apiFetch(`/api/obligations/${entry.entityId}/toggle-paid`, {
+                                            method: 'POST',
+                                            body: JSON.stringify({ yearMonth, paid: false }),
+                                          });
+                                          await reloadAll();
+                                        }}
+                                        className="inline-flex items-center gap-1 px-2 py-1 rounded border border-amber-200 bg-amber-50/70 text-[11px] text-amber-800 hover:bg-amber-600 hover:text-white transition"
+                                      >
+                                        <RotateCcw className="w-3 h-3" /> {t.undoBtn}
+                                      </button>
+                                    )}
+                                  </div>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    )}
+                  </div>
+                )}
+              </div>
             </section>
 
             {/* Expected Salary & Income Arrivals (Tick when received in bank account!) */}
@@ -1036,7 +1270,21 @@ export const App: React.FC = () => {
                       </button>
                       <div>
                         <div className="flex items-center gap-2">
-                          <span className="text-sm font-medium text-slate-900">{inc.name}</span>
+                          <button
+                            type="button"
+                            onClick={() => openEntityDrawer('income', inc.id)}
+                            className="text-sm font-medium text-slate-900 hover:text-teal-800 hover:underline text-left"
+                          >
+                            {inc.name}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => openEntityDrawer('income', inc.id)}
+                            title={t.editBtn}
+                            className="p-1 rounded text-slate-400 hover:text-slate-800 hover:bg-slate-100"
+                          >
+                            <Pencil className="w-3 h-3" />
+                          </button>
                           <span
                             className={`text-[10px] font-mono-num px-1.5 py-0.5 rounded ${
                               inc.isReceivedThisMonth
@@ -1062,32 +1310,47 @@ export const App: React.FC = () => {
               </div>
             </section>
 
-            {/* Chronological Monthly Payment Checklist */}
+            {/* Chronological Monthly Payment Checklist & Unified Sinking Set-Aside ('Preserve') */}
             <section className="bg-white border border-slate-200 rounded-lg overflow-hidden">
-              <div className="px-5 py-3.5 border-b border-slate-200 flex items-center justify-between">
-                <div>
-                  <h3 className="text-xs font-mono-num uppercase tracking-wider text-slate-600 font-semibold">
-                    {t.checklistTitle} ({yearMonth})
-                  </h3>
-                  <p className="text-xs text-slate-400">{t.checklistSub}</p>
+              <div className="px-5 py-3.5 border-b border-slate-200 space-y-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <h3 className="text-xs font-mono-num uppercase tracking-wider text-slate-600 font-semibold">
+                      {t.checklistTitle} ({yearMonth})
+                    </h3>
+                    <p className="text-xs text-slate-400">{t.checklistSub}</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setModal({ kind: 'obligation' })}
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded bg-slate-900 text-white text-xs font-medium"
+                  >
+                    <Plus className="w-3.5 h-3.5" /> {t.addScheduledBtn}
+                  </button>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => setModal({ kind: 'obligation' })}
-                  className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded bg-slate-900 text-white text-xs font-medium"
-                >
-                  <Plus className="w-3.5 h-3.5" /> {t.addScheduledBtn}
-                </button>
+
+                {/* Clear explanation of 'Preserve' (Monthly Sinking Set-Aside) */}
+                <div className="text-[11px] text-teal-900 bg-teal-50/70 border border-teal-200/70 rounded px-3 py-1.5 flex items-start gap-2">
+                  <PiggyBank className="w-3.5 h-3.5 text-teal-700 shrink-0 mt-0.5" />
+                  <span>{t.preserveExplainer}</span>
+                </div>
               </div>
 
               <div className="divide-y divide-slate-100">
                 {budget.obligations.map((ob) => {
                   const isDueNow = ob.metrics.isDueThisMonth;
+                  const progressPct =
+                    ob.amountMinor > 0 ? Math.min(100, Math.round((ob.preservedMinor / ob.amountMinor) * 100)) : 0;
+                  const paidTimestamp =
+                    ob.isPaidThisMonth && ob.occurrence?.paidAt
+                      ? `${ob.occurrence.paidAt.slice(0, 10)} ${ob.occurrence.paidAt.slice(11, 16) || '09:00'}`
+                      : null;
+
                   return (
                     <div
                       key={ob.id}
                       className={`px-5 py-3 flex flex-wrap items-center justify-between gap-3 hover:bg-slate-50/70 ${
-                        ob.isPaidThisMonth ? 'opacity-65' : ''
+                        ob.isPaidThisMonth ? 'bg-emerald-50/20' : ''
                       }`}
                     >
                       <div className="flex items-center gap-3">
@@ -1096,7 +1359,15 @@ export const App: React.FC = () => {
                           disabled={busy}
                           onClick={() => void handleTogglePaid(ob)}
                           className="text-slate-400 hover:text-teal-700 transition"
-                          title={ob.isPaidThisMonth ? t.markUnpaid : t.markPaid}
+                          title={
+                            isDueNow
+                              ? ob.isPaidThisMonth
+                                ? t.markUnpaid
+                                : t.markPaid
+                              : ob.isPaidThisMonth
+                              ? t.markPreserveUndone
+                              : t.markPreserveDone
+                          }
                         >
                           {ob.isPaidThisMonth ? (
                             <CheckCircle2 className="w-5 h-5 text-emerald-600" />
@@ -1105,29 +1376,35 @@ export const App: React.FC = () => {
                           )}
                         </button>
                         <div>
-                          <div className="flex items-center gap-2">
+                          <div className="flex flex-wrap items-center gap-2">
                             <button
                               type="button"
-                              onClick={() =>
-                                setDrawer({
-                                  entityType: 'obligation',
-                                  entityId: ob.id,
-                                  workspaceId: ob.workspaceId,
-                                  title: ob.name,
-                                  subtitle: `${ob.cadence} · ${t.dueLabel} ${ob.nextDueDate}`,
-                                  manageUrl: ob.manageUrl,
-                                  portalUrl: ob.portalUrl,
-                                  referenceNumber: ob.referenceNumber,
-                                  notes: ob.notes,
-                                  currency: ob.currency,
-                                })
-                              }
-                              className={`text-sm font-medium text-left hover:underline ${
+                              onClick={() => openEntityDrawer('obligation', ob.id)}
+                              className={`text-sm font-medium text-left hover:text-teal-800 hover:underline ${
                                 ob.isPaidThisMonth ? 'line-through text-slate-500' : 'text-slate-900'
                               }`}
                             >
                               {ob.name}
                             </button>
+                            <button
+                              type="button"
+                              onClick={() => openEntityDrawer('obligation', ob.id)}
+                              title={t.editBtn}
+                              className="p-1 rounded text-slate-400 hover:text-slate-800 hover:bg-slate-100"
+                            >
+                              <Pencil className="w-3 h-3" />
+                            </button>
+                            {!isDueNow && (
+                              <span
+                                className={`text-[10px] font-mono-num px-1.5 py-0.5 rounded ${
+                                  ob.isPaidThisMonth
+                                    ? 'bg-emerald-100 text-emerald-800 font-semibold'
+                                    : 'bg-teal-50 text-teal-800 border border-teal-200'
+                                }`}
+                              >
+                                {ob.isPaidThisMonth ? t.sinkingSetAsideDoneBadge : t.sinkingBadge}
+                              </span>
+                            )}
                             {ob.currency !== cur && !privacyMode && (
                               <span className="text-[10px] font-mono-num px-1.5 py-0.5 rounded bg-amber-50 text-amber-800">
                                 {ob.currency}
@@ -1144,25 +1421,22 @@ export const App: React.FC = () => {
                               </a>
                             )}
                           </div>
-                          <div className="text-xs text-slate-500 font-mono-num">
+                          <div className="text-xs text-slate-500 font-mono-num mt-0.5">
                             {isDueNow
                               ? `${t.dueLabel} ${yearMonth}-${String(ob.dueDay).padStart(2, '0')} · ${ob.cadence}`
-                              : `${ob.nextDueDate} (${ob.metrics.monthsUntilDue}${t.monthsLeft}) · Preserve`}
+                              : `${t.dueLabel} ${ob.nextDueDate} (${ob.metrics.monthsUntilDue}${t.monthsLeft}) · ${t.preservedPct} ${progressPct}%${
+                                  !privacyMode
+                                    ? ` (${fmt(ob.preservedDisplayMinor)} / ${fmt(ob.targetDisplayMinor)})`
+                                    : ''
+                                }`}
+                            {paidTimestamp && (
+                              <span className="ml-2 text-emerald-700 font-semibold">· ✓ {paidTimestamp}</span>
+                            )}
                           </div>
                         </div>
                       </div>
 
                       <div className="flex items-center gap-3 font-mono-num">
-                        {!isDueNow && ob.preserveDisplayMinor > 0 && (
-                          <button
-                            type="button"
-                            disabled={busy}
-                            onClick={() => void handleDepositPreserve(ob)}
-                            className="px-2 py-1 rounded border border-teal-200 bg-teal-50 text-teal-800 text-[11px] hover:bg-teal-100"
-                          >
-                            {t.depositPreserveBtn} {fmt(ob.preserveDisplayMinor)}
-                          </button>
-                        )}
                         <div className="text-right">
                           <div className="text-sm font-semibold text-slate-900">
                             {isDueNow ? fmt(ob.dueDisplayMinor) : `${fmt(ob.preserveDisplayMinor)}/mo`}
@@ -1315,6 +1589,14 @@ export const App: React.FC = () => {
                           )}
                           <button
                             type="button"
+                            onClick={() => openEntityDrawer('pot', node.pot.id)}
+                            title={t.editBtn}
+                            className="ml-1 inline-flex items-center justify-center w-4 h-4 rounded border border-slate-300 bg-white text-slate-500 hover:bg-slate-900 hover:text-white hover:border-slate-900 transition"
+                          >
+                            <Pencil className="w-2.5 h-2.5" />
+                          </button>
+                          <button
+                            type="button"
                             onClick={() =>
                               setQuickAddTarget({
                                 targetKind: 'pot',
@@ -1326,7 +1608,7 @@ export const App: React.FC = () => {
                               })
                             }
                             title={t.qaTooltipPot}
-                            className="ml-1 inline-flex items-center justify-center w-4 h-4 rounded border border-teal-600/40 bg-white text-teal-700 hover:bg-teal-700 hover:text-white transition"
+                            className="inline-flex items-center justify-center w-4 h-4 rounded border border-teal-600/40 bg-white text-teal-700 hover:bg-teal-700 hover:text-white transition"
                           >
                             <Plus className="w-2.5 h-2.5 stroke-[2.5]" />
                           </button>
@@ -1819,9 +2101,16 @@ export const App: React.FC = () => {
                   </div>
                   <div className="divide-y divide-slate-100">
                     {wealth.salaryHistory.map((inc) => (
-                      <div key={inc.id} className="px-4 py-2.5 flex items-center justify-between text-xs">
+                      <div
+                        key={inc.id}
+                        onClick={() => openEntityDrawer('income', inc.id)}
+                        className="px-4 py-2.5 flex items-center justify-between text-xs hover:bg-slate-50 cursor-pointer"
+                      >
                         <div>
-                          <div className="font-medium text-slate-800">{inc.name}</div>
+                          <div className="font-medium text-slate-800 inline-flex items-center gap-1.5">
+                            <span>{inc.name}</span>
+                            <Pencil className="w-3 h-3 text-slate-400" />
+                          </div>
                           <div className="text-[11px] text-slate-400 font-mono-num">
                             {inc.effectiveFrom} → {inc.effectiveTo || t.presentLabel} ({inc.paydayDay}.)
                           </div>
@@ -2310,10 +2599,15 @@ export const App: React.FC = () => {
                 </div>
                 <div className="divide-y divide-slate-100">
                   {budget.accounts.map((acc) => (
-                    <div key={acc.id} className="py-2 flex items-center justify-between text-xs">
-                      <div>
+                    <div
+                      key={acc.id}
+                      onClick={() => openEntityDrawer('account', acc.id)}
+                      className="py-2 flex items-center justify-between text-xs hover:bg-slate-50 cursor-pointer px-1 rounded"
+                    >
+                      <div className="inline-flex items-center gap-1.5">
                         <span className="font-medium text-slate-800">{acc.name}</span>{' '}
                         <span className="text-slate-400">({acc.institution})</span>
+                        <Pencil className="w-3 h-3 text-slate-400" />
                       </div>
                       <div className="font-mono-num font-semibold">
                         {formatDisplayValue(acc.balanceMinor, { currency: acc.currency, privacyMode })}
@@ -2452,7 +2746,7 @@ export const App: React.FC = () => {
         )}
       </main>
 
-      {/* ======================== DETAILS, LINKS & DOCUMENT VAULT DRAWER ======================== */}
+      {/* ======================== UNIVERSAL EDIT, LINKS & DOCUMENT VAULT DRAWER ======================== */}
       {drawer && (
         <div className="fixed inset-0 z-40 bg-slate-900/30 flex justify-end" onClick={() => setDrawer(null)}>
           <div
@@ -2471,6 +2765,13 @@ export const App: React.FC = () => {
                 <X className="w-4 h-4" />
               </button>
             </div>
+
+            {drawerSavedMsg && (
+              <div className="px-3 py-2 rounded bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs flex items-center gap-1.5 font-medium">
+                <Check className="w-3.5 h-3.5 shrink-0" />
+                <span>{drawerSavedMsg}</span>
+              </div>
+            )}
 
             {(drawer.manageUrl || drawer.portalUrl || drawer.referenceNumber) && (
               <div className="p-3.5 rounded-lg bg-[#FAF9F6] border border-slate-200 space-y-2">
@@ -2506,6 +2807,1210 @@ export const App: React.FC = () => {
                 )}
               </div>
             )}
+
+            {/* INLINE UNIVERSAL EDIT FORM FOR ALL ENTITY TYPES */}
+            {(() => {
+              if (drawer.entityType === 'obligation') {
+                const ob = budget.obligations.find((o) => o.id === drawer.entityId);
+                if (!ob) return null;
+                const occDateTimeDefault =
+                  ob.isPaidThisMonth && ob.occurrence?.paidAt && ob.occurrence.paidAt.length >= 16
+                    ? ob.occurrence.paidAt.slice(0, 16)
+                    : `${yearMonth}-${String(ob.dueDay || 1).padStart(2, '0')}T09:00`;
+
+                return (
+                  <form
+                    key={`edit-ob-${ob.id}`}
+                    className="p-3.5 rounded-lg border border-slate-200 bg-[#FAF9F6]/60 space-y-2.5 text-xs"
+                    onSubmit={async (e) => {
+                      e.preventDefault();
+                      const fd = new FormData(e.currentTarget);
+                      const nextName = String(fd.get('name') || ob.name).trim();
+                      const nextManageUrl = String(fd.get('manageUrl') || '').trim() || null;
+                      const nextPortalUrl = String(fd.get('portalUrl') || '').trim() || null;
+                      const nextRef = String(fd.get('referenceNumber') || '').trim() || null;
+                      const nextNotes = String(fd.get('notes') || '').trim() || null;
+                      const occDt = String(fd.get('occurrencePaidAt') || '').trim();
+
+                      await apiFetch('/api/obligations', {
+                        method: 'POST',
+                        body: JSON.stringify({
+                          id: ob.id,
+                          workspaceId: fd.get('workspaceId') || ob.workspaceId,
+                          potId: fd.get('potId') || null,
+                          name: nextName,
+                          amountMinor: Math.round(Number(fd.get('amountMajor') || 0) * 100),
+                          currency: fd.get('currency') || ob.currency,
+                          cadence: fd.get('cadence') || ob.cadence,
+                          intervalMonths: ob.intervalMonths,
+                          nextDueDate: fd.get('nextDueDate') || ob.nextDueDate,
+                          preservedMinor: Math.round(Number(fd.get('preservedMajor') || 0) * 100),
+                          autoPreserve: fd.get('autoPreserve') === 'on',
+                          splitMode: ob.splitMode,
+                          waderaSplitBp: ob.waderaSplitBp,
+                          manageUrl: nextManageUrl,
+                          portalUrl: nextPortalUrl,
+                          referenceNumber: nextRef,
+                          notes: nextNotes,
+                          isActive: true,
+                          ...(ob.isPaidThisMonth && occDt
+                            ? {
+                                occurrenceYearMonth: yearMonth,
+                                occurrencePaidAt: occDt.length === 16 ? `${occDt}:00Z` : occDt,
+                              }
+                            : {}),
+                        }),
+                      });
+                      setDrawer((prev) =>
+                        prev
+                          ? {
+                              ...prev,
+                              title: nextName,
+                              manageUrl: nextManageUrl,
+                              portalUrl: nextPortalUrl,
+                              referenceNumber: nextRef,
+                              notes: nextNotes,
+                            }
+                          : null
+                      );
+                      setDrawerSavedMsg(t.savedNotice);
+                      setTimeout(() => setDrawerSavedMsg(null), 3000);
+                      await reloadAll();
+                    }}
+                  >
+                    <div className="text-[11px] font-mono-num uppercase text-slate-600 font-semibold flex items-center gap-1.5">
+                      <Pencil className="w-3 h-3 text-teal-700" /> {t.editDetailsTitle}
+                    </div>
+                    <label className="block space-y-1">
+                      <span className="text-slate-600">{t.renameLabel}</span>
+                      <input
+                        required
+                        name="name"
+                        defaultValue={ob.name}
+                        className="w-full border border-slate-200 bg-white rounded px-2.5 py-1.5"
+                      />
+                    </label>
+                    <div className="grid grid-cols-2 gap-2">
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Workspace</span>
+                        <select
+                          name="workspaceId"
+                          defaultValue={ob.workspaceId}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
+                        >
+                          {writableWorkspaces.map((w) => (
+                            <option key={w.id} value={w.id}>
+                              {w.name}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-slate-600">{t.colPot}</span>
+                        <select
+                          name="potId"
+                          defaultValue={ob.potId || ''}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
+                        >
+                          <option value="">— Unassigned —</option>
+                          {budget.pots.map((p) => (
+                            <option key={p.id} value={p.id}>
+                              {potBreadcrumbs.get(p.id)?.pathString || p.name}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+                    <div className="grid grid-cols-3 gap-2">
+                      <label className="space-y-1">
+                        <span className="text-slate-600">{t.amountValueLabel}</span>
+                        <input
+                          required
+                          type="number"
+                          step="0.01"
+                          name="amountMajor"
+                          defaultValue={(ob.amountMinor / 100).toFixed(2)}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
+                        />
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Currency</span>
+                        <select
+                          name="currency"
+                          defaultValue={ob.currency}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
+                        >
+                          {(['GBP', 'EUR', 'PLN', 'USD', 'CHF'] as CurrencyCode[]).map((c) => (
+                            <option key={c} value={c}>
+                              {c}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Cadence</span>
+                        <select
+                          name="cadence"
+                          defaultValue={ob.cadence}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
+                        >
+                          <option value="monthly">Monthly</option>
+                          <option value="annual">Yearly (12m)</option>
+                          <option value="quarterly">Quarterly (3m)</option>
+                          <option value="biannual">Every 6m</option>
+                          <option value="once">One-Time</option>
+                        </select>
+                      </label>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Next Due Date</span>
+                        <input
+                          required
+                          type="date"
+                          name="nextDueDate"
+                          defaultValue={ob.nextDueDate}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
+                        />
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-slate-600">{t.sinkingSavedLabel}</span>
+                        <input
+                          type="number"
+                          step="0.01"
+                          name="preservedMajor"
+                          defaultValue={(ob.preservedMinor / 100).toFixed(2)}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
+                        />
+                      </label>
+                    </div>
+                    {ob.isPaidThisMonth && (
+                      <label className="block space-y-1">
+                        <span className="text-emerald-800 font-medium">{t.completedTimestampLabel}</span>
+                        <input
+                          type="datetime-local"
+                          name="occurrencePaidAt"
+                          defaultValue={occDateTimeDefault}
+                          className="w-full border border-emerald-300 bg-white rounded px-2 py-1.5 font-mono-num"
+                        />
+                      </label>
+                    )}
+                    <label className="flex items-center gap-2">
+                      <input type="checkbox" name="autoPreserve" defaultChecked={ob.autoPreserve} />
+                      <span className="text-slate-600">{t.sinkingBadge}</span>
+                    </label>
+                    <label className="block space-y-1">
+                      <span className="text-slate-600">{t.manageUrlLabel}</span>
+                      <input
+                        type="url"
+                        name="manageUrl"
+                        defaultValue={ob.manageUrl || ''}
+                        placeholder="https://..."
+                        className="w-full border border-slate-200 bg-white rounded px-2.5 py-1.5"
+                      />
+                    </label>
+                    <div className="grid grid-cols-2 gap-2">
+                      <label className="space-y-1">
+                        <span className="text-slate-600">{t.portalUrlLabel}</span>
+                        <input
+                          type="url"
+                          name="portalUrl"
+                          defaultValue={ob.portalUrl || ''}
+                          placeholder="https://..."
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
+                        />
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-slate-600">{t.refPolicyInputLabel}</span>
+                        <input
+                          name="referenceNumber"
+                          defaultValue={ob.referenceNumber || ''}
+                          placeholder="POL-12345"
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
+                        />
+                      </label>
+                    </div>
+                    <label className="block space-y-1">
+                      <span className="text-slate-600">{t.notesInputLabel}</span>
+                      <input
+                        name="notes"
+                        defaultValue={ob.notes || ''}
+                        className="w-full border border-slate-200 bg-white rounded px-2.5 py-1.5"
+                      />
+                    </label>
+                    <button
+                      type="submit"
+                      className="w-full py-2 rounded bg-slate-900 text-white font-medium hover:bg-slate-800 transition"
+                    >
+                      {t.saveChangesBtn}
+                    </button>
+                  </form>
+                );
+              }
+
+              if (drawer.entityType === 'expense') {
+                const exp = budget.expenses.find((e) => e.id === drawer.entityId);
+                if (!exp) return null;
+                const defaultTime =
+                  exp.createdAt && exp.createdAt.length >= 16 && /^\d{2}:\d{2}/.test(exp.createdAt.slice(11, 16))
+                    ? exp.createdAt.slice(11, 16)
+                    : '12:00';
+
+                return (
+                  <form
+                    key={`edit-exp-${exp.id}`}
+                    className="p-3.5 rounded-lg border border-slate-200 bg-[#FAF9F6]/60 space-y-2.5 text-xs"
+                    onSubmit={async (e) => {
+                      e.preventDefault();
+                      const fd = new FormData(e.currentTarget);
+                      const nextMerchant = String(fd.get('merchant') || exp.merchant).trim();
+                      const nextDesc = String(fd.get('description') || '').trim();
+                      const nextDate = String(fd.get('spentDate') || exp.spentDate);
+                      const nextTime = String(fd.get('spentTime') || defaultTime);
+                      const nextPortal = String(fd.get('portalUrl') || '').trim() || null;
+
+                      await apiFetch('/api/expenses', {
+                        method: 'POST',
+                        body: JSON.stringify({
+                          id: exp.id,
+                          workspaceId: fd.get('workspaceId') || exp.workspaceId,
+                          potId: fd.get('potId') || null,
+                          merchant: nextMerchant,
+                          description: nextDesc,
+                          amountMinor: Math.round(Number(fd.get('amountMajor') || 0) * 100),
+                          currency: fd.get('currency') || exp.currency,
+                          spentDate: nextDate,
+                          spentTime: nextTime,
+                          portalUrl: nextPortal,
+                          source: exp.source,
+                          items: exp.items,
+                        }),
+                      });
+                      setDrawer((prev) =>
+                        prev
+                          ? {
+                              ...prev,
+                              title: nextMerchant,
+                              subtitle: `${nextDate} ${nextTime}${nextDesc ? ` · ${nextDesc}` : ''}`,
+                              portalUrl: nextPortal,
+                            }
+                          : null
+                      );
+                      setDrawerSavedMsg(t.savedNotice);
+                      setTimeout(() => setDrawerSavedMsg(null), 3000);
+                      await reloadAll();
+                    }}
+                  >
+                    <div className="text-[11px] font-mono-num uppercase text-slate-600 font-semibold flex items-center gap-1.5">
+                      <Pencil className="w-3 h-3 text-teal-700" /> {t.editDetailsTitle}
+                    </div>
+                    <label className="block space-y-1">
+                      <span className="text-slate-600">{t.renameLabel}</span>
+                      <input
+                        required
+                        name="merchant"
+                        defaultValue={exp.merchant}
+                        className="w-full border border-slate-200 bg-white rounded px-2.5 py-1.5"
+                      />
+                    </label>
+                    <div className="grid grid-cols-2 gap-2">
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Workspace</span>
+                        <select
+                          name="workspaceId"
+                          defaultValue={exp.workspaceId}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
+                        >
+                          {writableWorkspaces.map((w) => (
+                            <option key={w.id} value={w.id}>
+                              {w.name}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-slate-600">{t.colPot}</span>
+                        <select
+                          name="potId"
+                          defaultValue={exp.potId || ''}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
+                        >
+                          <option value="">— Unassigned —</option>
+                          {budget.pots.map((p) => (
+                            <option key={p.id} value={p.id}>
+                              {potBreadcrumbs.get(p.id)?.pathString || p.name}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <label className="space-y-1">
+                        <span className="text-slate-600">{t.amountValueLabel}</span>
+                        <input
+                          required
+                          type="number"
+                          step="0.01"
+                          name="amountMajor"
+                          defaultValue={(exp.amountMinor / 100).toFixed(2)}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
+                        />
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Currency</span>
+                        <select
+                          name="currency"
+                          defaultValue={exp.currency}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
+                        >
+                          {(['GBP', 'EUR', 'PLN', 'USD', 'CHF'] as CurrencyCode[]).map((c) => (
+                            <option key={c} value={c}>
+                              {c}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Date</span>
+                        <input
+                          required
+                          type="date"
+                          name="spentDate"
+                          defaultValue={exp.spentDate}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
+                        />
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Time (HH:mm)</span>
+                        <input
+                          type="time"
+                          name="spentTime"
+                          defaultValue={defaultTime}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
+                        />
+                      </label>
+                    </div>
+                    <label className="block space-y-1">
+                      <span className="text-slate-600">{t.notesInputLabel}</span>
+                      <input
+                        name="description"
+                        defaultValue={exp.description || ''}
+                        className="w-full border border-slate-200 bg-white rounded px-2.5 py-1.5"
+                      />
+                    </label>
+                    <label className="block space-y-1">
+                      <span className="text-slate-600">{t.portalUrlLabel}</span>
+                      <input
+                        type="url"
+                        name="portalUrl"
+                        defaultValue={exp.portalUrl || ''}
+                        placeholder="https://..."
+                        className="w-full border border-slate-200 bg-white rounded px-2.5 py-1.5"
+                      />
+                    </label>
+                    <button
+                      type="submit"
+                      className="w-full py-2 rounded bg-slate-900 text-white font-medium hover:bg-slate-800 transition"
+                    >
+                      {t.saveChangesBtn}
+                    </button>
+                  </form>
+                );
+              }
+
+              if (drawer.entityType === 'pot') {
+                const pot = budget.pots.find((p) => p.id === drawer.entityId);
+                if (!pot) return null;
+                const ownSubtree = collectSubtreePotIds(pot.id, budget.pots);
+
+                return (
+                  <form
+                    key={`edit-pot-${pot.id}`}
+                    className="p-3.5 rounded-lg border border-slate-200 bg-[#FAF9F6]/60 space-y-2.5 text-xs"
+                    onSubmit={async (e) => {
+                      e.preventDefault();
+                      const fd = new FormData(e.currentTarget);
+                      const nextName = String(fd.get('name') || pot.name).trim();
+                      const estMajor = Number(fd.get('monthlyEstimateMajor') || 0);
+
+                      await apiFetch('/api/pots', {
+                        method: 'POST',
+                        body: JSON.stringify({
+                          id: pot.id,
+                          workspaceId: fd.get('workspaceId') || pot.workspaceId,
+                          parentId: fd.get('parentId') || null,
+                          name: nextName,
+                          color: fd.get('color') || pot.color,
+                          envelopeMode: estMajor > 0,
+                          monthlyEstimateMinor: Math.round(estMajor * 100),
+                          currency: fd.get('currency') || pot.currency,
+                          sortOrder: pot.sortOrder,
+                        }),
+                      });
+                      setDrawer((prev) => (prev ? { ...prev, title: nextName } : null));
+                      setDrawerSavedMsg(t.savedNotice);
+                      setTimeout(() => setDrawerSavedMsg(null), 3000);
+                      await reloadAll();
+                    }}
+                  >
+                    <div className="text-[11px] font-mono-num uppercase text-slate-600 font-semibold flex items-center gap-1.5">
+                      <Pencil className="w-3 h-3 text-teal-700" /> {t.editDetailsTitle}
+                    </div>
+                    <div className="grid grid-cols-3 gap-2">
+                      <label className="col-span-2 space-y-1">
+                        <span className="text-slate-600">{t.renameLabel}</span>
+                        <input
+                          required
+                          name="name"
+                          defaultValue={pot.name}
+                          className="w-full border border-slate-200 bg-white rounded px-2.5 py-1.5"
+                        />
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Color</span>
+                        <input
+                          type="color"
+                          name="color"
+                          defaultValue={pot.color || '#2E6F7E'}
+                          className="w-full h-8 border border-slate-200 bg-white rounded"
+                        />
+                      </label>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Workspace</span>
+                        <select
+                          name="workspaceId"
+                          defaultValue={pot.workspaceId}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
+                        >
+                          {writableWorkspaces.map((w) => (
+                            <option key={w.id} value={w.id}>
+                              {w.name}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Parent Pot</span>
+                        <select
+                          name="parentId"
+                          defaultValue={pot.parentId || ''}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
+                        >
+                          <option value="">— Top-Level Pot —</option>
+                          {budget.pots
+                            .filter((p) => !ownSubtree.has(p.id))
+                            .map((p) => (
+                              <option key={p.id} value={p.id}>
+                                {potBreadcrumbs.get(p.id)?.pathString || p.name}
+                              </option>
+                            ))}
+                        </select>
+                      </label>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Rough Envelope (0 = container)</span>
+                        <input
+                          type="number"
+                          step="0.01"
+                          name="monthlyEstimateMajor"
+                          defaultValue={(pot.monthlyEstimateMinor / 100).toFixed(2)}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
+                        />
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Currency</span>
+                        <select
+                          name="currency"
+                          defaultValue={pot.currency}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
+                        >
+                          {(['GBP', 'EUR', 'PLN', 'USD', 'CHF'] as CurrencyCode[]).map((c) => (
+                            <option key={c} value={c}>
+                              {c}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+                    <button
+                      type="submit"
+                      className="w-full py-2 rounded bg-slate-900 text-white font-medium hover:bg-slate-800 transition"
+                    >
+                      {t.saveChangesBtn}
+                    </button>
+                  </form>
+                );
+              }
+
+              if (drawer.entityType === 'income') {
+                const inc =
+                  budget.allIncomes.find((i) => i.id === drawer.entityId) ||
+                  wealth.salaryHistory.find((i) => i.id === drawer.entityId);
+                if (!inc) return null;
+
+                return (
+                  <form
+                    key={`edit-inc-${inc.id}`}
+                    className="p-3.5 rounded-lg border border-slate-200 bg-[#FAF9F6]/60 space-y-2.5 text-xs"
+                    onSubmit={async (e) => {
+                      e.preventDefault();
+                      const fd = new FormData(e.currentTarget);
+                      const nextName = String(fd.get('name') || inc.name).trim();
+                      const nextPortal = String(fd.get('portalUrl') || '').trim() || null;
+                      const nextNotes = String(fd.get('notes') || '').trim() || null;
+
+                      await apiFetch('/api/incomes', {
+                        method: 'POST',
+                        body: JSON.stringify({
+                          id: inc.id,
+                          workspaceId: fd.get('workspaceId') || inc.workspaceId,
+                          name: nextName,
+                          sourceKind: inc.sourceKind,
+                          amountMinor: Math.round(Number(fd.get('amountMajor') || 0) * 100),
+                          currency: fd.get('currency') || inc.currency,
+                          cadence: fd.get('cadence') || inc.cadence,
+                          paydayDay: Number(fd.get('paydayDay') || inc.paydayDay),
+                          effectiveFrom: fd.get('effectiveFrom') || inc.effectiveFrom,
+                          effectiveTo: fd.get('effectiveTo') || null,
+                          isActive: true,
+                          portalUrl: nextPortal,
+                          notes: nextNotes,
+                        }),
+                      });
+                      setDrawer((prev) =>
+                        prev ? { ...prev, title: nextName, portalUrl: nextPortal, notes: nextNotes } : null
+                      );
+                      setDrawerSavedMsg(t.savedNotice);
+                      setTimeout(() => setDrawerSavedMsg(null), 3000);
+                      await reloadAll();
+                    }}
+                  >
+                    <div className="text-[11px] font-mono-num uppercase text-slate-600 font-semibold flex items-center gap-1.5">
+                      <Pencil className="w-3 h-3 text-teal-700" /> {t.editDetailsTitle}
+                    </div>
+                    <label className="block space-y-1">
+                      <span className="text-slate-600">{t.renameLabel}</span>
+                      <input
+                        required
+                        name="name"
+                        defaultValue={inc.name}
+                        className="w-full border border-slate-200 bg-white rounded px-2.5 py-1.5"
+                      />
+                    </label>
+                    <div className="grid grid-cols-2 gap-2">
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Workspace</span>
+                        <select
+                          name="workspaceId"
+                          defaultValue={inc.workspaceId}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
+                        >
+                          {writableWorkspaces.map((w) => (
+                            <option key={w.id} value={w.id}>
+                              {w.name}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Payday (1-28)</span>
+                        <input
+                          type="number"
+                          min={1}
+                          max={28}
+                          name="paydayDay"
+                          defaultValue={inc.paydayDay}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
+                        />
+                      </label>
+                    </div>
+                    <div className="grid grid-cols-3 gap-2">
+                      <label className="space-y-1">
+                        <span className="text-slate-600">{t.amountValueLabel}</span>
+                        <input
+                          required
+                          type="number"
+                          step="0.01"
+                          name="amountMajor"
+                          defaultValue={(inc.amountMinor / 100).toFixed(2)}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
+                        />
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Currency</span>
+                        <select
+                          name="currency"
+                          defaultValue={inc.currency}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
+                        >
+                          {(['GBP', 'EUR', 'PLN', 'USD', 'CHF'] as CurrencyCode[]).map((c) => (
+                            <option key={c} value={c}>
+                              {c}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Cadence</span>
+                        <select
+                          name="cadence"
+                          defaultValue={inc.cadence}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
+                        >
+                          <option value="monthly">Monthly</option>
+                          <option value="annual">Annual</option>
+                        </select>
+                      </label>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Effective From</span>
+                        <input
+                          required
+                          type="date"
+                          name="effectiveFrom"
+                          defaultValue={inc.effectiveFrom}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
+                        />
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Effective To</span>
+                        <input
+                          type="date"
+                          name="effectiveTo"
+                          defaultValue={inc.effectiveTo || ''}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
+                        />
+                      </label>
+                    </div>
+                    <label className="block space-y-1">
+                      <span className="text-slate-600">{t.portalUrlLabel}</span>
+                      <input
+                        type="url"
+                        name="portalUrl"
+                        defaultValue={inc.portalUrl || ''}
+                        placeholder="https://..."
+                        className="w-full border border-slate-200 bg-white rounded px-2.5 py-1.5"
+                      />
+                    </label>
+                    <label className="block space-y-1">
+                      <span className="text-slate-600">{t.notesInputLabel}</span>
+                      <input
+                        name="notes"
+                        defaultValue={inc.notes || ''}
+                        className="w-full border border-slate-200 bg-white rounded px-2.5 py-1.5"
+                      />
+                    </label>
+                    <button
+                      type="submit"
+                      className="w-full py-2 rounded bg-slate-900 text-white font-medium hover:bg-slate-800 transition"
+                    >
+                      {t.saveChangesBtn}
+                    </button>
+                  </form>
+                );
+              }
+
+              if (drawer.entityType === 'account') {
+                const acc = budget.accounts.find((a) => a.id === drawer.entityId);
+                if (!acc) return null;
+
+                return (
+                  <form
+                    key={`edit-acc-${acc.id}`}
+                    className="p-3.5 rounded-lg border border-slate-200 bg-[#FAF9F6]/60 space-y-2.5 text-xs"
+                    onSubmit={async (e) => {
+                      e.preventDefault();
+                      const fd = new FormData(e.currentTarget);
+                      const nextName = String(fd.get('name') || acc.name).trim();
+                      const nextInst = String(fd.get('institution') || '').trim();
+                      const nextPortal = String(fd.get('portalUrl') || '').trim() || null;
+                      const nextNotes = String(fd.get('notes') || '').trim() || null;
+
+                      await apiFetch('/api/accounts', {
+                        method: 'POST',
+                        body: JSON.stringify({
+                          id: acc.id,
+                          workspaceId: fd.get('workspaceId') || acc.workspaceId,
+                          name: nextName,
+                          institution: nextInst,
+                          balanceMinor: Math.round(Number(fd.get('balanceMajor') || 0) * 100),
+                          currency: fd.get('currency') || acc.currency,
+                          isPrimaryRunway: fd.get('isPrimaryRunway') === 'on',
+                          portalUrl: nextPortal,
+                          notes: nextNotes,
+                        }),
+                      });
+                      setDrawer((prev) =>
+                        prev
+                          ? { ...prev, title: nextName, subtitle: nextInst, portalUrl: nextPortal, notes: nextNotes }
+                          : null
+                      );
+                      setDrawerSavedMsg(t.savedNotice);
+                      setTimeout(() => setDrawerSavedMsg(null), 3000);
+                      await reloadAll();
+                    }}
+                  >
+                    <div className="text-[11px] font-mono-num uppercase text-slate-600 font-semibold flex items-center gap-1.5">
+                      <Pencil className="w-3 h-3 text-teal-700" /> {t.editDetailsTitle}
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <label className="space-y-1">
+                        <span className="text-slate-600">{t.renameLabel}</span>
+                        <input
+                          required
+                          name="name"
+                          defaultValue={acc.name}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
+                        />
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Institution</span>
+                        <input
+                          name="institution"
+                          defaultValue={acc.institution}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
+                        />
+                      </label>
+                    </div>
+                    <div className="grid grid-cols-3 gap-2">
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Workspace</span>
+                        <select
+                          name="workspaceId"
+                          defaultValue={acc.workspaceId}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
+                        >
+                          {writableWorkspaces.map((w) => (
+                            <option key={w.id} value={w.id}>
+                              {w.name}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Balance</span>
+                        <input
+                          required
+                          type="number"
+                          step="0.01"
+                          name="balanceMajor"
+                          defaultValue={(acc.balanceMinor / 100).toFixed(2)}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
+                        />
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Currency</span>
+                        <select
+                          name="currency"
+                          defaultValue={acc.currency}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
+                        >
+                          {(['GBP', 'EUR', 'PLN', 'USD', 'CHF'] as CurrencyCode[]).map((c) => (
+                            <option key={c} value={c}>
+                              {c}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+                    <label className="flex items-center gap-2">
+                      <input type="checkbox" name="isPrimaryRunway" defaultChecked={acc.isPrimaryRunway} />
+                      <span className="text-slate-600">Include in monthly sufficiency runway check</span>
+                    </label>
+                    <label className="block space-y-1">
+                      <span className="text-slate-600">{t.portalUrlLabel}</span>
+                      <input
+                        type="url"
+                        name="portalUrl"
+                        defaultValue={acc.portalUrl || ''}
+                        placeholder="https://..."
+                        className="w-full border border-slate-200 bg-white rounded px-2.5 py-1.5"
+                      />
+                    </label>
+                    <button
+                      type="submit"
+                      className="w-full py-2 rounded bg-slate-900 text-white font-medium hover:bg-slate-800 transition"
+                    >
+                      {t.saveChangesBtn}
+                    </button>
+                  </form>
+                );
+              }
+
+              if (drawer.entityType === 'asset') {
+                const ast = wealth.assets.find((a) => a.id === drawer.entityId);
+                if (!ast) return null;
+
+                return (
+                  <form
+                    key={`edit-ast-${ast.id}`}
+                    className="p-3.5 rounded-lg border border-slate-200 bg-[#FAF9F6]/60 space-y-2.5 text-xs"
+                    onSubmit={async (e) => {
+                      e.preventDefault();
+                      const fd = new FormData(e.currentTarget);
+                      const nextName = String(fd.get('name') || ast.name).trim();
+                      const nextManage = String(fd.get('manageUrl') || '').trim() || null;
+                      const nextPortal = String(fd.get('portalUrl') || '').trim() || null;
+                      const nextRef = String(fd.get('referenceNumber') || '').trim() || null;
+                      const nextNotes = String(fd.get('notes') || '').trim() || null;
+
+                      await apiFetch('/api/assets', {
+                        method: 'POST',
+                        body: JSON.stringify({
+                          id: ast.id,
+                          workspaceId: fd.get('workspaceId') || ast.workspaceId,
+                          name: nextName,
+                          assetClass: fd.get('assetClass') || ast.assetClass,
+                          purchaseDate: ast.purchaseDate,
+                          purchasePriceMinor: Math.round(Number(fd.get('purchasePriceMajor') || 0) * 100),
+                          currentValueMinor: Math.round(Number(fd.get('currentValueMajor') || 0) * 100),
+                          currency: fd.get('currency') || ast.currency,
+                          curveModel: ast.curveModel,
+                          annualRateBp: Math.round(Number(fd.get('annualRatePct') || 0) * 100),
+                          residualFloorMinor: Math.round(Number(fd.get('residualFloorMajor') || 0) * 100),
+                          manageUrl: nextManage,
+                          portalUrl: nextPortal,
+                          referenceNumber: nextRef,
+                          notes: nextNotes,
+                        }),
+                      });
+                      setDrawer((prev) =>
+                        prev
+                          ? {
+                              ...prev,
+                              title: nextName,
+                              manageUrl: nextManage,
+                              portalUrl: nextPortal,
+                              referenceNumber: nextRef,
+                              notes: nextNotes,
+                            }
+                          : null
+                      );
+                      setDrawerSavedMsg(t.savedNotice);
+                      setTimeout(() => setDrawerSavedMsg(null), 3000);
+                      await reloadAll();
+                    }}
+                  >
+                    <div className="text-[11px] font-mono-num uppercase text-slate-600 font-semibold flex items-center gap-1.5">
+                      <Pencil className="w-3 h-3 text-teal-700" /> {t.editDetailsTitle}
+                    </div>
+                    <label className="block space-y-1">
+                      <span className="text-slate-600">{t.renameLabel}</span>
+                      <input
+                        required
+                        name="name"
+                        defaultValue={ast.name}
+                        className="w-full border border-slate-200 bg-white rounded px-2.5 py-1.5"
+                      />
+                    </label>
+                    <div className="grid grid-cols-2 gap-2">
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Workspace</span>
+                        <select
+                          name="workspaceId"
+                          defaultValue={ast.workspaceId}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
+                        >
+                          {writableWorkspaces.map((w) => (
+                            <option key={w.id} value={w.id}>
+                              {w.name}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Category</span>
+                        <select
+                          name="assetClass"
+                          defaultValue={ast.assetClass}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
+                        >
+                          <option value="property">Property / House</option>
+                          <option value="vehicle">Car / Motorcycle</option>
+                          <option value="belonging">Belonging / Gear</option>
+                          <option value="investment">Investment / ISA</option>
+                        </select>
+                      </label>
+                    </div>
+                    <div className="grid grid-cols-3 gap-2">
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Current Value</span>
+                        <input
+                          required
+                          type="number"
+                          step="0.01"
+                          name="currentValueMajor"
+                          defaultValue={(ast.currentValueMinor / 100).toFixed(2)}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
+                        />
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Currency</span>
+                        <select
+                          name="currency"
+                          defaultValue={ast.currency}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
+                        >
+                          {(['GBP', 'EUR', 'PLN', 'USD', 'CHF'] as CurrencyCode[]).map((c) => (
+                            <option key={c} value={c}>
+                              {c}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Annual %</span>
+                        <input
+                          required
+                          type="number"
+                          step="0.1"
+                          name="annualRatePct"
+                          defaultValue={(ast.annualRateBp / 100).toFixed(1)}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
+                        />
+                      </label>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Purchase Price</span>
+                        <input
+                          type="number"
+                          step="0.01"
+                          name="purchasePriceMajor"
+                          defaultValue={(ast.purchasePriceMinor / 100).toFixed(2)}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
+                        />
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Residual Floor</span>
+                        <input
+                          type="number"
+                          step="0.01"
+                          name="residualFloorMajor"
+                          defaultValue={(ast.residualFloorMinor / 100).toFixed(2)}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
+                        />
+                      </label>
+                    </div>
+                    <label className="block space-y-1">
+                      <span className="text-slate-600">{t.manageUrlLabel}</span>
+                      <input
+                        type="url"
+                        name="manageUrl"
+                        defaultValue={ast.manageUrl || ''}
+                        placeholder="https://..."
+                        className="w-full border border-slate-200 bg-white rounded px-2.5 py-1.5"
+                      />
+                    </label>
+                    <div className="grid grid-cols-2 gap-2">
+                      <label className="space-y-1">
+                        <span className="text-slate-600">{t.portalUrlLabel}</span>
+                        <input
+                          type="url"
+                          name="portalUrl"
+                          defaultValue={ast.portalUrl || ''}
+                          placeholder="https://..."
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
+                        />
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-slate-600">{t.refPolicyInputLabel}</span>
+                        <input
+                          name="referenceNumber"
+                          defaultValue={ast.referenceNumber || ''}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
+                        />
+                      </label>
+                    </div>
+                    <label className="block space-y-1">
+                      <span className="text-slate-600">{t.notesInputLabel}</span>
+                      <input
+                        name="notes"
+                        defaultValue={ast.notes || ''}
+                        className="w-full border border-slate-200 bg-white rounded px-2.5 py-1.5"
+                      />
+                    </label>
+                    <button
+                      type="submit"
+                      className="w-full py-2 rounded bg-slate-900 text-white font-medium hover:bg-slate-800 transition"
+                    >
+                      {t.saveChangesBtn}
+                    </button>
+                  </form>
+                );
+              }
+
+              if (drawer.entityType === 'liability') {
+                const lb = wealth.liabilities.find((l) => l.id === drawer.entityId);
+                if (!lb) return null;
+
+                return (
+                  <form
+                    key={`edit-lb-${lb.id}`}
+                    className="p-3.5 rounded-lg border border-slate-200 bg-[#FAF9F6]/60 space-y-2.5 text-xs"
+                    onSubmit={async (e) => {
+                      e.preventDefault();
+                      const fd = new FormData(e.currentTarget);
+                      const nextName = String(fd.get('name') || lb.name).trim();
+                      const nextPortal = String(fd.get('portalUrl') || '').trim() || null;
+                      const nextRef = String(fd.get('referenceNumber') || '').trim() || null;
+                      const nextNotes = String(fd.get('notes') || '').trim() || null;
+
+                      await apiFetch('/api/liabilities', {
+                        method: 'POST',
+                        body: JSON.stringify({
+                          id: lb.id,
+                          workspaceId: fd.get('workspaceId') || lb.workspaceId,
+                          linkedAssetId: lb.linkedAssetId,
+                          name: nextName,
+                          kind: fd.get('kind') || lb.kind,
+                          balanceMinor: Math.round(Number(fd.get('balanceMajor') || 0) * 100),
+                          aprBp: Math.round(Number(fd.get('aprPct') || 0) * 100),
+                          monthlyPaymentMinor: Math.round(Number(fd.get('monthlyMajor') || 0) * 100),
+                          currency: fd.get('currency') || lb.currency,
+                          endDate: lb.endDate,
+                          portalUrl: nextPortal,
+                          referenceNumber: nextRef,
+                          notes: nextNotes,
+                        }),
+                      });
+                      setDrawer((prev) =>
+                        prev
+                          ? {
+                              ...prev,
+                              title: nextName,
+                              portalUrl: nextPortal,
+                              referenceNumber: nextRef,
+                              notes: nextNotes,
+                            }
+                          : null
+                      );
+                      setDrawerSavedMsg(t.savedNotice);
+                      setTimeout(() => setDrawerSavedMsg(null), 3000);
+                      await reloadAll();
+                    }}
+                  >
+                    <div className="text-[11px] font-mono-num uppercase text-slate-600 font-semibold flex items-center gap-1.5">
+                      <Pencil className="w-3 h-3 text-teal-700" /> {t.editDetailsTitle}
+                    </div>
+                    <label className="block space-y-1">
+                      <span className="text-slate-600">{t.renameLabel}</span>
+                      <input
+                        required
+                        name="name"
+                        defaultValue={lb.name}
+                        className="w-full border border-slate-200 bg-white rounded px-2.5 py-1.5"
+                      />
+                    </label>
+                    <div className="grid grid-cols-2 gap-2">
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Workspace</span>
+                        <select
+                          name="workspaceId"
+                          defaultValue={lb.workspaceId}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
+                        >
+                          {writableWorkspaces.map((w) => (
+                            <option key={w.id} value={w.id}>
+                              {w.name}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Type</span>
+                        <select
+                          name="kind"
+                          defaultValue={lb.kind}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
+                        >
+                          <option value="mortgage">Mortgage</option>
+                          <option value="loan">Loan</option>
+                          <option value="credit_card">Credit Card</option>
+                        </select>
+                      </label>
+                    </div>
+                    <div className="grid grid-cols-3 gap-2">
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Balance</span>
+                        <input
+                          required
+                          type="number"
+                          step="0.01"
+                          name="balanceMajor"
+                          defaultValue={(lb.balanceMinor / 100).toFixed(2)}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
+                        />
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-slate-600">APR %</span>
+                        <input
+                          required
+                          type="number"
+                          step="0.01"
+                          name="aprPct"
+                          defaultValue={(lb.aprBp / 100).toFixed(2)}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
+                        />
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Monthly</span>
+                        <input
+                          required
+                          type="number"
+                          step="0.01"
+                          name="monthlyMajor"
+                          defaultValue={(lb.monthlyPaymentMinor / 100).toFixed(2)}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
+                        />
+                      </label>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <label className="space-y-1">
+                        <span className="text-slate-600">{t.portalUrlLabel}</span>
+                        <input
+                          type="url"
+                          name="portalUrl"
+                          defaultValue={lb.portalUrl || ''}
+                          placeholder="https://..."
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
+                        />
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-slate-600">{t.refPolicyInputLabel}</span>
+                        <input
+                          name="referenceNumber"
+                          defaultValue={lb.referenceNumber || ''}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
+                        />
+                      </label>
+                    </div>
+                    <label className="block space-y-1">
+                      <span className="text-slate-600">{t.notesInputLabel}</span>
+                      <input
+                        name="notes"
+                        defaultValue={lb.notes || ''}
+                        className="w-full border border-slate-200 bg-white rounded px-2.5 py-1.5"
+                      />
+                    </label>
+                    <button
+                      type="submit"
+                      className="w-full py-2 rounded bg-slate-900 text-white font-medium hover:bg-slate-800 transition"
+                    >
+                      {t.saveChangesBtn}
+                    </button>
+                  </form>
+                );
+              }
+
+              return null;
+            })()}
 
             {drawer.items && drawer.items.length > 0 && (
               <div className="space-y-1.5">
@@ -2611,6 +4116,10 @@ export const App: React.FC = () => {
                       ? `/api/assets/${drawer.entityId}`
                       : drawer.entityType === 'pot'
                       ? `/api/pots/${drawer.entityId}`
+                      : drawer.entityType === 'income'
+                      ? `/api/incomes/${drawer.entityId}`
+                      : drawer.entityType === 'account'
+                      ? `/api/accounts/${drawer.entityId}`
                       : `/api/liabilities/${drawer.entityId}`;
                   await apiFetch(endpoint, { method: 'DELETE' });
                   setDrawer(null);
