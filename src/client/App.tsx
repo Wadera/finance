@@ -500,6 +500,13 @@ export const App: React.FC = () => {
     }
   };
 
+  const allAvailableAccounts = budget.allAccounts && budget.allAccounts.length > 0 ? budget.allAccounts : budget.accounts;
+  const defaultAccountForWs = (wsId: string) =>
+    allAvailableAccounts.find((a) => a.workspaceId === wsId && a.isPrimaryRunway)?.id ||
+    allAvailableAccounts.find((a) => a.workspaceId === wsId)?.id ||
+    allAvailableAccounts[0]?.id ||
+    '';
+
   const openEntityDrawer = (
     entityType: DrawerSubject['entityType'],
     entityId: string
@@ -564,7 +571,7 @@ export const App: React.FC = () => {
         });
       }
     } else if (entityType === 'account') {
-      const acc = budget.accounts.find((a) => a.id === entityId);
+      const acc = allAvailableAccounts.find((a) => a.id === entityId);
       if (acc) {
         setDrawer({
           entityType: 'account',
@@ -854,6 +861,53 @@ export const App: React.FC = () => {
               </div>
             </div>
 
+            {/* Live Bank & Runway Accounts Bar (Click Edit on any account to rename or adjust balance) */}
+            <section className="bg-white border border-slate-200 rounded-lg p-3.5">
+              <div className="flex flex-wrap items-center justify-between gap-2 mb-2.5">
+                <div className="text-[11px] font-mono-num uppercase tracking-wider text-slate-500 font-semibold flex items-center gap-1.5">
+                  <Landmark className="w-3.5 h-3.5 text-teal-700" /> {t.bankAccountsTitle}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setModal({ kind: 'account' })}
+                  className="inline-flex items-center gap-1 px-2 py-1 rounded border border-slate-200 bg-white text-[11px] font-medium text-slate-700 hover:bg-slate-50"
+                >
+                  <Plus className="w-3 h-3" /> {t.addAccountBtn}
+                </button>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5">
+                {allAvailableAccounts.map((acc) => (
+                  <div
+                    key={acc.id}
+                    onClick={() => openEntityDrawer('account', acc.id)}
+                    className="border border-slate-200 rounded-md px-3 py-2 bg-[#FAF9F6]/60 hover:border-teal-700/50 cursor-pointer flex items-center justify-between gap-2 transition"
+                  >
+                    <div className="min-w-0">
+                      <div className="text-xs font-semibold text-slate-900 truncate">{acc.name}</div>
+                      <div className="text-[11px] text-slate-400 truncate">
+                        {acc.institution || acc.currency}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <span className="font-mono-num text-xs font-semibold text-slate-900">
+                        {formatDisplayValue(acc.balanceMinor, { currency: acc.currency, privacyMode })}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          openEntityDrawer('account', acc.id);
+                        }}
+                        className="inline-flex items-center gap-1 px-2 py-1 rounded border border-slate-300 bg-white text-[11px] font-medium text-slate-700 hover:bg-slate-900 hover:text-white transition"
+                      >
+                        <Pencil className="w-3 h-3" /> {t.editBtn}
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </section>
+
             {/* Cashflow Sankey Card with Unlimited-Depth Unfold & Two-Track Payday Bridge */}
             <section className="bg-white border border-slate-200 rounded-lg p-5 space-y-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
@@ -918,6 +972,7 @@ export const App: React.FC = () => {
                   target={quickAddTarget}
                   defaultCurrency={cur}
                   yearMonth={yearMonth}
+                  accounts={allAvailableAccounts}
                   t={t}
                   onCancel={() => setQuickAddTarget(null)}
                   onCreated={async ({ expandPotIds }) => {
@@ -1020,6 +1075,51 @@ export const App: React.FC = () => {
         {/* ======================== TAB 2: TIMELINE & SUFFICIENCY ======================== */}
         {tab === 'timeline' && (
           <>
+            {/* Live Bank & Runway Accounts Strip on Timeline */}
+            <section className="bg-white border border-slate-200 rounded-lg px-4 py-3">
+              <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+                <span className="text-[11px] font-mono-num uppercase tracking-wider text-slate-500 font-semibold flex items-center gap-1.5">
+                  <Landmark className="w-3.5 h-3.5 text-teal-700" /> {t.bankAccountsTitle}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setModal({ kind: 'account' })}
+                  className="inline-flex items-center gap-1 px-2 py-1 rounded border border-slate-200 text-[11px] font-medium text-slate-700 hover:bg-slate-50"
+                >
+                  <Plus className="w-3 h-3" /> {t.addAccountBtn}
+                </button>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5">
+                {allAvailableAccounts.map((acc) => (
+                  <div
+                    key={acc.id}
+                    onClick={() => openEntityDrawer('account', acc.id)}
+                    className="flex items-center justify-between gap-2 px-3 py-2 rounded-md border border-slate-200 bg-[#FAF9F6]/70 hover:border-teal-600/50 cursor-pointer transition"
+                  >
+                    <div className="min-w-0">
+                      <div className="text-xs font-medium text-slate-800 truncate">{acc.name}</div>
+                      <div className="text-[10px] text-slate-400 truncate">{acc.institution}</div>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <span className="font-mono-num text-xs font-semibold text-slate-900">
+                        {formatDisplayValue(acc.balanceMinor, { currency: acc.currency, privacyMode })}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          openEntityDrawer('account', acc.id);
+                        }}
+                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded border border-slate-300 bg-white text-[10px] font-medium text-slate-700 hover:bg-slate-900 hover:text-white hover:border-slate-900 transition"
+                      >
+                        <Pencil className="w-2.5 h-2.5" /> {t.editBtn}
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </section>
+
             {/* Pre-Payday Sufficiency Banner + Plotted Runway Curve + Folded-by-Default Expenses & Completed Payments Table */}
             <section className="bg-white border border-slate-200 rounded-lg p-5 space-y-4">
               <div className="flex flex-wrap items-center justify-between gap-3">
@@ -1118,6 +1218,7 @@ export const App: React.FC = () => {
                             <th className="py-2 px-3">{t.colDateTime}</th>
                             <th className="py-2 px-3">{t.colItemMerchant}</th>
                             <th className="py-2 px-3">{t.colPot}</th>
+                            <th className="py-2 px-3">{t.colAccount}</th>
                             <th className="py-2 px-3">{t.colType}</th>
                             <th className="py-2 px-3 text-right">{t.colAmount}</th>
                             <th className="py-2 px-3 text-right">{t.colActions}</th>
@@ -1129,6 +1230,7 @@ export const App: React.FC = () => {
                             const potPath = entry.potId
                               ? potBreadcrumbs.get(entry.potId)?.pathString || entry.potName
                               : '—';
+                            const isInflow = entry.flowDirection === 'inflow';
                             return (
                               <tr key={entry.id} className="hover:bg-slate-50/80">
                                 <td className="py-2.5 px-3 font-mono-num text-[11px] text-slate-600 whitespace-nowrap">
@@ -1154,28 +1256,51 @@ export const App: React.FC = () => {
                                       className="w-2 h-2 rounded-full shrink-0"
                                       style={{ backgroundColor: entry.potColor }}
                                     />
-                                    <span className="truncate max-w-[180px]">{potPath}</span>
+                                    <span className="truncate max-w-[160px]">{potPath}</span>
                                   </span>
+                                </td>
+                                <td className="py-2.5 px-3 whitespace-nowrap text-[11px] text-slate-600">
+                                  {entry.accountName ? (
+                                    <button
+                                      type="button"
+                                      onClick={() => entry.accountId && openEntityDrawer('account', entry.accountId)}
+                                      className="inline-flex items-center gap-1 text-slate-700 hover:text-teal-800 hover:underline"
+                                    >
+                                      <Landmark className="w-3 h-3 text-teal-700 shrink-0" />
+                                      <span>{entry.accountName}</span>
+                                    </button>
+                                  ) : (
+                                    <span className="text-slate-400">—</span>
+                                  )}
                                 </td>
                                 <td className="py-2.5 px-3 whitespace-nowrap">
                                   <span
                                     className={`inline-flex px-2 py-0.5 rounded text-[10px] font-mono-num ${
-                                      entry.kind === 'expense'
+                                      isInflow
+                                        ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
+                                        : entry.kind === 'expense'
                                         ? 'bg-rose-50 text-rose-800 border border-rose-200'
                                         : entry.kind === 'paid_bill'
                                         ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
                                         : 'bg-teal-50 text-teal-800 border border-teal-200'
                                     }`}
                                   >
-                                    {entry.kind === 'expense'
+                                    {isInflow
+                                      ? t.typeDeposit
+                                      : entry.kind === 'expense'
                                       ? t.typeExpense
                                       : entry.kind === 'paid_bill'
                                       ? t.typePaidBill
                                       : t.typeSinkingSetAside}
                                   </span>
                                 </td>
-                                <td className="py-2.5 px-3 text-right font-mono-num font-semibold text-slate-900 whitespace-nowrap">
-                                  -{fmt(entry.displayAmountMinor)}
+                                <td
+                                  className={`py-2.5 px-3 text-right font-mono-num font-semibold whitespace-nowrap ${
+                                    isInflow ? 'text-emerald-700' : 'text-slate-900'
+                                  }`}
+                                >
+                                  {isInflow ? '+' : '-'}
+                                  {fmt(entry.displayAmountMinor)}
                                   {entry.currency !== cur && !privacyMode && (
                                     <div className="text-[10px] text-slate-400 font-normal">
                                       {CURRENCY_SYMBOLS[entry.currency]}
@@ -1299,6 +1424,9 @@ export const App: React.FC = () => {
                         </div>
                         <div className="text-xs text-slate-500 font-mono-num">
                           {inc.expectedDate} · {inc.cadence}
+                          {inc.accountName && (
+                            <span className="ml-2 text-slate-600">· 🏦 {inc.accountName}</span>
+                          )}
                         </div>
                       </div>
                     </div>
@@ -1429,6 +1557,9 @@ export const App: React.FC = () => {
                                     ? ` (${fmt(ob.preservedDisplayMinor)} / ${fmt(ob.targetDisplayMinor)})`
                                     : ''
                                 }`}
+                            {ob.accountName && (
+                              <span className="ml-2 text-slate-600">· 🏦 {ob.accountName}</span>
+                            )}
                             {paidTimestamp && (
                               <span className="ml-2 text-emerald-700 font-semibold">· ✓ {paidTimestamp}</span>
                             )}
@@ -1503,6 +1634,7 @@ export const App: React.FC = () => {
                 target={quickAddTarget}
                 defaultCurrency={cur}
                 yearMonth={yearMonth}
+                accounts={allAvailableAccounts}
                 t={t}
                 onCancel={() => setQuickAddTarget(null)}
                 onCreated={async ({ expandPotIds }) => {
@@ -2323,6 +2455,23 @@ export const App: React.FC = () => {
                           >
                             {t.openWorkspaceBtn}
                           </button>
+                          {ws.canManage && (
+                            <button
+                              type="button"
+                              onClick={async () => {
+                                const nextName = prompt(t.renameWorkspacePrompt(ws.name), ws.name)?.trim();
+                                if (!nextName || nextName === ws.name) return;
+                                await apiFetch(`/api/workspaces/${ws.id}`, {
+                                  method: 'PATCH',
+                                  body: JSON.stringify({ name: nextName }),
+                                });
+                                await reloadAll();
+                              }}
+                              className="inline-flex items-center gap-1 px-2 py-1 rounded border border-slate-200 text-slate-700 hover:bg-slate-900 hover:text-white text-[11px] transition"
+                            >
+                              <Pencil className="w-3 h-3" /> {t.editBtn}
+                            </button>
+                          )}
                           {ws.canManage &&
                             ws.id !== 'ws-home' &&
                             ws.id !== 'ws-wadera' &&
@@ -2598,19 +2747,30 @@ export const App: React.FC = () => {
                   </button>
                 </div>
                 <div className="divide-y divide-slate-100">
-                  {budget.accounts.map((acc) => (
+                  {allAvailableAccounts.map((acc) => (
                     <div
                       key={acc.id}
                       onClick={() => openEntityDrawer('account', acc.id)}
-                      className="py-2 flex items-center justify-between text-xs hover:bg-slate-50 cursor-pointer px-1 rounded"
+                      className="py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs hover:bg-slate-50 cursor-pointer px-2 rounded"
                     >
-                      <div className="inline-flex items-center gap-1.5">
+                      <div className="inline-flex items-center gap-1.5 min-w-0">
                         <span className="font-medium text-slate-800">{acc.name}</span>{' '}
                         <span className="text-slate-400">({acc.institution})</span>
-                        <Pencil className="w-3 h-3 text-slate-400" />
                       </div>
-                      <div className="font-mono-num font-semibold">
-                        {formatDisplayValue(acc.balanceMinor, { currency: acc.currency, privacyMode })}
+                      <div className="flex items-center gap-2.5 font-mono-num">
+                        <span className="font-semibold text-slate-900">
+                          {formatDisplayValue(acc.balanceMinor, { currency: acc.currency, privacyMode })}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            openEntityDrawer('account', acc.id);
+                          }}
+                          className="inline-flex items-center gap-1 px-2 py-1 rounded border border-slate-300 bg-white text-[11px] font-sans font-medium text-slate-700 hover:bg-slate-900 hover:text-white hover:border-slate-900 transition"
+                        >
+                          <Pencil className="w-3 h-3" /> {t.editAccountBtn}
+                        </button>
                       </div>
                     </div>
                   ))}
@@ -2838,6 +2998,7 @@ export const App: React.FC = () => {
                           id: ob.id,
                           workspaceId: fd.get('workspaceId') || ob.workspaceId,
                           potId: fd.get('potId') || null,
+                          accountId: fd.get('accountId') || null,
                           name: nextName,
                           amountMinor: Math.round(Number(fd.get('amountMajor') || 0) * 100),
                           currency: fd.get('currency') || ob.currency,
@@ -2921,6 +3082,21 @@ export const App: React.FC = () => {
                         </select>
                       </label>
                     </div>
+                    <label className="block space-y-1">
+                      <span className="text-slate-600">{t.paidFromAccountLabel}</span>
+                      <select
+                        name="accountId"
+                        defaultValue={ob.accountId || ''}
+                        className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
+                      >
+                        <option value="">{t.noAccountLinkOption}</option>
+                        {allAvailableAccounts.map((acc) => (
+                          <option key={acc.id} value={acc.id}>
+                            🏦 {acc.name} ({acc.institution} · {acc.currency})
+                          </option>
+                        ))}
+                      </select>
+                    </label>
                     <div className="grid grid-cols-3 gap-2">
                       <label className="space-y-1">
                         <span className="text-slate-600">{t.amountValueLabel}</span>
@@ -3075,6 +3251,8 @@ export const App: React.FC = () => {
                           id: exp.id,
                           workspaceId: fd.get('workspaceId') || exp.workspaceId,
                           potId: fd.get('potId') || null,
+                          accountId: fd.get('accountId') || null,
+                          flowDirection: fd.get('flowDirection') || 'outflow',
                           merchant: nextMerchant,
                           description: nextDesc,
                           amountMinor: Math.round(Number(fd.get('amountMajor') || 0) * 100),
@@ -3141,6 +3319,34 @@ export const App: React.FC = () => {
                               {potBreadcrumbs.get(p.id)?.pathString || p.name}
                             </option>
                           ))}
+                        </select>
+                      </label>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <label className="space-y-1">
+                        <span className="text-slate-600">{t.bankAccountLabel}</span>
+                        <select
+                          name="accountId"
+                          defaultValue={exp.accountId || ''}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
+                        >
+                          <option value="">{t.noAccountLinkOption}</option>
+                          {allAvailableAccounts.map((acc) => (
+                            <option key={acc.id} value={acc.id}>
+                              🏦 {acc.name} ({acc.currency})
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-slate-600">{t.flowDirectionLabel}</span>
+                        <select
+                          name="flowDirection"
+                          defaultValue={exp.flowDirection || 'outflow'}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
+                        >
+                          <option value="outflow">{t.flowOutflowOption}</option>
+                          <option value="inflow">{t.flowInflowOption}</option>
                         </select>
                       </label>
                     </div>
@@ -3369,6 +3575,7 @@ export const App: React.FC = () => {
                         body: JSON.stringify({
                           id: inc.id,
                           workspaceId: fd.get('workspaceId') || inc.workspaceId,
+                          accountId: fd.get('accountId') || null,
                           name: nextName,
                           sourceKind: inc.sourceKind,
                           amountMinor: Math.round(Number(fd.get('amountMajor') || 0) * 100),
@@ -3429,6 +3636,21 @@ export const App: React.FC = () => {
                         />
                       </label>
                     </div>
+                    <label className="block space-y-1">
+                      <span className="text-slate-600">{t.depositIntoAccountLabel}</span>
+                      <select
+                        name="accountId"
+                        defaultValue={inc.accountId || ''}
+                        className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
+                      >
+                        <option value="">{t.noAccountLinkOption}</option>
+                        {allAvailableAccounts.map((acc) => (
+                          <option key={acc.id} value={acc.id}>
+                            🏦 {acc.name} ({acc.institution} · {acc.currency})
+                          </option>
+                        ))}
+                      </select>
+                    </label>
                     <div className="grid grid-cols-3 gap-2">
                       <label className="space-y-1">
                         <span className="text-slate-600">{t.amountValueLabel}</span>
@@ -3517,7 +3739,7 @@ export const App: React.FC = () => {
               }
 
               if (drawer.entityType === 'account') {
-                const acc = budget.accounts.find((a) => a.id === drawer.entityId);
+                const acc = allAvailableAccounts.find((a) => a.id === drawer.entityId);
                 if (!acc) return null;
 
                 return (
@@ -4205,6 +4427,7 @@ export const App: React.FC = () => {
                     body: JSON.stringify({
                       workspaceId: fd.get('workspaceId'),
                       potId: fd.get('potId') || null,
+                      accountId: fd.get('accountId') || null,
                       name: fd.get('name'),
                       amountMinor: Math.round(Number(fd.get('amountMajor') || 0) * 100),
                       currency: fd.get('currency'),
@@ -4252,6 +4475,22 @@ export const App: React.FC = () => {
                     </select>
                   </label>
                 </div>
+
+                <label className="block space-y-1">
+                  <span>{t.paidFromAccountLabel}</span>
+                  <select
+                    name="accountId"
+                    defaultValue={defaultAccountForWs(defaultActiveWsId)}
+                    className="w-full border border-slate-200 rounded px-2 py-1.5"
+                  >
+                    <option value="">{t.noAccountLinkOption}</option>
+                    {allAvailableAccounts.map((acc) => (
+                      <option key={acc.id} value={acc.id}>
+                        🏦 {acc.name} ({acc.institution} · {acc.currency})
+                      </option>
+                    ))}
+                  </select>
+                </label>
 
                 <label className="block space-y-1">
                   <span>Payment / Goal Name</span>
@@ -4360,6 +4599,8 @@ export const App: React.FC = () => {
                     body: JSON.stringify({
                       workspaceId: fd.get('workspaceId'),
                       potId: fd.get('potId') || null,
+                      accountId: fd.get('accountId') || null,
+                      flowDirection: fd.get('flowDirection') || 'outflow',
                       merchant: fd.get('merchant'),
                       description: fd.get('description'),
                       amountMinor: Math.round(Number(fd.get('amountMajor') || 0) * 100),
@@ -4399,6 +4640,34 @@ export const App: React.FC = () => {
                           {potBreadcrumbs.get(p.id)?.pathString || p.name}
                         </option>
                       ))}
+                    </select>
+                  </label>
+                </div>
+                <div className="grid grid-cols-2 gap-2.5">
+                  <label className="space-y-1">
+                    <span>{t.bankAccountLabel}</span>
+                    <select
+                      name="accountId"
+                      defaultValue={defaultAccountForWs(defaultActiveWsId)}
+                      className="w-full border border-slate-200 rounded px-2 py-1.5"
+                    >
+                      <option value="">{t.noAccountLinkOption}</option>
+                      {allAvailableAccounts.map((acc) => (
+                        <option key={acc.id} value={acc.id}>
+                          🏦 {acc.name} ({acc.institution} · {acc.currency})
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="space-y-1">
+                    <span>{t.flowDirectionLabel}</span>
+                    <select
+                      name="flowDirection"
+                      defaultValue="outflow"
+                      className="w-full border border-slate-200 rounded px-2 py-1.5"
+                    >
+                      <option value="outflow">{t.flowOutflowOption}</option>
+                      <option value="inflow">{t.flowInflowOption}</option>
                     </select>
                   </label>
                 </div>
@@ -4749,6 +5018,7 @@ export const App: React.FC = () => {
                     method: 'POST',
                     body: JSON.stringify({
                       workspaceId: fd.get('workspaceId') || boot.user.personalWorkspaceId,
+                      accountId: fd.get('accountId') || null,
                       name: fd.get('name'),
                       amountMinor: Math.round(Number(fd.get('amountMajor') || 0) * 100),
                       currency: fd.get('currency'),
@@ -4787,6 +5057,21 @@ export const App: React.FC = () => {
                     />
                   </label>
                 </div>
+                <label className="block space-y-1">
+                  <span>{t.depositIntoAccountLabel}</span>
+                  <select
+                    name="accountId"
+                    defaultValue={defaultAccountForWs(defaultActiveWsId)}
+                    className="w-full border border-slate-200 rounded px-2 py-1.5"
+                  >
+                    <option value="">{t.noAccountLinkOption}</option>
+                    {allAvailableAccounts.map((acc) => (
+                      <option key={acc.id} value={acc.id}>
+                        🏦 {acc.name} ({acc.institution} · {acc.currency})
+                      </option>
+                    ))}
+                  </select>
+                </label>
                 <div className="grid grid-cols-3 gap-2">
                   <label className="space-y-1">
                     <span>Net Amount</span>

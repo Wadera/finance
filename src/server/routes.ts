@@ -44,6 +44,45 @@ function shiftYearMonth(ym: string, deltaMonths: number): string {
   return `${yy}-${String(mm).padStart(2, '0')}`;
 }
 
+function adjustAccountBalance(
+  store: FinanceStore,
+  accountId: string | null | undefined,
+  deltaTxMinor: number,
+  txCurrency: CurrencyCode
+): void {
+  if (!accountId || !Number.isFinite(deltaTxMinor) || deltaTxMinor === 0) return;
+  const acc = store.db
+    .prepare(`SELECT id, currency, balance_minor FROM accounts WHERE id = ?`)
+    .get(accountId) as { id: string; currency: CurrencyCode; balance_minor: number } | undefined;
+  if (!acc) return;
+  const rateMap = buildRateMap(store.getFxRates());
+  const deltaAccMinor =
+    acc.currency === txCurrency
+      ? Math.round(deltaTxMinor)
+      : convertMinor(Math.abs(Math.round(deltaTxMinor)), txCurrency, acc.currency, rateMap) *
+        (deltaTxMinor < 0 ? -1 : 1);
+  store.db
+    .prepare(`UPDATE accounts SET balance_minor = balance_minor + ?, updated_at = ? WHERE id = ?`)
+    .run(deltaAccMinor, new Date().toISOString(), acc.id);
+}
+
+function defaultAccountForWorkspace(
+  store: FinanceStore,
+  workspaceId: string,
+  preferredCurrency?: CurrencyCode
+): string | null {
+  const rows = store.listAccounts([workspaceId]);
+  if (!rows.length) return null;
+  if (preferredCurrency) {
+    const match =
+      rows.find((a) => a.currency === preferredCurrency && a.isPrimaryRunway) ||
+      rows.find((a) => a.currency === preferredCurrency);
+    if (match) return match.id;
+  }
+  const primary = rows.find((a) => a.isPrimaryRunway);
+  return (primary || rows[0]).id;
+}
+
 export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg: AuthConfig): void {
   // Healthcheck (no private data exposed)
   app.get('/healthz', async () => {
@@ -109,6 +148,9 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     const rateMap = buildRateMap(fxRates);
 
     const wsIds = store.readableWorkspaceIds(user.id, scope);
+    const allReadableWsIds = store.readableWorkspaceIds(user.id, 'all');
+    const allAccounts = store.listAccounts(allReadableWsIds);
+    const accById = new Map(allAccounts.map((a) => [a.id, a]));
     const accounts = store.listAccounts(wsIds);
     const incomes = store.listIncomes(wsIds);
     const pots = store.listPots(wsIds);
@@ -125,8 +167,12 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       .filter((e) => e.spentDate.slice(0, 7) === ym)
       .map((e) => ({
         ...e,
+        accountId: e.accountId ?? null,
+        accountName: e.accountId ? (accById.get(e.accountId)?.name ?? null) : null,
+        flowDirection: e.flowDirection === 'inflow' ? ('inflow' as const) : ('outflow' as const),
         displayAmountMinor: convertMinor(e.amountMinor, e.currency, cur, rateMap),
       }));
+    const outflowExpenses = expenses.filter((e) => e.flowDirection !== 'inflow');
 
     // Compute Wadera & Walter monthly incomes for proportional split calculations
     const waderaIncs = store.listIncomes(['ws-wadera']);
@@ -159,9 +205,12 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       const effectiveDisplayMinor = convertMinor(effectiveBurdenNativeMinor, ob.currency, cur, rateMap);
       const targetDisplayMinor = convertMinor(ob.amountMinor, ob.currency, cur, rateMap);
       const preservedDisplayMinor = convertMinor(ob.preservedMinor, ob.currency, cur, rateMap);
+      const resolvedAccId = (occ?.accountId ?? ob.accountId) || null;
 
       return {
         ...ob,
+        accountId: ob.accountId ?? null,
+        accountName: resolvedAccId ? (accById.get(resolvedAccId)?.name ?? null) : null,
         metrics: {
           ...metrics,
           monthlyPreserveNativeMinor: effectivePreserveNativeMinor,
@@ -178,7 +227,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       };
     });
 
-    const potTree = buildPotRollupTree(pots, obligations, expenses, ym, cur, rateMap);
+    const potTree = buildPotRollupTree(pots, obligations, outflowExpenses, ym, cur, rateMap);
 
     // Monthly Income streams + explicit arrival tracking (income_occurrences)
     const incomeOccurrences = store.listIncomeOccurrences(
@@ -192,8 +241,11 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
         const monthlyDisplayMinor = computeMonthlyIncomeMinor(inc, ym, cur, rateMap);
         const occ = incOccById.get(inc.id) ?? null;
         const expectedDate = `${ym}-${String(Math.min(28, Math.max(1, inc.paydayDay))).padStart(2, '0')}`;
+        const resolvedAccId = (occ?.accountId ?? inc.accountId) || null;
         return {
           ...inc,
+          accountId: inc.accountId ?? null,
+          accountName: resolvedAccId ? (accById.get(resolvedAccId)?.name ?? null) : null,
           monthlyDisplayMinor,
           expectedDate,
           isReceivedThisMonth: Boolean(occ && occ.status === 'received'),
@@ -205,7 +257,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     const totalIncomeMinor = activeIncomes.reduce((s, i) => s + i.monthlyDisplayMinor, 0);
 
     // Unassigned obligations/expenses (where potId is null)
-    const unassignedExpensesMinor = expenses
+    const unassignedExpensesMinor = outflowExpenses
       .filter((e) => !e.potId)
       .reduce((s, e) => s + convertMinor(e.amountMinor, e.currency, cur, rateMap), 0);
     const unassignedObMinor = enrichedObligations
@@ -364,10 +416,13 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     const timelineLedger: Array<{
       id: string;
       kind: 'expense' | 'paid_bill' | 'sinking_set_aside';
+      flowDirection: 'outflow' | 'inflow';
       entityType: 'expense' | 'obligation';
       entityId: string;
       occurrenceId?: string;
       workspaceId: string;
+      accountId: string | null;
+      accountName: string | null;
       potId: string | null;
       potName: string | null;
       potColor: string;
@@ -392,12 +447,15 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       timelineLedger.push({
         id: `led-exp-${exp.id}`,
         kind: 'expense',
+        flowDirection: exp.flowDirection === 'inflow' ? 'inflow' : 'outflow',
         entityType: 'expense',
         entityId: exp.id,
         workspaceId: exp.workspaceId,
+        accountId: exp.accountId ?? null,
+        accountName: exp.accountName ?? null,
         potId: exp.potId,
         potName: pot?.name ?? null,
-        potColor: pot?.color ?? '#E11D48',
+        potColor: pot?.color ?? (exp.flowDirection === 'inflow' ? '#10B981' : '#E11D48'),
         title: exp.merchant,
         subtitle: exp.description || '',
         date: exp.spentDate,
@@ -430,13 +488,17 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
         (ob.metrics.isDueThisMonth ? ob.amountMinor : ob.metrics.monthlyPreserveNativeMinor || ob.amountMinor);
       const displayAmountMinor = convertMinor(actualNativeMinor, ob.currency, cur, rateMap);
       const pot = ob.potId ? potById.get(ob.potId) : undefined;
+      const effAccId = (occ.accountId ?? ob.accountId) || null;
       timelineLedger.push({
         id: `led-occ-${occ.id}`,
         kind: ob.metrics.isDueThisMonth ? 'paid_bill' : 'sinking_set_aside',
+        flowDirection: 'outflow',
         entityType: 'obligation',
         entityId: ob.id,
         occurrenceId: occ.id,
         workspaceId: ob.workspaceId,
+        accountId: effAccId,
+        accountName: effAccId ? (accById.get(effAccId)?.name ?? null) : null,
         potId: ob.potId,
         potName: pot?.name ?? null,
         potColor: pot?.color ?? '#059669',
@@ -454,7 +516,10 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     timelineLedger.sort((a, b) => b.timestamp.localeCompare(a.timestamp) || a.id.localeCompare(b.id));
 
     // Daily Runway Curve (days 1..daysInMonth) plotting ALL expenses, completed checklist items, upcoming bills & salary
-    const completedOutflowsThisMonthMinor = timelineLedger.reduce((s, e) => s + e.displayAmountMinor, 0);
+    const completedOutflowsThisMonthMinor = timelineLedger.reduce(
+      (s, e) => s + (e.flowDirection === 'inflow' ? -e.displayAmountMinor : e.displayAmountMinor),
+      0
+    );
     const receivedIncomesThisMonthMinor = activeIncomes
       .filter((i) => i.isReceivedThisMonth)
       .reduce((s, i) => s + i.monthlyDisplayMinor, 0);
@@ -498,17 +563,28 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
         }
       }
 
-      // 2. Logged expenses & completed checklist items on day d
+      // 2. Logged expenses, deposits & completed checklist items on day d
       for (const entry of timelineLedger) {
         if (entry.day === d) {
-          runningBal -= entry.displayAmountMinor;
-          dayEvents.push({
-            id: entry.id,
-            kind: entry.kind,
-            title: entry.title,
-            timestamp: entry.timestamp,
-            displayMinor: entry.displayAmountMinor,
-          });
+          if (entry.flowDirection === 'inflow') {
+            runningBal += entry.displayAmountMinor;
+            dayEvents.push({
+              id: entry.id,
+              kind: 'income',
+              title: entry.title,
+              timestamp: entry.timestamp,
+              displayMinor: entry.displayAmountMinor,
+            });
+          } else {
+            runningBal -= entry.displayAmountMinor;
+            dayEvents.push({
+              id: entry.id,
+              kind: entry.kind,
+              title: entry.title,
+              timestamp: entry.timestamp,
+              displayMinor: entry.displayAmountMinor,
+            });
+          }
         }
       }
 
@@ -611,7 +687,9 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     // 6-Month Spending & Income Context Trend
     const trend6m = sixMonths.map((mKey) => {
       const mInc = incomes.reduce((s, i) => s + computeMonthlyIncomeMinor(i, mKey, cur, rateMap), 0);
-      const mExps = allSixMonthExpenses.filter((e) => e.spentDate.slice(0, 7) === mKey);
+      const mExps = allSixMonthExpenses.filter(
+        (e) => e.spentDate.slice(0, 7) === mKey && e.flowDirection !== 'inflow'
+      );
       const mTree = buildPotRollupTree(pots, obligations, mExps, mKey, cur, rateMap);
       const mSpend =
         mTree.reduce((s, n) => s + n.effectiveTotalDisplayMinor, 0) +
@@ -629,6 +707,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       scope,
       displayCurrency: cur,
       accounts,
+      allAccounts,
       incomes: activeIncomes,
       allIncomes: incomes,
       pots,
@@ -1188,12 +1267,27 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     const wsId = String(b.workspaceId || user.personalWorkspaceId);
     if (!store.canWriteWorkspace(user.id, wsId)) return reply.code(403).send({ error: 'Write denied' });
     const id = b.id ? String(b.id) : `inc-${crypto.randomUUID().slice(0, 8)}`;
+    const currency = String(b.currency || user.defaultCurrency) as CurrencyCode;
+    const existingInc = b.id
+      ? (store.db.prepare(`SELECT account_id FROM income_streams WHERE id = ?`).get(id) as
+          | { account_id: string | null }
+          | undefined)
+      : undefined;
+    const accountId =
+      b.accountId !== undefined
+        ? b.accountId
+          ? String(b.accountId)
+          : null
+        : existingInc !== undefined
+        ? existingInc.account_id
+        : defaultAccountForWorkspace(store, wsId, currency);
+
     store.db
       .prepare(
-        `INSERT INTO income_streams (id, workspace_id, name, source_kind, amount_minor, currency, cadence, payday_day, effective_from, effective_to, is_active, portal_url, notes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO income_streams (id, workspace_id, account_id, name, source_kind, amount_minor, currency, cadence, payday_day, effective_from, effective_to, is_active, portal_url, notes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
-           workspace_id=excluded.workspace_id, name=excluded.name, source_kind=excluded.source_kind, amount_minor=excluded.amount_minor,
+           workspace_id=excluded.workspace_id, account_id=excluded.account_id, name=excluded.name, source_kind=excluded.source_kind, amount_minor=excluded.amount_minor,
            currency=excluded.currency, cadence=excluded.cadence, payday_day=excluded.payday_day,
            effective_from=excluded.effective_from, effective_to=excluded.effective_to,
            is_active=excluded.is_active, portal_url=excluded.portal_url, notes=excluded.notes`
@@ -1201,10 +1295,11 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       .run(
         id,
         wsId,
+        accountId,
         String(b.name || 'Salary'),
         String(b.sourceKind || 'salary'),
         Math.round(Number(b.amountMinor ?? 0)),
-        String(b.currency || user.defaultCurrency),
+        currency,
         String(b.cadence || 'monthly'),
         Math.min(28, Math.max(1, Number(b.paydayDay ?? 25))),
         String(b.effectiveFrom || new Date().toISOString().slice(0, 10)),
@@ -1226,12 +1321,12 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     return { ok: true };
   });
 
-  // Tick / Untick "[✓] Salary / Income Arrived" on the Monthly Timeline Tracker
+  // Tick / Untick "[✓] Salary / Income Arrived" on the Monthly Timeline Tracker (live deposits into linked Bank Account)
   app.post('/api/incomes/:id/toggle-received', async (req, reply) => {
     const user = requireUser(req, reply, store, cfg);
     if (!user) return;
     const { id } = req.params as { id: string };
-    const body = (req.body || {}) as { yearMonth?: string; received?: boolean };
+    const body = (req.body || {}) as { yearMonth?: string; received?: boolean; accountId?: string | null };
     const ym = body.yearMonth && /^\d{4}-\d{2}$/.test(body.yearMonth) ? body.yearMonth : new Date().toISOString().slice(0, 7);
 
     const wsIds = store.readableWorkspaceIds(user.id, 'all');
@@ -1240,18 +1335,63 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       return reply.code(403).send({ error: 'Income stream not found or write denied' });
     }
 
+    const existingOcc = store.db
+      .prepare(
+        `SELECT id, account_id, received_minor, currency, status FROM income_occurrences WHERE income_id = ? AND year_month = ?`
+      )
+      .get(inc.id, ym) as
+      | { id: string; account_id: string | null; received_minor: number; currency: CurrencyCode; status: string }
+      | undefined;
+
+    const targetAccountId =
+      body.accountId !== undefined
+        ? body.accountId || null
+        : inc.accountId ?? defaultAccountForWorkspace(store, inc.workspaceId, inc.currency);
+
     const expectedDate = `${ym}-${String(Math.min(28, Math.max(1, inc.paydayDay))).padStart(2, '0')}`;
     const markReceived = body.received !== false;
-    store.setIncomeReceived({
-      incomeId: inc.id,
-      yearMonth: ym,
-      expectedDate,
-      amountMinor: inc.amountMinor,
-      currency: inc.currency,
-      received: markReceived,
-    });
 
-    return { ok: true, incomeId: inc.id, yearMonth: ym, isReceivedThisMonth: markReceived };
+    store.db.exec('BEGIN IMMEDIATE;');
+    try {
+      if (existingOcc && existingOcc.status === 'received' && existingOcc.account_id) {
+        // Reverse previous deposit if already marked received
+        adjustAccountBalance(store, existingOcc.account_id, -existingOcc.received_minor, existingOcc.currency);
+      }
+
+      if (markReceived) {
+        store.setIncomeReceived({
+          incomeId: inc.id,
+          accountId: targetAccountId,
+          yearMonth: ym,
+          expectedDate,
+          amountMinor: inc.amountMinor,
+          currency: inc.currency,
+          received: true,
+        });
+        if (targetAccountId) {
+          adjustAccountBalance(store, targetAccountId, +inc.amountMinor, inc.currency);
+        }
+        if (body.accountId !== undefined) {
+          store.db.prepare(`UPDATE income_streams SET account_id = ? WHERE id = ?`).run(targetAccountId, inc.id);
+        }
+      } else {
+        store.setIncomeReceived({
+          incomeId: inc.id,
+          accountId: null,
+          yearMonth: ym,
+          expectedDate,
+          amountMinor: inc.amountMinor,
+          currency: inc.currency,
+          received: false,
+        });
+      }
+      store.db.exec('COMMIT;');
+    } catch (err) {
+      store.db.exec('ROLLBACK;');
+      throw err;
+    }
+
+    return { ok: true, incomeId: inc.id, yearMonth: ym, isReceivedThisMonth: markReceived, accountId: targetAccountId };
   });
 
   // --- CRUD: Hierarchical Pots (Unlimited Nesting + Item-to-Pot Promotion) ---
@@ -1550,16 +1690,31 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     const nextDueDate = String(b.nextDueDate || new Date().toISOString().slice(0, 10));
     const dueDay = Number(nextDueDate.slice(8, 10)) || 1;
     const intervalMonths = cadenceIntervalMonths(cadence, Number(b.intervalMonths || 1));
+    const currency = String(b.currency || user.defaultCurrency) as CurrencyCode;
+
+    const existingOb = b.id
+      ? (store.db.prepare(`SELECT account_id FROM obligations WHERE id = ?`).get(id) as
+          | { account_id: string | null }
+          | undefined)
+      : undefined;
+    const accountId =
+      b.accountId !== undefined
+        ? b.accountId
+          ? String(b.accountId)
+          : null
+        : existingOb !== undefined
+        ? existingOb.account_id
+        : defaultAccountForWorkspace(store, wsId, currency);
 
     store.db
       .prepare(
         `INSERT INTO obligations (
-           id, workspace_id, pot_id, name, amount_minor, currency, cadence, interval_months,
+           id, workspace_id, pot_id, account_id, name, amount_minor, currency, cadence, interval_months,
            next_due_date, due_day, preserved_minor, auto_preserve, split_mode, wadera_split_bp,
            tags_json, manage_url, portal_url, reference_number, renewal_notice_days, notes, is_active
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
-           workspace_id=excluded.workspace_id, pot_id=excluded.pot_id, name=excluded.name,
+           workspace_id=excluded.workspace_id, pot_id=excluded.pot_id, account_id=excluded.account_id, name=excluded.name,
            amount_minor=excluded.amount_minor, currency=excluded.currency, cadence=excluded.cadence,
            interval_months=excluded.interval_months, next_due_date=excluded.next_due_date, due_day=excluded.due_day,
            preserved_minor=excluded.preserved_minor, auto_preserve=excluded.auto_preserve,
@@ -1571,9 +1726,10 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
         id,
         wsId,
         b.potId ? String(b.potId) : null,
+        accountId,
         String(b.name || 'Scheduled Payment'),
         Math.round(Number(b.amountMinor ?? 0)),
-        String(b.currency || user.defaultCurrency),
+        currency,
         cadence,
         intervalMonths,
         nextDueDate,
@@ -1591,28 +1747,50 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
         b.isActive === false ? 0 : 1
       );
 
-    // If caller also edited the completed occurrence timestamp or amount for a specific yearMonth
-    if (b.occurrenceYearMonth && (b.occurrencePaidAt || b.occurrenceActualPaidMinor != null)) {
+    // If caller also edited the completed occurrence timestamp, amount, or account for a specific yearMonth
+    if (b.occurrenceYearMonth && (b.occurrencePaidAt || b.occurrenceActualPaidMinor != null || b.accountId !== undefined)) {
       const occYm = String(b.occurrenceYearMonth);
       const existingOcc = store.db
-        .prepare(`SELECT id, paid_at, actual_paid_minor FROM payment_occurrences WHERE obligation_id = ? AND year_month = ?`)
-        .get(id, occYm) as { id: string; paid_at: string | null; actual_paid_minor: number | null } | undefined;
+        .prepare(
+          `SELECT id, paid_at, actual_paid_minor, currency, account_id, status FROM payment_occurrences WHERE obligation_id = ? AND year_month = ?`
+        )
+        .get(id, occYm) as
+        | {
+            id: string;
+            paid_at: string | null;
+            actual_paid_minor: number | null;
+            currency: CurrencyCode;
+            account_id: string | null;
+            status: string;
+          }
+        | undefined;
       if (existingOcc) {
         const nextPaidAt = b.occurrencePaidAt ? String(b.occurrencePaidAt) : existingOcc.paid_at;
         const nextActual =
           b.occurrenceActualPaidMinor != null
             ? Math.round(Number(b.occurrenceActualPaidMinor))
             : existingOcc.actual_paid_minor;
+        const nextAccId = b.accountId !== undefined ? accountId : existingOcc.account_id;
+
+        if (existingOcc.status === 'paid') {
+          if (existingOcc.account_id && existingOcc.actual_paid_minor) {
+            adjustAccountBalance(store, existingOcc.account_id, +existingOcc.actual_paid_minor, existingOcc.currency);
+          }
+          if (nextAccId && nextActual) {
+            adjustAccountBalance(store, nextAccId, -nextActual, currency);
+          }
+        }
+
         store.db
-          .prepare(`UPDATE payment_occurrences SET paid_at = ?, actual_paid_minor = ? WHERE id = ?`)
-          .run(nextPaidAt, nextActual, existingOcc.id);
+          .prepare(`UPDATE payment_occurrences SET paid_at = ?, actual_paid_minor = ?, account_id = ?, currency = ? WHERE id = ?`)
+          .run(nextPaidAt, nextActual, nextAccId, currency, existingOcc.id);
       }
     }
 
     return { ok: true, id };
   });
 
-  // Tick / Untick "[✓] Mark as Paid / Set Aside" (logs timestamped occurrence; handles both due bills & monthly Preserve slices)
+  // Tick / Untick "[✓] Mark as Paid / Set Aside" (logs timestamped occurrence; deducts/refunds linked Bank Account live)
   app.post('/api/obligations/:id/toggle-paid', async (req, reply) => {
     const user = requireUser(req, reply, store, cfg);
     if (!user) return;
@@ -1622,6 +1800,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       paid?: boolean;
       preserveDepositMinor?: number;
       paidAt?: string;
+      accountId?: string | null;
     };
     const ym = body.yearMonth || new Date().toISOString().slice(0, 7);
 
@@ -1634,11 +1813,23 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     const metrics = computeObligationMonthMetrics(ob, ym);
     const existingOcc = store.db
       .prepare(
-        `SELECT id, status, actual_paid_minor, paid_at FROM payment_occurrences WHERE obligation_id = ? AND year_month = ?`
+        `SELECT id, status, actual_paid_minor, currency, account_id, paid_at FROM payment_occurrences WHERE obligation_id = ? AND year_month = ?`
       )
       .get(ob.id, ym) as
-      | { id: string; status: string; actual_paid_minor: number | null; paid_at: string | null }
+      | {
+          id: string;
+          status: string;
+          actual_paid_minor: number | null;
+          currency: CurrencyCode;
+          account_id: string | null;
+          paid_at: string | null;
+        }
       | undefined;
+
+    const targetAccountId =
+      body.accountId !== undefined
+        ? body.accountId || null
+        : ob.accountId ?? defaultAccountForWorkspace(store, ob.workspaceId, ob.currency);
 
     const markPaid = body.preserveDepositMinor && body.preserveDepositMinor > 0 ? true : body.paid !== false;
     const nowIso = new Date().toISOString();
@@ -1647,73 +1838,109 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     const defaultTimestampInYm = nowIso.slice(0, 7) === ym ? nowIso : `${dueInYm}T${nowIso.slice(11, 19)}Z`;
     const paidAtIso = body.paidAt || defaultTimestampInYm;
 
-    if (markPaid) {
-      if (!metrics.isDueThisMonth) {
-        // Monthly Sinking-Fund ("Preserve") Set-Aside for a future/multi-month goal
-        const sliceMinor =
-          body.preserveDepositMinor && body.preserveDepositMinor > 0
-            ? Math.round(body.preserveDepositMinor)
-            : existingOcc?.actual_paid_minor || metrics.monthlyPreserveNativeMinor || ob.amountMinor;
+    store.db.exec('BEGIN IMMEDIATE;');
+    try {
+      // First reverse any previous paid occurrence balance effect for this month
+      if (existingOcc && existingOcc.status === 'paid' && existingOcc.account_id && existingOcc.actual_paid_minor) {
+        adjustAccountBalance(store, existingOcc.account_id, +existingOcc.actual_paid_minor, existingOcc.currency);
+      }
 
-        store.db
-          .prepare(
-            `INSERT INTO payment_occurrences (id, obligation_id, year_month, due_date, expected_minor, actual_paid_minor, currency, status, paid_at, notes)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'paid', ?, 'Monthly sinking set-aside')
-             ON CONFLICT(obligation_id, year_month) DO UPDATE SET
-               status='paid', actual_paid_minor=excluded.actual_paid_minor, paid_at=excluded.paid_at, notes=excluded.notes`
-          )
-          .run(`occ-${crypto.randomUUID().slice(0, 8)}`, ob.id, ym, dueInYm, sliceMinor, sliceMinor, ob.currency, paidAtIso);
+      if (markPaid) {
+        if (body.accountId !== undefined) {
+          store.db.prepare(`UPDATE obligations SET account_id = ? WHERE id = ?`).run(targetAccountId, ob.id);
+        }
 
-        if (!existingOcc || existingOcc.status !== 'paid') {
-          const nextPreserved = Math.min(ob.amountMinor, ob.preservedMinor + sliceMinor);
-          store.db.prepare(`UPDATE obligations SET preserved_minor = ? WHERE id = ?`).run(nextPreserved, ob.id);
+        if (!metrics.isDueThisMonth) {
+          // Monthly Sinking-Fund ("Preserve") Set-Aside for a future/multi-month goal
+          const sliceMinor =
+            body.preserveDepositMinor && body.preserveDepositMinor > 0
+              ? Math.round(body.preserveDepositMinor)
+              : existingOcc?.actual_paid_minor || metrics.monthlyPreserveNativeMinor || ob.amountMinor;
+
+          store.db
+            .prepare(
+              `INSERT INTO payment_occurrences (id, obligation_id, account_id, year_month, due_date, expected_minor, actual_paid_minor, currency, status, paid_at, notes)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'paid', ?, 'Monthly sinking set-aside')
+               ON CONFLICT(obligation_id, year_month) DO UPDATE SET
+                 account_id=excluded.account_id, status='paid', actual_paid_minor=excluded.actual_paid_minor, paid_at=excluded.paid_at, notes=excluded.notes`
+            )
+            .run(
+              `occ-${crypto.randomUUID().slice(0, 8)}`,
+              ob.id,
+              targetAccountId,
+              ym,
+              dueInYm,
+              sliceMinor,
+              sliceMinor,
+              ob.currency,
+              paidAtIso
+            );
+
+          if (!existingOcc || existingOcc.status !== 'paid') {
+            const nextPreserved = Math.min(ob.amountMinor, ob.preservedMinor + sliceMinor);
+            store.db.prepare(`UPDATE obligations SET preserved_minor = ? WHERE id = ?`).run(nextPreserved, ob.id);
+          }
+
+          if (targetAccountId) {
+            adjustAccountBalance(store, targetAccountId, -sliceMinor, ob.currency);
+          }
+        } else {
+          // Scheduled Bill due this month
+          store.db
+            .prepare(
+              `INSERT INTO payment_occurrences (id, obligation_id, account_id, year_month, due_date, expected_minor, actual_paid_minor, currency, status, paid_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'paid', ?)
+               ON CONFLICT(obligation_id, year_month) DO UPDATE SET
+                 account_id=excluded.account_id, status='paid', actual_paid_minor=excluded.actual_paid_minor, paid_at=excluded.paid_at`
+            )
+            .run(
+              `occ-${crypto.randomUUID().slice(0, 8)}`,
+              ob.id,
+              targetAccountId,
+              ym,
+              dueInYm,
+              ob.amountMinor,
+              ob.amountMinor,
+              ob.currency,
+              paidAtIso
+            );
+
+          if (targetAccountId) {
+            adjustAccountBalance(store, targetAccountId, -ob.amountMinor, ob.currency);
+          }
+
+          // If this was a multi-month or one-off obligation due this month, advance nextDueDate & reset Preserve counter!
+          if (ob.cadence !== 'monthly' && ob.nextDueDate.slice(0, 7) <= ym) {
+            const reset = applyObligationPaymentReset(ob);
+            store.db
+              .prepare(`UPDATE obligations SET next_due_date = ?, preserved_minor = ?, is_active = ? WHERE id = ?`)
+              .run(reset.nextDueDate, reset.preservedMinor, reset.isActive ? 1 : 0, ob.id);
+          }
         }
       } else {
-        // Scheduled Bill due this month
+        // Unticking [✓] or clicking Undo in the Timeline table
+        if (existingOcc && existingOcc.status === 'paid' && !metrics.isDueThisMonth) {
+          const reversedPreserved = Math.max(0, ob.preservedMinor - (existingOcc.actual_paid_minor || 0));
+          store.db.prepare(`UPDATE obligations SET preserved_minor = ? WHERE id = ?`).run(reversedPreserved, ob.id);
+        }
+
         store.db
-          .prepare(
-            `INSERT INTO payment_occurrences (id, obligation_id, year_month, due_date, expected_minor, actual_paid_minor, currency, status, paid_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'paid', ?)
-             ON CONFLICT(obligation_id, year_month) DO UPDATE SET status='paid', actual_paid_minor=excluded.actual_paid_minor, paid_at=excluded.paid_at`
-          )
-          .run(
-            `occ-${crypto.randomUUID().slice(0, 8)}`,
-            ob.id,
-            ym,
-            dueInYm,
-            ob.amountMinor,
-            ob.amountMinor,
-            ob.currency,
-            paidAtIso
-          );
+          .prepare(`DELETE FROM payment_occurrences WHERE obligation_id = ? AND year_month = ?`)
+          .run(ob.id, ym);
 
-        // If this was a multi-month or one-off obligation due this month, advance nextDueDate & reset Preserve counter!
-        if (ob.cadence !== 'monthly' && ob.nextDueDate.slice(0, 7) <= ym) {
-          const reset = applyObligationPaymentReset(ob);
-          store.db
-            .prepare(`UPDATE obligations SET next_due_date = ?, preserved_minor = ?, is_active = ? WHERE id = ?`)
-            .run(reset.nextDueDate, reset.preservedMinor, reset.isActive ? 1 : 0, ob.id);
+        if (ob.cadence !== 'monthly' && ob.cadence !== 'once' && ob.nextDueDate.slice(0, 7) > ym) {
+          const rolledBack = addMonthsToDate(ob.nextDueDate, -cadenceIntervalMonths(ob.cadence, ob.intervalMonths));
+          if (rolledBack.slice(0, 7) === ym) {
+            store.db.prepare(`UPDATE obligations SET next_due_date = ?, is_active = 1 WHERE id = ?`).run(rolledBack, ob.id);
+          }
         }
       }
-    } else {
-      // Unticking [✓] or clicking Undo in the Timeline table
-      if (existingOcc && existingOcc.status === 'paid' && !metrics.isDueThisMonth) {
-        const reversedPreserved = Math.max(0, ob.preservedMinor - (existingOcc.actual_paid_minor || 0));
-        store.db.prepare(`UPDATE obligations SET preserved_minor = ? WHERE id = ?`).run(reversedPreserved, ob.id);
-      }
-
-      store.db
-        .prepare(`DELETE FROM payment_occurrences WHERE obligation_id = ? AND year_month = ?`)
-        .run(ob.id, ym);
-
-      if (ob.cadence !== 'monthly' && ob.cadence !== 'once' && ob.nextDueDate.slice(0, 7) > ym) {
-        const rolledBack = addMonthsToDate(ob.nextDueDate, -cadenceIntervalMonths(ob.cadence, ob.intervalMonths));
-        if (rolledBack.slice(0, 7) === ym) {
-          store.db.prepare(`UPDATE obligations SET next_due_date = ?, is_active = 1 WHERE id = ?`).run(rolledBack, ob.id);
-        }
-      }
+      store.db.exec('COMMIT;');
+    } catch (err) {
+      store.db.exec('ROLLBACK;');
+      throw err;
     }
-    return { ok: true };
+    return { ok: true, accountId: targetAccountId };
   });
 
   app.delete('/api/obligations/:id', async (req, reply) => {
@@ -1726,7 +1953,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     return { ok: true };
   });
 
-  // --- CRUD: Expenses & Itemized Receipts ---
+  // --- CRUD: Expenses, Deposits & Itemized Receipts (with Live Bank Account Balance Sync) ---
   app.post('/api/expenses', async (req, reply) => {
     const user = requireUser(req, reply, store, cfg);
     if (!user) return;
@@ -1735,9 +1962,44 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     if (!store.canWriteWorkspace(user.id, wsId)) return reply.code(403).send({ error: 'Write denied' });
     const id = b.id ? String(b.id) : `exp-${crypto.randomUUID().slice(0, 8)}`;
     const spentDate = String(b.spentDate || new Date().toISOString().slice(0, 10));
+    const currency = String(b.currency || user.defaultCurrency) as CurrencyCode;
+    const amountMinor = Math.round(Number(b.amountMinor ?? 0));
+
     const existingExp = b.id
-      ? (store.db.prepare(`SELECT created_at FROM expenses WHERE id = ?`).get(id) as { created_at: string } | undefined)
+      ? (store.db
+          .prepare(
+            `SELECT id, account_id, flow_direction, amount_minor, currency, created_at FROM expenses WHERE id = ?`
+          )
+          .get(id) as
+          | {
+              id: string;
+              account_id: string | null;
+              flow_direction: string;
+              amount_minor: number;
+              currency: CurrencyCode;
+              created_at: string;
+            }
+          | undefined)
       : undefined;
+
+    const flowDirection: 'outflow' | 'inflow' =
+      b.flowDirection === 'inflow'
+        ? 'inflow'
+        : b.flowDirection === 'outflow'
+        ? 'outflow'
+        : existingExp?.flow_direction === 'inflow'
+        ? 'inflow'
+        : 'outflow';
+
+    const accountId =
+      b.accountId !== undefined
+        ? b.accountId
+          ? String(b.accountId)
+          : null
+        : existingExp !== undefined
+        ? existingExp.account_id
+        : defaultAccountForWorkspace(store, wsId, currency);
+
     const nowIso = new Date().toISOString();
     let createdAt = existingExp?.created_at || `${spentDate}T${nowIso.slice(11, 19)}Z`;
     if (b.spentTime && /^\d{2}:\d{2}/.test(String(b.spentTime))) {
@@ -1746,41 +2008,89 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       createdAt = String(b.createdAt);
     }
 
-    store.db
-      .prepare(
-        `INSERT INTO expenses (id, workspace_id, pot_id, merchant, description, amount_minor, currency, spent_date, tags_json, portal_url, source, items_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET
-           workspace_id=excluded.workspace_id, pot_id=excluded.pot_id, merchant=excluded.merchant,
-           description=excluded.description, amount_minor=excluded.amount_minor, currency=excluded.currency,
-           spent_date=excluded.spent_date, tags_json=excluded.tags_json, portal_url=excluded.portal_url,
-           items_json=excluded.items_json, created_at=excluded.created_at`
-      )
-      .run(
-        id,
-        wsId,
-        b.potId ? String(b.potId) : null,
-        String(b.merchant || 'Expense'),
-        String(b.description || ''),
-        Math.round(Number(b.amountMinor ?? 0)),
-        String(b.currency || user.defaultCurrency),
-        spentDate,
-        JSON.stringify(Array.isArray(b.tags) ? b.tags : []),
-        b.portalUrl ? String(b.portalUrl) : null,
-        String(b.source || 'manual'),
-        JSON.stringify(Array.isArray(b.items) ? b.items : []),
-        createdAt
-      );
-    return { ok: true, id };
+    store.db.exec('BEGIN IMMEDIATE;');
+    try {
+      // 1. If editing an existing expense, reverse its previous bank account balance impact
+      if (existingExp && existingExp.account_id && existingExp.amount_minor > 0) {
+        const reverseDelta =
+          existingExp.flow_direction === 'inflow' ? -existingExp.amount_minor : +existingExp.amount_minor;
+        adjustAccountBalance(store, existingExp.account_id, reverseDelta, existingExp.currency);
+      }
+
+      // 2. Upsert the expense / deposit row
+      store.db
+        .prepare(
+          `INSERT INTO expenses (id, workspace_id, pot_id, account_id, flow_direction, merchant, description, amount_minor, currency, spent_date, tags_json, portal_url, source, items_json, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+             workspace_id=excluded.workspace_id, pot_id=excluded.pot_id, account_id=excluded.account_id,
+             flow_direction=excluded.flow_direction, merchant=excluded.merchant,
+             description=excluded.description, amount_minor=excluded.amount_minor, currency=excluded.currency,
+             spent_date=excluded.spent_date, tags_json=excluded.tags_json, portal_url=excluded.portal_url,
+             items_json=excluded.items_json, created_at=excluded.created_at`
+        )
+        .run(
+          id,
+          wsId,
+          b.potId ? String(b.potId) : null,
+          accountId,
+          flowDirection,
+          String(b.merchant || 'Expense'),
+          String(b.description || ''),
+          amountMinor,
+          currency,
+          spentDate,
+          JSON.stringify(Array.isArray(b.tags) ? b.tags : []),
+          b.portalUrl ? String(b.portalUrl) : null,
+          String(b.source || 'manual'),
+          JSON.stringify(Array.isArray(b.items) ? b.items : []),
+          createdAt
+        );
+
+      // 3. Apply the new bank account balance impact (-amount for outflow expense, +amount for inflow deposit)
+      if (accountId && amountMinor > 0) {
+        const applyDelta = flowDirection === 'inflow' ? +amountMinor : -amountMinor;
+        adjustAccountBalance(store, accountId, applyDelta, currency);
+      }
+
+      store.db.exec('COMMIT;');
+    } catch (err) {
+      store.db.exec('ROLLBACK;');
+      throw err;
+    }
+
+    return { ok: true, id, accountId, flowDirection };
   });
 
   app.delete('/api/expenses/:id', async (req, reply) => {
     const user = requireUser(req, reply, store, cfg);
     if (!user) return;
     const { id } = req.params as { id: string };
-    const row = store.db.prepare(`SELECT workspace_id FROM expenses WHERE id = ?`).get(id) as { workspace_id: string } | undefined;
+    const row = store.db
+      .prepare(`SELECT workspace_id, account_id, flow_direction, amount_minor, currency FROM expenses WHERE id = ?`)
+      .get(id) as
+      | {
+          workspace_id: string;
+          account_id: string | null;
+          flow_direction: string;
+          amount_minor: number;
+          currency: CurrencyCode;
+        }
+      | undefined;
     if (!row || !store.canWriteWorkspace(user.id, row.workspace_id)) return reply.code(403).send({ error: 'Denied' });
-    store.db.prepare(`DELETE FROM expenses WHERE id = ?`).run(id);
+
+    store.db.exec('BEGIN IMMEDIATE;');
+    try {
+      if (row.account_id && row.amount_minor > 0) {
+        const reverseDelta = row.flow_direction === 'inflow' ? -row.amount_minor : +row.amount_minor;
+        adjustAccountBalance(store, row.account_id, reverseDelta, row.currency);
+      }
+      store.db.prepare(`DELETE FROM expenses WHERE id = ?`).run(id);
+      store.db.exec('COMMIT;');
+    } catch (err) {
+      store.db.exec('ROLLBACK;');
+      throw err;
+    }
     return { ok: true };
   });
 

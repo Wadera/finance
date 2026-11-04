@@ -331,6 +331,22 @@ export class FinanceStore {
     if (!userCols.has('created_at')) {
       this.db.exec(`ALTER TABLE users ADD COLUMN created_at TEXT NOT NULL DEFAULT '2026-11-04T00:00:00Z'`);
     }
+
+    const addColumnIfMissing = (table: string, colName: string, definitionSql: string) => {
+      const cols = new Set(
+        (this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((c) => c.name)
+      );
+      if (!cols.has(colName)) {
+        this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${colName} ${definitionSql}`);
+      }
+    };
+
+    addColumnIfMissing('expenses', 'account_id', 'TEXT REFERENCES accounts(id) ON DELETE SET NULL');
+    addColumnIfMissing('expenses', 'flow_direction', "TEXT NOT NULL DEFAULT 'outflow'");
+    addColumnIfMissing('obligations', 'account_id', 'TEXT REFERENCES accounts(id) ON DELETE SET NULL');
+    addColumnIfMissing('payment_occurrences', 'account_id', 'TEXT REFERENCES accounts(id) ON DELETE SET NULL');
+    addColumnIfMissing('income_streams', 'account_id', 'TEXT REFERENCES accounts(id) ON DELETE SET NULL');
+    addColumnIfMissing('income_occurrences', 'account_id', 'TEXT REFERENCES accounts(id) ON DELETE SET NULL');
   }
 
   private seedCoreDefaults(): void {
@@ -390,6 +406,56 @@ export class FinanceStore {
         .run();
       this.db.prepare(`INSERT OR REPLACE INTO app_meta (key, value) VALUES ('payday_27_v1', 'done')`).run();
     }
+
+    const accountLinksSeeded = this.db.prepare(`SELECT value FROM app_meta WHERE key = 'account_links_seeded_v1'`).get() as
+      | { value: string }
+      | undefined;
+    if (!accountLinksSeeded) {
+      this.backfillDefaultAccountLinks();
+      this.db.prepare(`INSERT OR REPLACE INTO app_meta (key, value) VALUES ('account_links_seeded_v1', 'done')`).run();
+    }
+  }
+
+  public backfillDefaultAccountLinks(): void {
+    this.db.exec(`
+      UPDATE income_streams
+      SET account_id = (
+        SELECT a.id FROM accounts a
+        WHERE a.workspace_id = income_streams.workspace_id
+        ORDER BY a.is_primary_runway DESC, a.id ASC LIMIT 1
+      )
+      WHERE account_id IS NULL;
+
+      UPDATE obligations
+      SET account_id = (
+        SELECT a.id FROM accounts a
+        WHERE a.workspace_id = obligations.workspace_id
+        ORDER BY a.is_primary_runway DESC, a.id ASC LIMIT 1
+      )
+      WHERE account_id IS NULL;
+
+      UPDATE expenses
+      SET account_id = (
+        SELECT a.id FROM accounts a
+        WHERE a.workspace_id = expenses.workspace_id
+        ORDER BY a.is_primary_runway DESC, a.id ASC LIMIT 1
+      )
+      WHERE account_id IS NULL;
+
+      UPDATE payment_occurrences
+      SET account_id = (
+        SELECT o.account_id FROM obligations o
+        WHERE o.id = payment_occurrences.obligation_id
+      )
+      WHERE account_id IS NULL;
+
+      UPDATE income_occurrences
+      SET account_id = (
+        SELECT i.account_id FROM income_streams i
+        WHERE i.id = income_occurrences.income_id
+      )
+      WHERE account_id IS NULL;
+    `);
   }
 
   public getFxRates(): FxRateRecord[] {
@@ -829,6 +895,7 @@ export class FinanceStore {
     return rows.map((r) => ({
       id: String(r.id),
       workspaceId: String(r.workspace_id),
+      accountId: (r.account_id as string | null) ?? null,
       name: String(r.name),
       sourceKind: r.source_kind as IncomeStreamRecord['sourceKind'],
       amountMinor: Number(r.amount_minor),
@@ -874,6 +941,7 @@ export class FinanceStore {
       id: String(r.id),
       workspaceId: String(r.workspace_id),
       potId: (r.pot_id as string | null) ?? null,
+      accountId: (r.account_id as string | null) ?? null,
       name: String(r.name),
       amountMinor: Number(r.amount_minor),
       currency: r.currency as CurrencyCode,
@@ -906,6 +974,7 @@ export class FinanceStore {
     return rows.map((r) => ({
       id: String(r.id),
       obligationId: String(r.obligation_id),
+      accountId: (r.account_id as string | null) ?? null,
       yearMonth: String(r.year_month),
       dueDate: String(r.due_date),
       expectedMinor: Number(r.expected_minor),
@@ -923,6 +992,7 @@ export class FinanceStore {
   ): Array<{
     id: string;
     incomeId: string;
+    accountId: string | null;
     yearMonth: string;
     expectedDate: string;
     receivedMinor: number;
@@ -940,6 +1010,7 @@ export class FinanceStore {
     return rows.map((r) => ({
       id: String(r.id),
       incomeId: String(r.income_id),
+      accountId: (r.account_id as string | null) ?? null,
       yearMonth: String(r.year_month),
       expectedDate: String(r.expected_date),
       receivedMinor: Number(r.received_minor),
@@ -951,6 +1022,7 @@ export class FinanceStore {
 
   public setIncomeReceived(params: {
     incomeId: string;
+    accountId?: string | null;
     yearMonth: string;
     expectedDate: string;
     amountMinor: number;
@@ -960,9 +1032,10 @@ export class FinanceStore {
     if (params.received) {
       this.db
         .prepare(
-          `INSERT INTO income_occurrences (id, income_id, year_month, expected_date, received_minor, currency, status, received_at)
-           VALUES (?, ?, ?, ?, ?, ?, 'received', ?)
+          `INSERT INTO income_occurrences (id, income_id, account_id, year_month, expected_date, received_minor, currency, status, received_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'received', ?)
            ON CONFLICT(income_id, year_month) DO UPDATE SET
+             account_id = excluded.account_id,
              received_minor = excluded.received_minor,
              status = 'received',
              received_at = excluded.received_at`
@@ -970,6 +1043,7 @@ export class FinanceStore {
         .run(
           `incocc-${crypto.randomUUID().slice(0, 8)}`,
           params.incomeId,
+          params.accountId ?? null,
           params.yearMonth,
           params.expectedDate,
           params.amountMinor,
@@ -1002,6 +1076,8 @@ export class FinanceStore {
       id: String(r.id),
       workspaceId: String(r.workspace_id),
       potId: (r.pot_id as string | null) ?? null,
+      accountId: (r.account_id as string | null) ?? null,
+      flowDirection: r.flow_direction === 'inflow' ? 'inflow' : 'outflow',
       merchant: String(r.merchant),
       description: String(r.description ?? ''),
       amountMinor: Number(r.amount_minor),
@@ -1359,6 +1435,7 @@ export class FinanceStore {
     insSnap.run('snap-wal-2024', 'ws-walter', '2024-01-01', 2400000, 0, 2400000, 6500000, '2024 start');
     insSnap.run('snap-wal-2025', 'ws-walter', '2025-01-01', 2950000, 0, 2950000, 7000000, '2025 start');
     insSnap.run('snap-wal-2026', 'ws-walter', '2026-01-01', 3460000, 0, 3460000, 7200000, '2026 start');
+    this.backfillDefaultAccountLinks();
   }
 
   public createApiKey(userId: string, label: string): { id: string; rawToken: string; keyPrefix: string } {

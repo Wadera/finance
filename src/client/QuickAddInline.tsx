@@ -1,6 +1,6 @@
 import { CornerDownLeft, FolderPlus, X } from 'lucide-react';
 import React, { useEffect, useRef, useState } from 'react';
-import type { CurrencyCode } from '../shared/types.js';
+import type { BankAccountRecord, CurrencyCode } from '../shared/types.js';
 import { type QuickAddTarget, apiFetch } from './api.js';
 import type { TranslationDict } from './i18n.js';
 
@@ -10,14 +10,22 @@ export const QuickAddInline: React.FC<{
   target: QuickAddTarget;
   defaultCurrency: CurrencyCode;
   yearMonth: string;
+  accounts?: BankAccountRecord[];
   t: TranslationDict;
   onCancel: () => void;
   onCreated: (result: { expandPotIds: string[] }) => Promise<void> | void;
-}> = ({ target, defaultCurrency, yearMonth, t, onCancel, onCreated }) => {
+}> = ({ target, defaultCurrency, yearMonth, accounts = [], t, onCancel, onCreated }) => {
   const [childKind, setChildKind] = useState<QuickChildKind>('pot');
   const [name, setName] = useState<string>('');
   const [amountMajor, setAmountMajor] = useState<string>('');
   const [currency, setCurrency] = useState<CurrencyCode>(target.currency || defaultCurrency);
+  const [accountId, setAccountId] = useState<string>(() => {
+    const wsAcc =
+      accounts.find((a) => a.workspaceId === target.workspaceId && a.isPrimaryRunway) ||
+      accounts.find((a) => a.workspaceId === target.workspaceId) ||
+      accounts[0];
+    return wsAcc?.id || '';
+  });
   const [dueDate, setDueDate] = useState<string>(() => {
     const [y, m] = yearMonth.split('-').map(Number);
     return `${y + 1}-${String(m).padStart(2, '0')}-15`;
@@ -28,8 +36,13 @@ export const QuickAddInline: React.FC<{
 
   useEffect(() => {
     setCurrency(target.currency || defaultCurrency);
+    const wsAcc =
+      accounts.find((a) => a.workspaceId === target.workspaceId && a.isPrimaryRunway) ||
+      accounts.find((a) => a.workspaceId === target.workspaceId) ||
+      accounts[0];
+    if (wsAcc) setAccountId(wsAcc.id);
     setTimeout(() => inputRef.current?.focus(), 10);
-  }, [target, defaultCurrency]);
+  }, [target, defaultCurrency, accounts]);
 
   const isPromotion = target.targetKind !== 'pot';
 
@@ -61,6 +74,7 @@ export const QuickAddInline: React.FC<{
             body: JSON.stringify({
               workspaceId: target.workspaceId,
               potId: target.potId,
+              accountId: accountId || null,
               name: cleanName,
               amountMinor,
               currency,
@@ -79,6 +93,8 @@ export const QuickAddInline: React.FC<{
             body: JSON.stringify({
               workspaceId: target.workspaceId,
               potId: target.potId,
+              accountId: accountId || null,
+              flowDirection: 'outflow',
               merchant: cleanName,
               description: '',
               amountMinor,
@@ -221,6 +237,22 @@ export const QuickAddInline: React.FC<{
             </option>
           ))}
         </select>
+
+        {childKind !== 'pot' && accounts.length > 0 && (
+          <select
+            value={accountId}
+            onChange={(e) => setAccountId(e.target.value)}
+            className="bg-white border border-slate-300 rounded px-2 py-1.5 text-xs text-slate-800 max-w-[180px]"
+            title={t.bankAccountLabel}
+          >
+            <option value="">{t.noAccountLinkOption}</option>
+            {accounts.map((a) => (
+              <option key={a.id} value={a.id}>
+                🏦 {a.name} ({a.currency})
+              </option>
+            ))}
+          </select>
+        )}
 
         {childKind === 'annual_goal' && (
           <input

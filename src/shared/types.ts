@@ -83,6 +83,7 @@ export interface BankAccountRecord {
 export interface IncomeStreamRecord {
   id: string;
   workspaceId: string;
+  accountId?: string | null;
   name: string;
   sourceKind: 'salary' | 'contract' | 'dividend' | 'side_income' | 'other';
   amountMinor: number;
@@ -115,6 +116,7 @@ export interface ObligationRecord {
   id: string;
   workspaceId: string;
   potId: string | null;
+  accountId?: string | null;
   name: string;
   amountMinor: number;
   currency: CurrencyCode;
@@ -140,6 +142,7 @@ export interface ObligationRecord {
 export interface PaymentOccurrenceRecord {
   id: string;
   obligationId: string;
+  accountId?: string | null;
   yearMonth: string; // YYYY-MM
   dueDate: string; // YYYY-MM-DD
   expectedMinor: number;
@@ -161,6 +164,8 @@ export interface ExpenseEntryRecord {
   id: string;
   workspaceId: string;
   potId: string | null;
+  accountId?: string | null;
+  flowDirection?: 'outflow' | 'inflow';
   merchant: string;
   description: string;
   amountMinor: number;

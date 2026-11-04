@@ -72,6 +72,7 @@ export interface BootstrapResponse {
 }
 
 export interface EnrichedObligation extends ObligationRecord {
+  accountName?: string | null;
   metrics: {
     obligationId: string;
     isDueThisMonth: boolean;
@@ -90,9 +91,13 @@ export interface EnrichedObligation extends ObligationRecord {
   preservedDisplayMinor: number;
 }
 
-export type EnrichedExpense = ExpenseEntryRecord & { displayAmountMinor: number };
+export type EnrichedExpense = ExpenseEntryRecord & {
+  displayAmountMinor: number;
+  accountName?: string | null;
+};
 
 export interface EnrichedIncome extends IncomeStreamRecord {
+  accountName?: string | null;
   monthlyDisplayMinor: number;
   expectedDate: string;
   isReceivedThisMonth: boolean;
@@ -126,10 +131,13 @@ export interface CashflowBridgeData {
 export interface TimelineLedgerEntry {
   id: string;
   kind: 'expense' | 'paid_bill' | 'sinking_set_aside';
+  flowDirection?: 'outflow' | 'inflow';
   entityType: 'expense' | 'obligation';
   entityId: string;
   occurrenceId?: string;
   workspaceId: string;
+  accountId?: string | null;
+  accountName?: string | null;
   potId: string | null;
   potName: string | null;
   potColor: string;
@@ -162,6 +170,7 @@ export interface BudgetMonthResponse {
   scope: string;
   displayCurrency: CurrencyCode;
   accounts: BankAccountRecord[];
+  allAccounts?: BankAccountRecord[];
   incomes: EnrichedIncome[];
   allIncomes: IncomeStreamRecord[];
   pots: PotRecord[];
