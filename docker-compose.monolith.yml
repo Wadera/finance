@@ -1,0 +1,39 @@
+services:
+  skyday-finance:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: skyday-finance:latest
+    container_name: skyday-finance
+    restart: unless-stopped
+    ports:
+      - "192.168.40.23:3020:3020"
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: "3020"
+      DATA_DIR: /data
+    volumes:
+      - skyday_finance_data:/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - skyday_finance_net
+      - authentik_proxy
+
+volumes:
+  skyday_finance_data:
+    name: skyday_finance_data
+
+networks:
+  skyday_finance_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.100.16.0/24
+  authentik_proxy:
+    external: true
