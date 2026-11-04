@@ -1,8 +1,10 @@
 import {
+  Check,
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
   Circle,
+  Copy,
   Download,
   ExternalLink,
   Eye,
@@ -84,6 +86,75 @@ function shiftMonth(ym: string, delta: number): string {
   return `${ny}-${String(nm).padStart(2, '0')}`;
 }
 
+function buildAgentBootstrapPrompt(params: {
+  origin: string;
+  displayName: string;
+  personalWorkspaceId: string;
+  defaultCurrency: CurrencyCode;
+  token: string;
+}): string {
+  const mcpUrl = `${params.origin}/api/mcp`;
+  const attachUrl = `${params.origin}/api/attachments`;
+  return `Connect to my **Skyday Finance & Budget** MCP server so you can read my spending pots, check monthly budgets, categorize receipt photos/invoices, and tick scheduled bills as paid.
+
+### 1. Connection & Credentials
+- **MCP Endpoint (Streamable HTTP / JSON-RPC 2.0 \`POST\`):** \`${mcpUrl}\`
+- **Attachment Upload Endpoint (Multipart \`POST\`):** \`${attachUrl}\`
+- **Authorization Header:** \`Authorization: Bearer ${params.token}\`
+- **Authenticated Account:** ${params.displayName} (Default currency: \`${params.defaultCurrency}\`)
+- **Workspaces:** \`ws-home\` (Shared Household) and \`${params.personalWorkspaceId}\` (${params.displayName} Personal)
+
+> Security rule: Store this Bearer token in your secret file or local \`mcp_config.json\` (mode 0600); never commit it to Git or echo it into public reports.
+
+### 2. Register in \`mcp_config.json\`
+If your client supports Streamable HTTP MCP with headers:
+\`\`\`json
+{
+  "mcpServers": {
+    "skyday-finance": {
+      "url": "${mcpUrl}",
+      "headers": {
+        "Authorization": "Bearer ${params.token}"
+      }
+    }
+  }
+}
+\`\`\`
+*(If your MCP host uses Stdio without custom HTTP header support, use \`mcp-remote\`):*
+\`\`\`json
+{
+  "mcpServers": {
+    "skyday-finance": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "${mcpUrl}",
+        "--header",
+        "Authorization: Bearer ${params.token}"
+      ]
+    }
+  }
+}
+\`\`\`
+
+### 3. Direct JSON-RPC 2.0 Handshake & Tools (Works Immediately via HTTP \`POST\`)
+Even before restarting your MCP host, you can call \`${mcpUrl}\` directly via HTTP \`POST\` with \`Content-Type: application/json\` and \`Authorization: Bearer ${params.token}\`:
+
+1. **Discover Pots (\`list_pots\`):** Always call \`list_pots\` first to map a receipt/invoice to the right nested pot ID (e.g. \`Home & Utilities -> Food & Groceries -> Butcher & Meat\`, \`Car & Moto Fleet -> Fuel\`).
+2. **Log Categorized Receipt (\`log_expense_receipt\`):** Pass \`workspaceId\` (\`ws-home\` or \`${params.personalWorkspaceId}\`), \`potId\`, \`merchant\`, \`amountMajor\`, \`currency\` (\`GBP\`|\`EUR\`|\`PLN\`|\`USD\`|\`CHF\`), \`spentDate\` (\`YYYY-MM-DD\`), and optional itemized \`items: [{ name, subCategory, amountMajor }]\`. Returns \`expenseId\`.
+3. **Attach Receipt Photo / PDF (\`attach_receipt_base64\`):** Pass \`entityType: "expense"\`, \`entityId: "<expenseId>"\`, \`workspaceId\`, \`fileName\`, \`mimeType\`, and \`dataBase64\` to store the receipt image/PDF in the Skyday Finance vault.
+4. **Budget & Bills (\`get_monthly_budget\`, \`list_upcoming_obligations\`, \`mark_obligation_paid\`):** Query monthly budget/Preserve sinking-fund status or mark a bill paid.
+
+Verify connection now by calling \`tools/list\` against \`${mcpUrl}\`:
+\`\`\`bash
+curl -sS -X POST "${mcpUrl}" \\
+  -H "Authorization: Bearer ${params.token}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+\`\`\``;
+}
+
 export const App: React.FC = () => {
   const [auth, setAuth] = useState<AuthStatusResponse | null>(null);
   const [boot, setBoot] = useState<BootstrapResponse | null>(null);
@@ -105,6 +176,8 @@ export const App: React.FC = () => {
   const [drawer, setDrawer] = useState<DrawerSubject | null>(null);
   const [drawerAttachments, setDrawerAttachments] = useState<AttachmentRecord[]>([]);
   const [newlyMintedKey, setNewlyMintedKey] = useState<string | null>(null);
+  const [agentKeyLabel, setAgentKeyLabel] = useState<string>('');
+  const [copiedNotice, setCopiedNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -1368,11 +1441,7 @@ export const App: React.FC = () => {
                         <span className="text-slate-400">({acc.institution})</span>
                       </div>
                       <div className="font-mono-num font-semibold">
-                        {privacyMode
-                          ? '•••'
-                          : `${CURRENCY_SYMBOLS[acc.currency]}${(acc.balanceMinor / 100).toLocaleString('en-GB', {
-                              minimumFractionDigits: 2,
-                            })}`}
+                        {formatDisplayValue(acc.balanceMinor, { currency: acc.currency, privacyMode })}
                       </div>
                     </div>
                   ))}
@@ -1381,35 +1450,137 @@ export const App: React.FC = () => {
 
               {/* MCP Connector */}
               <section className="bg-white border border-slate-200 rounded-lg p-5 space-y-3">
-                <div className="flex items-center justify-between">
+                <div className="space-y-2.5">
                   <div>
                     <h2 className="text-xs font-mono-num uppercase tracking-wider text-slate-500 font-semibold flex items-center gap-1.5">
                       <Sparkles className="w-3.5 h-3.5 text-teal-700" /> AI / Receipt MCP Connector (`/api/mcp`)
                     </h2>
                     <p className="text-[11px] text-slate-400">
-                      Generate a scoped token so AI agents can categorize receipt photos directly into your pots.
+                      Mint a scoped key or 1-click copy a complete Agent Bootstrap Prompt (endpoint + token + MCP config) for any AI agent.
                     </p>
                   </div>
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      const res = await apiFetch<{ rawToken: string }>('/api/settings/api-keys', {
-                        method: 'POST',
-                        body: JSON.stringify({ label: `${boot.user.displayName} MCP Agent` }),
-                      });
-                      setNewlyMintedKey(res.rawToken);
-                      await reloadAll();
-                    }}
-                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded bg-teal-700 text-white text-xs font-medium"
-                  >
-                    <KeyRound className="w-3.5 h-3.5" /> Mint Key
-                  </button>
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <input
+                      type="text"
+                      value={agentKeyLabel}
+                      onChange={(e) => setAgentKeyLabel(e.target.value)}
+                      placeholder={`${boot.user.displayName} MCP Agent`}
+                      className="flex-1 min-w-[140px] border border-slate-200 rounded px-2.5 py-1.5 text-xs"
+                    />
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        const label = agentKeyLabel.trim() || `${boot.user.displayName} MCP Agent`;
+                        const res = await apiFetch<{ rawToken: string }>('/api/settings/api-keys', {
+                          method: 'POST',
+                          body: JSON.stringify({ label }),
+                        });
+                        setNewlyMintedKey(res.rawToken);
+                        setAgentKeyLabel('');
+                        const promptText = buildAgentBootstrapPrompt({
+                          origin: window.location.origin,
+                          displayName: boot.user.displayName,
+                          personalWorkspaceId: boot.user.personalWorkspaceId,
+                          defaultCurrency: boot.user.defaultCurrency,
+                          token: res.rawToken,
+                        });
+                        await navigator.clipboard.writeText(promptText).catch(() => {});
+                        setCopiedNotice('Minted & copied full Agent Bootstrap Prompt to clipboard!');
+                        setTimeout(() => setCopiedNotice(null), 4000);
+                        await reloadAll();
+                      }}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded bg-slate-900 text-white text-xs font-medium hover:bg-slate-800 transition"
+                    >
+                      <Copy className="w-3.5 h-3.5 text-teal-400" /> Mint & Copy Bootstrap Prompt
+                    </button>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        const label = agentKeyLabel.trim() || `${boot.user.displayName} MCP Agent`;
+                        const res = await apiFetch<{ rawToken: string }>('/api/settings/api-keys', {
+                          method: 'POST',
+                          body: JSON.stringify({ label }),
+                        });
+                        setNewlyMintedKey(res.rawToken);
+                        setAgentKeyLabel('');
+                        await reloadAll();
+                      }}
+                      className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded border border-teal-700 text-teal-800 bg-teal-50/60 hover:bg-teal-100/70 text-xs font-medium transition"
+                    >
+                      <KeyRound className="w-3.5 h-3.5" /> Mint Key
+                    </button>
+                  </div>
                 </div>
 
+                {copiedNotice && (
+                  <div className="px-3 py-2 rounded bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs flex items-center gap-1.5 font-medium">
+                    <Check className="w-3.5 h-3.5 shrink-0" />
+                    <span>{copiedNotice}</span>
+                  </div>
+                )}
+
                 {newlyMintedKey && (
-                  <div className="p-2.5 rounded bg-amber-50 border border-amber-200 text-xs font-mono-num break-all space-y-1">
-                    <div className="font-semibold text-amber-900">Copy token now (shown once):</div>
-                    <div className="text-slate-900 select-all">{newlyMintedKey}</div>
+                  <div className="p-3 rounded-lg bg-amber-50/80 border border-amber-200 text-xs space-y-2.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="font-semibold text-amber-900">
+                        New Scoped Token & Agent Bootstrap Prompt (shown once):
+                      </span>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            await navigator.clipboard.writeText(newlyMintedKey);
+                            setCopiedNotice('Raw token copied to clipboard!');
+                            setTimeout(() => setCopiedNotice(null), 3000);
+                          }}
+                          className="inline-flex items-center gap-1 px-2 py-1 rounded border border-amber-300 bg-white text-slate-700 text-[11px] hover:bg-amber-50"
+                        >
+                          <Copy className="w-3 h-3" /> Copy Token
+                        </button>
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            const promptText = buildAgentBootstrapPrompt({
+                              origin: window.location.origin,
+                              displayName: boot.user.displayName,
+                              personalWorkspaceId: boot.user.personalWorkspaceId,
+                              defaultCurrency: boot.user.defaultCurrency,
+                              token: newlyMintedKey,
+                            });
+                            await navigator.clipboard.writeText(promptText);
+                            setCopiedNotice('Full Agent Bootstrap Prompt copied to clipboard!');
+                            setTimeout(() => setCopiedNotice(null), 3000);
+                          }}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-teal-700 text-white text-[11px] font-medium hover:bg-teal-800"
+                        >
+                          <Copy className="w-3 h-3" /> Copy Bootstrap Prompt
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="font-mono-num text-[11px] bg-white border border-amber-200 rounded px-2.5 py-1.5 break-all select-all text-slate-800">
+                      {newlyMintedKey}
+                    </div>
+
+                    <details className="group">
+                      <summary className="cursor-pointer text-[11px] font-medium text-teal-800 hover:underline">
+                        Preview / manually select full Agent Bootstrap Prompt
+                      </summary>
+                      <textarea
+                        readOnly
+                        rows={11}
+                        onFocus={(e) => e.currentTarget.select()}
+                        value={buildAgentBootstrapPrompt({
+                          origin: window.location.origin,
+                          displayName: boot.user.displayName,
+                          personalWorkspaceId: boot.user.personalWorkspaceId,
+                          defaultCurrency: boot.user.defaultCurrency,
+                          token: newlyMintedKey,
+                        })}
+                        className="mt-2 w-full font-mono-num text-[11px] bg-white border border-slate-200 rounded p-2.5 text-slate-700 leading-relaxed"
+                      />
+                    </details>
                   </div>
                 )}
 
