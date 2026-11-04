@@ -106,7 +106,10 @@ export function mapIdentityToUser(
 
   if (
     uname === 'walter' ||
+    uname === 'wojciech' ||
     uname === 'wpoznanski' ||
+    uname === 'poznanski.wojciech@gmail.com' ||
+    email === 'poznanski.wojciech@gmail.com' ||
     email === 'wpoznanski@skyday.eu' ||
     email === 'walter@skyday.eu'
   ) {

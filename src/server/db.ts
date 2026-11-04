@@ -282,7 +282,7 @@ export class FinanceStore {
       VALUES (?, ?, ?, ?, ?, ?)
     `);
     insertUser.run('usr-wadera', 'wadera', 'Wadera', 'pstopa@skyday.eu', 'GBP', 'ws-wadera');
-    insertUser.run('usr-walter', 'walter', 'Walter', 'wpoznanski@skyday.eu', 'GBP', 'ws-walter');
+    insertUser.run('usr-walter', 'walter', 'Walter', 'poznanski.wojciech@gmail.com', 'GBP', 'ws-walter');
 
     const insertWs = this.db.prepare(`
       INSERT OR IGNORE INTO workspaces (id, slug, name, kind, owner_user_id, partner_visibility, default_split_mode, wadera_custom_split_bp)
