@@ -118,13 +118,24 @@ export const CashflowSankeyChart: React.FC<{
       expsByPot.set(k, list);
     }
 
-    // --- TOP TRACK (SOLID): Previous Month Overflow -> This Month Pool -> This Month Spending Pots ---
+    // --- UNIFIED SINGLE SANKEY:
+    // Left (Inflows combining into single Monthly Pool):
+    //   1. Previous Month Overflow (Solid Green)
+    //   2. Upcoming Salary (Dashed Green until ticked received on Timeline; Solid Green once ticked)
+    // Middle:
+    //   Single Monthly Pool
+    // Right (Spreading out from Monthly Pool):
+    //   1. This Month Spending Pots (Solid, click-to-unfoldable to unlimited depth)
+    //   2. Next Month Needed Before Salary (Dashed Red, click-to-unfoldable into next month's pre-salary pots)
+    //   3. Unallocated Savings / Buffer (what remains after BOTH this month's spending AND next month's pre-salary reserve)
     const poolId = 'pool-budget';
-    const overflowMinor =
-      cashflowBridge && cashflowBridge.overflowInMinor > 0
-        ? cashflowBridge.overflowInMinor
-        : totalIncomeMinor;
-    const poolMinor = Math.max(overflowMinor, potPlannedTotalMinor);
+    const overflowMinor = cashflowBridge ? cashflowBridge.overflowInMinor : 0;
+    const upcomingMinor = cashflowBridge ? cashflowBridge.upcomingSalaryTotalMinor : totalIncomeMinor;
+    const nextNeededMinor = cashflowBridge ? cashflowBridge.nextMonthPreSalaryMinor : 0;
+
+    const totalInflowMinor = overflowMinor + upcomingMinor;
+    const totalOutflowCommitmentsMinor = potPlannedTotalMinor + nextNeededMinor;
+    const poolMinor = Math.max(totalInflowMinor, totalOutflowCommitmentsMinor);
 
     nodes.push({
       id: poolId,
@@ -157,8 +168,32 @@ export const CashflowSankeyChart: React.FC<{
       });
     }
 
-    if (overflowMinor < potPlannedTotalMinor) {
-      const gap = potPlannedTotalMinor - overflowMinor;
+    for (const inc of incomes) {
+      if (inc.monthlyDisplayMinor <= 0) continue;
+      if (cashflowBridge && inc.paydayDay < 12 && inc.isReceivedThisMonth) continue;
+      const nid = `inc-upcoming-${inc.id}`;
+      const pending = !inc.isReceivedThisMonth;
+      nodes.push({
+        id: nid,
+        name: `${pending ? '' : '✓ '}${t.sankeyUpcomingSalary}: ${inc.name} (${inc.paydayDay}.)`,
+        color: pending ? '#16A34A' : '#15803D',
+        displayMinor: inc.monthlyDisplayMinor,
+        nodeKind: 'income',
+        canUnfold: false,
+        isExpanded: false,
+        dashed: pending,
+      });
+      links.push({
+        source: nid,
+        target: poolId,
+        value: Math.max(1, inc.monthlyDisplayMinor),
+        dashed: pending,
+        strokeColorOverride: '#16A34A',
+      });
+    }
+
+    if (totalInflowMinor < totalOutflowCommitmentsMinor) {
+      const gap = totalOutflowCommitmentsMinor - totalInflowMinor;
       nodes.push({
         id: 'inc-drawdown',
         name: t.sankeyDrawdown,
@@ -169,7 +204,7 @@ export const CashflowSankeyChart: React.FC<{
         isExpanded: false,
       });
       links.push({ source: 'inc-drawdown', target: poolId, value: Math.max(1, gap) });
-    } else if (overflowMinor === 0 && potTree.length > 0) {
+    } else if (totalInflowMinor === 0 && potTree.length > 0) {
       nodes.push({
         id: 'inc-placeholder',
         name: t.sankeyPrevOverflow,
@@ -350,131 +385,74 @@ export const CashflowSankeyChart: React.FC<{
       links.push({ source: poolId, target: expNodeId, value: Math.max(1, exp.displayAmountMinor) });
     }
 
-    const topBufferMinor =
-      cashflowBridge != null ? cashflowBridge.thisMonthBufferMinor : Math.max(0, netMonthlySurplusMinor);
-    if (topBufferMinor > 0) {
+    // Next Month Needed Before Salary (Dashed Red outflow from the same unified central pool, click-to-unfoldable!)
+    if (cashflowBridge && cashflowBridge.nextMonthPreSalaryMinor > 0) {
+      const nextNeedId = 'out-next-month-needed';
+      const canUnfoldNext = cashflowBridge.nextMonthBreakdown.length > 0;
+      const isNextExpanded = canUnfoldNext && expandedPotIds.has('__next_month_needed__');
+
       nodes.push({
-        id: 'out-surplus',
-        name: t.sankeyThisMonthBuffer,
-        color: '#10B981',
-        displayMinor: topBufferMinor,
-        nodeKind: 'surplus',
-        canUnfold: false,
-        isExpanded: false,
+        id: nextNeedId,
+        name: `${t.sankeyNextMonthNeeded} (1–${Math.max(1, cashflowBridge.primaryPaydayDay - 1)}.)`,
+        color: '#DC2626',
+        displayMinor: cashflowBridge.nextMonthPreSalaryMinor,
+        nodeKind: 'next_needed',
+        canUnfold: canUnfoldNext,
+        isExpanded: isNextExpanded,
+        dashed: true,
       });
-      links.push({ source: poolId, target: 'out-surplus', value: topBufferMinor });
+      links.push({
+        source: poolId,
+        target: nextNeedId,
+        value: Math.max(1, cashflowBridge.nextMonthPreSalaryMinor),
+        dashed: true,
+        strokeColorOverride: '#DC2626',
+      });
+
+      if (isNextExpanded) {
+        for (const item of cashflowBridge.nextMonthBreakdown) {
+          nodes.push({
+            id: item.id,
+            name: item.name,
+            color: item.color || '#DC2626',
+            displayMinor: item.displayMinor,
+            nodeKind: 'other',
+            canUnfold: false,
+            isExpanded: false,
+            dashed: true,
+          });
+          links.push({
+            source: nextNeedId,
+            target: item.id,
+            value: Math.max(1, item.displayMinor),
+            dashed: true,
+            strokeColorOverride: '#DC2626',
+          });
+        }
+      }
     }
 
-    // --- BOTTOM TRACK (DOTTED / PAYDAY BRIDGE): Upcoming Salary (27th) -> Next-Cycle Bridge -> Next Month Needed Before Salary ---
-    if (cashflowBridge && cashflowBridge.upcomingSalaryTotalMinor > 0) {
-      const nextPoolId = 'pool-next-cycle';
-      const anyPending = cashflowBridge.upcomingSalaryPendingMinor > 0;
-      const bridgeMinor = Math.max(
-        cashflowBridge.upcomingSalaryTotalMinor,
-        cashflowBridge.nextMonthPreSalaryMinor
-      );
-
+    // True Remaining Buffer / Unallocated Savings (after BOTH this month's spending AND next month's pre-salary reserve)
+    const combinedFreeBufferMinor = Math.max(0, totalInflowMinor - totalOutflowCommitmentsMinor);
+    if (combinedFreeBufferMinor > 0) {
+      const anyPending = cashflowBridge ? cashflowBridge.upcomingSalaryPendingMinor > 0 : false;
       nodes.push({
-        id: nextPoolId,
-        name: t.sankeyNextCycleBridge,
-        color: '#334155',
-        displayMinor: bridgeMinor,
-        nodeKind: 'pool',
+        id: 'out-surplus',
+        name: t.sankeySurplus,
+        color: '#10B981',
+        displayMinor: combinedFreeBufferMinor,
+        nodeKind: 'surplus',
         canUnfold: false,
         isExpanded: false,
         dashed: anyPending,
       });
-
-      for (const inc of incomes) {
-        if (inc.monthlyDisplayMinor <= 0) continue;
-        if (inc.paydayDay < 12 && inc.isReceivedThisMonth) continue;
-        const nid = `inc-upcoming-${inc.id}`;
-        const pending = !inc.isReceivedThisMonth;
-        nodes.push({
-          id: nid,
-          name: `${pending ? '' : '✓ '}${t.sankeyUpcomingSalary}: ${inc.name} (${inc.paydayDay}.)`,
-          color: pending ? '#16A34A' : '#15803D',
-          displayMinor: inc.monthlyDisplayMinor,
-          nodeKind: 'income',
-          canUnfold: false,
-          isExpanded: false,
-          dashed: pending,
-        });
-        links.push({
-          source: nid,
-          target: nextPoolId,
-          value: Math.max(1, inc.monthlyDisplayMinor),
-          dashed: pending,
-          strokeColorOverride: '#16A34A',
-        });
-      }
-
-      if (cashflowBridge.nextMonthPreSalaryMinor > 0) {
-        const nextNeedId = 'out-next-month-needed';
-        const canUnfoldNext = cashflowBridge.nextMonthBreakdown.length > 0;
-        const isNextExpanded = canUnfoldNext && expandedPotIds.has('__next_month_needed__');
-
-        nodes.push({
-          id: nextNeedId,
-          name: `${t.sankeyNextMonthNeeded} (1–${Math.max(1, cashflowBridge.primaryPaydayDay - 1)}.)`,
-          color: '#DC2626',
-          displayMinor: cashflowBridge.nextMonthPreSalaryMinor,
-          nodeKind: 'next_needed',
-          canUnfold: canUnfoldNext,
-          isExpanded: isNextExpanded,
-          dashed: true,
-        });
-        links.push({
-          source: nextPoolId,
-          target: nextNeedId,
-          value: Math.max(1, cashflowBridge.nextMonthPreSalaryMinor),
-          dashed: true,
-          strokeColorOverride: '#DC2626',
-        });
-
-        if (isNextExpanded) {
-          for (const item of cashflowBridge.nextMonthBreakdown) {
-            nodes.push({
-              id: item.id,
-              name: item.name,
-              color: '#DC2626',
-              displayMinor: item.displayMinor,
-              nodeKind: 'other',
-              canUnfold: false,
-              isExpanded: false,
-              dashed: true,
-            });
-            links.push({
-              source: nextNeedId,
-              target: item.id,
-              value: Math.max(1, item.displayMinor),
-              dashed: true,
-              strokeColorOverride: '#DC2626',
-            });
-          }
-        }
-      }
-
-      if (cashflowBridge.projectedFreeFromUpcomingMinor > 0) {
-        const freeId = 'out-next-cycle-free';
-        nodes.push({
-          id: freeId,
-          name: t.sankeyProjectedFree,
-          color: '#0D9488',
-          displayMinor: cashflowBridge.projectedFreeFromUpcomingMinor,
-          nodeKind: 'surplus',
-          canUnfold: false,
-          isExpanded: false,
-          dashed: anyPending,
-        });
-        links.push({
-          source: nextPoolId,
-          target: freeId,
-          value: Math.max(1, cashflowBridge.projectedFreeFromUpcomingMinor),
-          dashed: anyPending,
-          strokeColorOverride: '#0D9488',
-        });
-      }
+      links.push({
+        source: poolId,
+        target: 'out-surplus',
+        value: Math.max(1, combinedFreeBufferMinor),
+        dashed: anyPending,
+        strokeColorOverride: '#10B981',
+      });
     }
 
     if (nodes.length < 2 || links.length === 0) return null;
@@ -505,9 +483,9 @@ export const CashflowSankeyChart: React.FC<{
     const maxNodesInCol = Math.max(3, ...Array.from(colCounts.values()));
     const numCols = maxDepth + 1;
 
-    const width = numCols <= 3 ? 860 : Math.max(860, numCols * 255 + 95);
-    const height = Math.max(295, maxNodesInCol * 46 + 34);
-    const rightMargin = 205;
+    const width = numCols <= 3 ? 900 : Math.max(900, numCols * 265 + 130);
+    const height = Math.max(320, maxNodesInCol * 46 + 40);
+    const rightMargin = 245;
 
     const finalLayout = sankey<SankeyNodeDatum, SankeyLinkDatum>()
       .nodeId((d) => d.id)
@@ -524,7 +502,7 @@ export const CashflowSankeyChart: React.FC<{
       links: links.map((l) => ({ ...l })),
     });
 
-    return { graph, width, height, numCols, maxDepth };
+    return { graph, width, height, numCols, maxDepth, poolMinor };
   }, [
     incomes,
     cashflowBridge,
@@ -547,9 +525,9 @@ export const CashflowSankeyChart: React.FC<{
     );
   }
 
-  const { graph, width, height, numCols, maxDepth } = model;
+  const { graph, width, height, numCols, maxDepth, poolMinor } = model;
   const pathGen = sankeyLinkHorizontal();
-  const denom = totalIncomeMinor > 0 ? totalIncomeMinor : Math.max(1, potPlannedTotalMinor);
+  const denom = Math.max(1, poolMinor);
 
   const triggerQuickAddForNode = (node: SankeyNodeDatum) => {
     if (node.nodeKind === 'pot' && node.potRef) {
@@ -631,11 +609,11 @@ export const CashflowSankeyChart: React.FC<{
                   key={idx}
                   d={d}
                   stroke={strokeColor}
-                  strokeOpacity={isDashed ? 0.55 : 0.26}
-                  strokeDasharray={isDashed ? '7 5' : undefined}
-                  strokeLinecap={isDashed ? 'round' : undefined}
-                  strokeWidth={isDashed ? Math.max(2.5, (link.width || 3) * 0.7) : Math.max(2, link.width || 2)}
-                  className="transition-opacity hover:stroke-opacity-70"
+                  strokeOpacity={isDashed ? 0.36 : 0.25}
+                  strokeDasharray={isDashed ? '10 6' : undefined}
+                  strokeLinecap="butt"
+                  strokeWidth={Math.max(2, link.width || 2)}
+                  className="transition-opacity hover:stroke-opacity-55"
                 />
               );
             })}
@@ -689,7 +667,7 @@ export const CashflowSankeyChart: React.FC<{
               node.nodeKind === 'next_needed' ||
               (node.nodeKind === 'expense' && node.canUnfold);
 
-            const colMaxWidthPx = depth >= maxDepth ? 192 : 178;
+            const colMaxWidthPx = depth >= maxDepth ? 230 : 195;
 
             return (
               <div
