@@ -1,4 +1,5 @@
 import {
+  AlertTriangle,
   Building2,
   Check,
   CheckCircle2,
@@ -1530,7 +1531,13 @@ export const App: React.FC = () => {
                     <Landmark className="w-3.5 h-3.5 text-teal-700" /> {t.bankAccountsTitle} ({allAvailableAccounts.length})
                   </span>
                   <span className="text-[11px] font-mono-num text-slate-500">
-                    · Total: <strong className="text-slate-900">{fmt(budget.runway.totalLiquidAssetsMinor)}</strong>
+                    · Total:{' '}
+                    <strong className="text-slate-900">
+                      {fmt(
+                        (budget.accountAnalytics || []).reduce((s, a) => s + a.displayBalanceMinor, 0) ||
+                          budget.runway.runwayCashMinor
+                      )}
+                    </strong>
                   </span>
                 </button>
 
@@ -1568,7 +1575,10 @@ export const App: React.FC = () => {
                 >
                   <span>All Accounts (Combined)</span>
                   <span className="font-mono-num text-[11px] opacity-80">
-                    {fmt(budget.runway.totalLiquidAssetsMinor)}
+                    {fmt(
+                      (budget.accountAnalytics || []).reduce((s, a) => s + a.displayBalanceMinor, 0) ||
+                        budget.runway.runwayCashMinor
+                    )}
                   </span>
                 </button>
                 {allAvailableAccounts.map((acc) => {
@@ -1671,7 +1681,7 @@ export const App: React.FC = () => {
                                 {analytics.lockedItems.length > 0 && (
                                   <div className="text-[9.5px] text-slate-500 pl-2 border-l-2 border-amber-300 space-y-0.5 mt-0.5">
                                     {analytics.lockedItems.map((li) => (
-                                      <div key={li.id} className="flex justify-between">
+                                      <div key={li.obligationId} className="flex justify-between">
                                         <span className="truncate max-w-[160px]">{li.name}</span>
                                         <span>
                                           {fmt(li.preservedDisplayMinor)} / {fmt(li.targetDisplayMinor)}
@@ -2222,7 +2232,7 @@ export const App: React.FC = () => {
               <div className="divide-y divide-slate-100">
                 {budget.obligations.map((ob) => {
                   const isDueNow = ob.metrics.isDueThisMonth;
-                  const isMultiMonth = ob.metrics.intervalMonths > 1 || ob.cadence === 'annual';
+                  const isMultiMonth = ob.intervalMonths > 1 || ob.cadence === 'annual';
                   const isExpanded = preserveExpandedIds.has(ob.id);
                   const progressPct =
                     ob.amountMinor > 0 ? Math.min(100, Math.round((ob.preservedMinor / ob.amountMinor) * 100)) : 0;
@@ -2408,7 +2418,9 @@ export const App: React.FC = () => {
                             </div>
                             <div>
                               <span className="text-slate-400 block">Pot / Category:</span>
-                              <span className="font-semibold text-slate-700">{ob.potName}</span>
+                              <span className="font-semibold text-slate-700">
+                                {ob.potId ? potBreadcrumbs.get(ob.potId)?.pathString || '—' : '—'}
+                              </span>
                             </div>
                           </div>
                         </div>
@@ -4682,7 +4694,7 @@ export const App: React.FC = () => {
                                 </div>
                                 <div className="pl-2.5 border-l-2 border-amber-300 space-y-1 text-[10.5px] text-slate-600 my-1">
                                   {analytics.lockedItems.map((li) => (
-                                    <div key={li.id} className="flex justify-between gap-2">
+                                    <div key={li.obligationId} className="flex justify-between gap-2">
                                       <span className="truncate">
                                         {li.name} (due {li.nextDueDate})
                                       </span>
