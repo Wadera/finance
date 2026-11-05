@@ -443,11 +443,14 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       .filter((i) => !i.isReceivedThisMonth)
       .reduce((s, i) => s + i.monthlyDisplayMinor, 0);
 
-    const unallocatedEnvelopeRemainingMinor = potTree.reduce((s, n) => {
-      const sumEnv = (node: (typeof potTree)[number]): number =>
-        node.unallocatedEnvelopeDisplayMinor + node.children.reduce((acc, c) => acc + sumEnv(c), 0);
-      return s + sumEnv(n);
-    }, 0);
+    const isPastMonth = ym < todayIso.slice(0, 7);
+    const unallocatedEnvelopeRemainingMinor = isPastMonth
+      ? 0
+      : potTree.reduce((s, n) => {
+          const sumEnv = (node: (typeof potTree)[number]): number =>
+            node.unallocatedEnvelopeDisplayMinor + node.children.reduce((acc, c) => acc + sumEnv(c), 0);
+          return s + sumEnv(n);
+        }, 0);
 
     const unpaidPreserveSliceMinor = enrichedObligations
       .filter((o) => !o.metrics.isDueThisMonth && !o.isPaidThisMonth && o.preserveDisplayMinor > 0)
@@ -580,8 +583,6 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     const receivedIncomesThisMonthMinor = activeIncomes
       .filter((i) => i.isReceivedThisMonth)
       .reduce((s, i) => s + i.monthlyDisplayMinor, 0);
-    const startOfMonthCashMinor =
-      runwayCashMinor + completedOutflowsThisMonthMinor - receivedIncomesThisMonthMinor;
 
     const dailyCurve: Array<{
       day: number;
@@ -597,7 +598,15 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       }>;
     }> = [];
 
-    let runningBal = startOfMonthCashMinor;
+    const rawDailySteps: Array<{
+      day: number;
+      date: string;
+      cumDeltaMinor: number;
+      label?: string;
+      events: (typeof dailyCurve)[number]['events'];
+    }> = [];
+
+    let cumDelta = 0;
     for (let d = 1; d <= daysInMonth; d++) {
       const dateStr = `${ym}-${String(d).padStart(2, '0')}`;
       const dayEvents: (typeof dailyCurve)[number]['events'] = [];
@@ -609,7 +618,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
             ? Math.min(daysInMonth, Math.max(1, Number(inc.receivedAt.slice(8, 10)) || inc.paydayDay))
             : Math.min(daysInMonth, Math.max(1, inc.paydayDay));
         if (incDay === d) {
-          runningBal += inc.monthlyDisplayMinor;
+          cumDelta += inc.monthlyDisplayMinor;
           dayEvents.push({
             id: inc.id,
             kind: 'income',
@@ -624,7 +633,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       for (const entry of timelineLedger) {
         if (entry.day === d) {
           if (entry.flowDirection === 'inflow') {
-            runningBal += entry.displayAmountMinor;
+            cumDelta += entry.displayAmountMinor;
             dayEvents.push({
               id: entry.id,
               kind: 'income',
@@ -633,7 +642,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
               displayMinor: entry.displayAmountMinor,
             });
           } else {
-            runningBal -= entry.displayAmountMinor;
+            cumDelta -= entry.displayAmountMinor;
             dayEvents.push({
               id: entry.id,
               kind: entry.kind,
@@ -650,7 +659,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
         if (ob.isPaidThisMonth) continue;
         const obDay = Math.min(daysInMonth, Math.max(1, ob.dueDay || 1));
         if (ob.metrics.isDueThisMonth && obDay === d) {
-          runningBal -= ob.dueDisplayMinor;
+          cumDelta -= ob.dueDisplayMinor;
           dayEvents.push({
             id: ob.id,
             kind: 'unpaid_bill',
@@ -658,7 +667,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
             displayMinor: ob.dueDisplayMinor,
           });
         } else if (!ob.metrics.isDueThisMonth && ob.preserveDisplayMinor > 0 && obDay === d) {
-          runningBal -= ob.preserveDisplayMinor;
+          cumDelta -= ob.preserveDisplayMinor;
           dayEvents.push({
             id: ob.id,
             kind: 'unpaid_bill',
@@ -669,12 +678,31 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       }
 
       const labels = dayEvents.map((ev) => `${ev.kind === 'income' ? '+' : '-'}${ev.title}`);
-      dailyCurve.push({
+      rawDailySteps.push({
         day: d,
         date: dateStr,
-        balanceMinor: runningBal,
+        cumDeltaMinor: cumDelta,
         label: labels.length ? labels.join(', ') : undefined,
         events: dayEvents,
+      });
+    }
+
+    const minCumDeltaMinor = Math.min(0, ...rawDailySteps.map((s) => s.cumDeltaMinor));
+    const prePaydayFloorMinor = Math.max(
+      Math.min(runwayCashMinor, Math.round(totalIncomeMinor * 0.08)),
+      Math.min(runwayCashMinor, 25000)
+    );
+    const startOfMonthCashMinor = isPastMonth
+      ? -minCumDeltaMinor + prePaydayFloorMinor
+      : runwayCashMinor + completedOutflowsThisMonthMinor - receivedIncomesThisMonthMinor;
+
+    for (const step of rawDailySteps) {
+      dailyCurve.push({
+        day: step.day,
+        date: step.date,
+        balanceMinor: startOfMonthCashMinor + step.cumDeltaMinor,
+        label: step.label,
+        events: step.events,
       });
     }
 
@@ -1106,6 +1134,18 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
               lateEvents.push({ id: e.id, kind: e.kind, title: e.title, timestamp: e.timestamp, displayMinor: e.displayAmountMinor });
             }
           }
+          if (!isCurrentMo) {
+            const maxCycleDrawdown = Math.max(50000, projectedEndBalanceMinor - prePaydayFloorMinor);
+            const rawDrawdown = -(earlyDelta + midDelta);
+            if (rawDrawdown > maxCycleDrawdown && rawDrawdown > 0) {
+              const scale = maxCycleDrawdown / rawDrawdown;
+              rawPoints[rawPoints.length - 2].deltaMinor = Math.round(earlyDelta * scale);
+              rawPoints[rawPoints.length - 1].deltaMinor = Math.round(midDelta * scale);
+              lateDelta = -(rawPoints[rawPoints.length - 2].deltaMinor + rawPoints[rawPoints.length - 1].deltaMinor);
+            } else if (rawDrawdown > 0) {
+              lateDelta = rawDrawdown;
+            }
+          }
           rawPoints.push({
             date: `${mKey}-27`,
             deltaMinor: lateDelta,
@@ -1113,9 +1153,16 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
           });
         }
 
-        // Compute running balance anchored so the final point equals projectedEndBalanceMinor
+        // Compute running balance anchored so the final point equals projectedEndBalanceMinor and never dips into fake debt
         const totalDelta = rawPoints.reduce((s, p) => s + p.deltaMinor, 0);
-        let bal = projectedEndBalanceMinor - totalDelta;
+        let simBal = projectedEndBalanceMinor - totalDelta;
+        let minSimBal = simBal;
+        for (const pt of rawPoints) {
+          simBal += pt.deltaMinor;
+          if (simBal < minSimBal) minSimBal = simBal;
+        }
+        const liftMinor = minSimBal < prePaydayFloorMinor ? prePaydayFloorMinor - minSimBal : 0;
+        let bal = projectedEndBalanceMinor - totalDelta + liftMinor;
         rawPoints.forEach((pt, idx) => {
           bal += pt.deltaMinor;
           dailyCurve.push({
