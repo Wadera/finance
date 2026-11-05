@@ -195,7 +195,25 @@ export const App: React.FC = () => {
   const [advisoryOpen, setAdvisoryOpen] = useState<boolean>(true);
   const [preserveExpandedIds, setPreserveExpandedIds] = useState<Set<string>>(() => new Set());
   const [sankeyShowLayers, setSankeyShowLayers] = useState<boolean>(true);
+  const [checklistPaidFolded, setChecklistPaidFolded] = useState<boolean>(true);
+  const [highlightedObId, setHighlightedObId] = useState<string | null>(null);
   const [horizonMenuOpen, setHorizonMenuOpen] = useState<boolean>(false);
+
+  const scrollToChecklistObligation = useCallback((obId: string | null) => {
+    const targetEl =
+      (obId ? document.getElementById(`checklist-ob-${obId}`) : null) ||
+      document.getElementById('checklist-shortfall-anchor') ||
+      document.getElementById('checklist-section');
+    if (targetEl) {
+      targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+    if (obId) {
+      setHighlightedObId(obId);
+      setTimeout(() => {
+        setHighlightedObId((prev) => (prev === obId ? null : prev));
+      }, 3800);
+    }
+  }, []);
   const [quickMenuOpen, setQuickMenuOpen] = useState<boolean>(false);
   const [newlyMintedKey, setNewlyMintedKey] = useState<string | null>(null);
   const [agentKeyLabel, setAgentKeyLabel] = useState<string>('');
@@ -1828,6 +1846,23 @@ export const App: React.FC = () => {
 
                           <div className="flex flex-wrap items-center justify-between gap-2 pt-1.5 border-t border-black/5 text-[10px]">
                             <div className="flex flex-wrap items-center gap-1.5 font-mono-num">
+                              {adv.kind === 'transfer_warning' && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    const firstShortfallOb = budget.obligations.find(
+                                      (o) =>
+                                        !o.isPaidThisMonth &&
+                                        o.metrics.isDueThisMonth &&
+                                        (!adv.accountId || o.accountId === adv.accountId)
+                                    );
+                                    scrollToChecklistObligation(firstShortfallOb?.id ?? null);
+                                  }}
+                                  className="px-2 py-0.5 rounded bg-rose-700 text-white font-semibold hover:bg-rose-800 transition"
+                                >
+                                  ↓ Scroll to Red Uncovered Payments
+                                </button>
+                              )}
                               {adv.accountName && (
                                 <button
                                   type="button"
@@ -1861,484 +1896,233 @@ export const App: React.FC = () => {
             )}
 
             {/* Pre-Payday Sufficiency Banner + Plotted Runway Curve + Folded-by-Default Expenses & Completed Payments Table */}
-            <section className="bg-white border border-slate-200 rounded-lg p-5 space-y-4">
-              {timelineAccountId !== 'all' && (
-                <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 rounded-md bg-teal-50 border border-teal-200 text-xs text-teal-950">
-                  <div className="flex items-center gap-2">
-                    <Landmark className="w-4 h-4 text-teal-700 shrink-0" />
-                    <span>
-                      Showing isolated timeline & cashflow for{' '}
-                      <strong>
-                        {allAvailableAccounts.find((a) => a.id === timelineAccountId)?.name || timelineAccountId}
-                      </strong>
-                    </span>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => setTimelineAccountId('all')}
-                    className="px-2 py-0.5 rounded bg-white border border-teal-300 text-[11px] font-medium text-teal-900 hover:bg-teal-800 hover:text-white transition"
-                  >
-                    Reset to All Accounts
-                  </button>
-                </div>
-              )}
+            {(() => {
+              const primaryPaydayDay =
+                budget.incomes.find((i) => i.paydayDay >= 20)?.paydayDay ||
+                budget.incomes[0]?.paydayDay ||
+                27;
 
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div>
-                  <div className="flex items-center gap-2">
-                    <span
-                      className={`inline-block w-2.5 h-2.5 rounded-full ${
-                        budget.runway.isSufficient ? 'bg-emerald-600' : 'bg-amber-600'
-                      }`}
-                    />
-                    <h2 className="text-sm font-semibold text-slate-900">
-                      {budget.runway.isSufficient ? t.runwaySufficient : t.runwayShortfall}
-                    </h2>
-                  </div>
-                  <p className="text-xs text-slate-500 mt-0.5 font-mono-num">
-                    {t.runwayCash}: {fmt(budget.runway.runwayCashMinor)} · {t.unpaidDue}:{' '}
-                    {fmt(budget.runway.unpaidPrePaydayBillsMinor)} · {t.preserveTransfers}:{' '}
-                    {fmt(budget.runway.totalPreserveSliceMinor)} · {t.remainingEnvelopes}:{' '}
-                    {fmt(budget.runway.unallocatedEnvelopeRemainingMinor)}
-                  </p>
-                  {budget.cashflowBridge.nextMonthPreSalaryMinor > 0 && timelineAccountId === 'all' && (
-                    <p className="text-xs text-rose-700 mt-1 font-mono-num">
-                      {t.nextMonthReserveLabel}{' '}
-                      <span className="font-semibold">{fmt(budget.cashflowBridge.nextMonthPreSalaryMinor)}</span>
-                    </p>
-                  )}
-                </div>
+              // Build map of accounts with pre-payday shortfall and track which specific obligations are uncovered
+              const accAnalyticsMap = new Map(
+                (budget.accountAnalytics || []).map((a) => [a.accountId, a])
+              );
+              const runningAccBalance = new Map<string, number>();
+              for (const a of budget.accountAnalytics || []) {
+                runningAccBalance.set(a.accountId, a.trueAvailableDisplayMinor);
+              }
 
-                <div className="text-right font-mono-num">
-                  <div className="text-[11px] uppercase text-slate-400">
-                    {budget.runway.isSufficient ? t.projectedBuffer : t.requiredTopUp}
-                  </div>
+              const atRiskObInfo = new Map<
+                string,
+                {
+                  accountName: string;
+                  accountBalanceMinor: number;
+                  accountDeficitMinor: number;
+                  runningAfterMinor: number;
+                  isDirectlyUncovered: boolean;
+                }
+              >();
+
+              const sortedPrePaydayUnpaid = budget.obligations
+                .filter((ob) => !ob.isPaidThisMonth && ob.metrics.isDueThisMonth && ob.dueDay < primaryPaydayDay)
+                .sort((a, b) => a.dueDay - b.dueDay);
+
+              for (const ob of sortedPrePaydayUnpaid) {
+                if (!ob.accountId) continue;
+                const stat = accAnalyticsMap.get(ob.accountId);
+                if (!stat) continue;
+                const prevBal = runningAccBalance.get(ob.accountId) ?? stat.trueAvailableDisplayMinor;
+                const nextBal = prevBal - ob.dueDisplayMinor;
+                runningAccBalance.set(ob.accountId, nextBal);
+
+                if (!stat.isPrePaydaySufficient || nextBal < 0) {
+                  atRiskObInfo.set(ob.id, {
+                    accountName: stat.name,
+                    accountBalanceMinor: stat.trueAvailableDisplayMinor,
+                    accountDeficitMinor: Math.abs(stat.netPrePaydayDisplayMinor),
+                    runningAfterMinor: nextBal,
+                    isDirectlyUncovered: nextBal < 0,
+                  });
+                }
+              }
+
+              const atRiskObligations = sortedPrePaydayUnpaid.filter((ob) => atRiskObInfo.has(ob.id));
+              const directlyUncoveredObligations = sortedPrePaydayUnpaid.filter(
+                (ob) => atRiskObInfo.get(ob.id)?.isDirectlyUncovered
+              );
+              const firstWarningObId =
+                directlyUncoveredObligations[0]?.id || atRiskObligations[0]?.id || null;
+              const atRiskTotalMinor = atRiskObligations.reduce((s, o) => s + o.dueDisplayMinor, 0);
+
+              const unpaidPrePaydayObs = budget.obligations.filter(
+                (ob) => !ob.isPaidThisMonth && ob.metrics.isDueThisMonth && ob.dueDay < primaryPaydayDay
+              );
+              const unpaidPostPaydayObs = budget.obligations.filter(
+                (ob) => !ob.isPaidThisMonth && ob.metrics.isDueThisMonth && ob.dueDay >= primaryPaydayDay
+              );
+              const unpaidPreserveObs = budget.obligations.filter(
+                (ob) => !ob.isPaidThisMonth && !ob.metrics.isDueThisMonth
+              );
+              const unpaidAllObs = budget.obligations.filter((ob) => !ob.isPaidThisMonth);
+              const paidAllObs = budget.obligations.filter((ob) => ob.isPaidThisMonth);
+
+              const unpaidPrePaydaySumMinor = unpaidPrePaydayObs.reduce((s, o) => s + o.dueDisplayMinor, 0);
+              const unpaidPostPaydaySumMinor = unpaidPostPaydayObs.reduce((s, o) => s + o.dueDisplayMinor, 0);
+              const unpaidPreserveSumMinor = unpaidPreserveObs.reduce((s, o) => s + o.preserveDisplayMinor, 0);
+              const paidSumMinor = paidAllObs.reduce(
+                (s, o) => s + (o.metrics.isDueThisMonth ? o.dueDisplayMinor : o.preserveDisplayMinor),
+                0
+              );
+
+              const renderChecklistRow = (ob: (typeof budget.obligations)[number], isFirstWarningAnchor: boolean) => {
+                const isDueNow = ob.metrics.isDueThisMonth;
+                const isMultiMonth = ob.intervalMonths > 1 || ob.cadence === 'annual';
+                const isExpanded = preserveExpandedIds.has(ob.id);
+                const progressPct =
+                  ob.amountMinor > 0 ? Math.min(100, Math.round((ob.preservedMinor / ob.amountMinor) * 100)) : 0;
+                const paidTimestamp =
+                  ob.isPaidThisMonth && ob.occurrence?.paidAt
+                    ? `${ob.occurrence.paidAt.slice(0, 10)} ${ob.occurrence.paidAt.slice(11, 16) || '09:00'}`
+                    : null;
+                const riskInfo = atRiskObInfo.get(ob.id);
+                const isHighlighted = highlightedObId === ob.id;
+
+                return (
                   <div
-                    className={`text-xl font-semibold ${
-                      budget.runway.isSufficient ? 'text-emerald-700' : 'bg-amber-700 text-white px-2 py-0.5 rounded'
+                    key={ob.id}
+                    id={`checklist-ob-${ob.id}`}
+                    className={`px-4 sm:px-5 py-3 space-y-2 transition-all ${
+                      isHighlighted
+                        ? 'bg-rose-100/90 ring-2 ring-rose-600'
+                        : riskInfo
+                        ? riskInfo.isDirectlyUncovered
+                          ? 'bg-rose-50/80 border-l-4 border-l-rose-600 hover:bg-rose-50'
+                          : 'bg-rose-50/40 border-l-4 border-l-amber-500 hover:bg-rose-50/60'
+                        : ob.isPaidThisMonth
+                        ? 'bg-emerald-50/20 hover:bg-slate-50/70'
+                        : 'hover:bg-slate-50/70'
                     }`}
                   >
-                    {budget.runway.isSufficient
-                      ? fmt(budget.runway.prePaydayBufferMinor)
-                      : fmt(budget.runway.shortfallMinor)}
-                  </div>
-                </div>
-              </div>
-
-              <DailyRunwayChart
-                curve={budget.runway.dailyCurve}
-                currency={cur}
-                privacyMode={privacyMode}
-                t={t}
-                onSelectDay={() => setLedgerOpen(true)}
-              />
-
-              {/* Folded-by-Default Chronological Table of All Month Expenses & Completed Checklist Payments */}
-              <div className="border-t border-slate-200 pt-3">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setLedgerOpen((prev) => !prev)}
-                    className="flex items-center gap-2 text-left group"
-                  >
-                    {ledgerOpen ? (
-                      <ChevronDown className="w-4 h-4 text-teal-700 shrink-0" />
-                    ) : (
-                      <ChevronRight className="w-4 h-4 text-slate-400 group-hover:text-teal-700 shrink-0" />
-                    )}
-                    <div>
-                      <div className="text-xs font-mono-num uppercase tracking-wider text-slate-700 font-semibold group-hover:text-teal-800">
-                        {t.ledgerFoldedTitle(budget.timelineLedger.length)}
-                        {budgetHorizon > 1 && budget.horizonSummary
-                          ? ` (${budget.horizonSummary.startYearMonth} → ${budget.horizonSummary.endYearMonth})`
-                          : ` (${yearMonth})`}{' '}
-                        ·{' '}
-                        <span className="text-slate-900">
-                          {fmt(budget.timelineLedger.reduce((s, e) => s + e.displayAmountMinor, 0))}
-                        </span>
-                      </div>
-                      <div className="text-[11px] text-slate-400">{t.ledgerFoldedSub}</div>
-                    </div>
-                  </button>
-
-                  <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={() => setModal({ kind: 'expense' })}
-                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded border border-slate-200 bg-white text-xs font-medium text-slate-700 hover:bg-slate-50"
-                    >
-                      <Plus className="w-3.5 h-3.5" /> {t.btnAddExpense}
-                    </button>
-                  </div>
-                </div>
-
-                {ledgerOpen && (
-                  <div className="mt-3 border border-slate-200 rounded-lg overflow-x-auto max-h-[460px] overflow-y-auto bg-white">
-                    {budget.timelineLedger.length === 0 ? (
-                      <div className="p-4 text-xs text-slate-400 font-mono-num text-center">{t.emptyLedgerMsg}</div>
-                    ) : (
-                      <table className="w-full text-left border-collapse text-xs">
-                        <thead className="sticky top-0 z-10">
-                          <tr className="border-b border-slate-200 bg-[#FAF9F6] text-[10px] font-mono-num uppercase text-slate-500">
-                            <th className="py-2 px-3">{t.colDateTime}</th>
-                            <th className="py-2 px-3">{t.colItemMerchant}</th>
-                            <th className="py-2 px-3">{t.colPot}</th>
-                            <th className="py-2 px-3">{t.colAccount}</th>
-                            <th className="py-2 px-3">{t.colType}</th>
-                            <th className="py-2 px-3 text-right">{t.colAmount}</th>
-                            <th className="py-2 px-3 text-right">{t.colActions}</th>
-                          </tr>
-                        </thead>
-                        <tbody className="divide-y divide-slate-100">
-                          {budget.timelineLedger.map((entry) => {
-                            const formattedTs = `${entry.date} ${entry.timestamp.slice(11, 16) || '12:00'}`;
-                            const potPath = entry.potId
-                              ? potBreadcrumbs.get(entry.potId)?.pathString || entry.potName
-                              : '—';
-                            const isInflow = entry.flowDirection === 'inflow';
-                            return (
-                              <tr key={entry.id} className="hover:bg-slate-50/80">
-                                <td className="py-2.5 px-3 font-mono-num text-[11px] text-slate-600 whitespace-nowrap">
-                                  {formattedTs}
-                                </td>
-                                <td className="py-2.5 px-3">
-                                  <button
-                                    type="button"
-                                    onClick={() => openEntityDrawer(entry.entityType, entry.entityId)}
-                                    className="font-medium text-slate-900 hover:text-teal-800 hover:underline text-left"
-                                  >
-                                    {entry.title}
-                                  </button>
-                                  {entry.subtitle && (
-                                    <div className="text-[11px] text-slate-400 truncate max-w-[220px]">
-                                      {entry.subtitle}
-                                    </div>
-                                  )}
-                                </td>
-                                <td className="py-2.5 px-3">
-                                  <span className="inline-flex items-center gap-1.5 text-[11px] text-slate-600">
-                                    <span
-                                      className="w-2 h-2 rounded-full shrink-0"
-                                      style={{ backgroundColor: entry.potColor }}
-                                    />
-                                    <span className="truncate max-w-[160px]">{potPath}</span>
-                                  </span>
-                                </td>
-                                <td className="py-2.5 px-3 whitespace-nowrap text-[11px] text-slate-600">
-                                  {entry.accountName ? (
-                                    <button
-                                      type="button"
-                                      onClick={() => entry.accountId && openEntityDrawer('account', entry.accountId)}
-                                      className="inline-flex items-center gap-1 text-slate-700 hover:text-teal-800 hover:underline"
-                                    >
-                                      <Landmark className="w-3 h-3 text-teal-700 shrink-0" />
-                                      <span>{entry.accountName}</span>
-                                    </button>
-                                  ) : (
-                                    <span className="text-slate-400">—</span>
-                                  )}
-                                </td>
-                                <td className="py-2.5 px-3 whitespace-nowrap">
-                                  <span
-                                    className={`inline-flex px-2 py-0.5 rounded text-[10px] font-mono-num ${
-                                      isInflow
-                                        ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
-                                        : entry.kind === 'expense'
-                                        ? 'bg-rose-50 text-rose-800 border border-rose-200'
-                                        : entry.kind === 'paid_bill'
-                                        ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
-                                        : 'bg-teal-50 text-teal-800 border border-teal-200'
-                                    }`}
-                                  >
-                                    {isInflow
-                                      ? t.typeDeposit
-                                      : entry.kind === 'expense'
-                                      ? t.typeExpense
-                                      : entry.kind === 'paid_bill'
-                                      ? t.typePaidBill
-                                      : t.typeSinkingSetAside}
-                                  </span>
-                                </td>
-                                <td
-                                  className={`py-2.5 px-3 text-right font-mono-num font-semibold whitespace-nowrap ${
-                                    isInflow ? 'text-emerald-700' : 'text-slate-900'
-                                  }`}
-                                >
-                                  {isInflow ? '+' : '-'}
-                                  {fmt(entry.displayAmountMinor)}
-                                  {entry.currency !== cur && !privacyMode && (
-                                    <div className="text-[10px] text-slate-400 font-normal">
-                                      {CURRENCY_SYMBOLS[entry.currency]}
-                                      {(entry.amountMinor / 100).toFixed(2)}
-                                    </div>
-                                  )}
-                                </td>
-                                <td className="py-2.5 px-3 text-right whitespace-nowrap">
-                                  <div className="inline-flex items-center gap-1.5">
-                                    <button
-                                      type="button"
-                                      onClick={() => openEntityDrawer(entry.entityType, entry.entityId)}
-                                      className="inline-flex items-center gap-1 px-2 py-1 rounded border border-slate-200 bg-white text-[11px] text-slate-700 hover:bg-slate-900 hover:text-white transition"
-                                    >
-                                      <Pencil className="w-3 h-3" /> {t.editBtn}
-                                    </button>
-                                    {entry.entityType === 'expense' ? (
-                                      <button
-                                        type="button"
-                                        onClick={async () => {
-                                          if (!confirm(`Delete "${entry.title}"?`)) return;
-                                          await apiFetch(`/api/expenses/${entry.entityId}`, { method: 'DELETE' });
-                                          await reloadAll();
-                                        }}
-                                        className="inline-flex items-center gap-1 px-2 py-1 rounded border border-rose-200 bg-rose-50/60 text-[11px] text-rose-700 hover:bg-rose-600 hover:text-white transition"
-                                      >
-                                        <Trash2 className="w-3 h-3" /> {t.deleteBtn}
-                                      </button>
-                                    ) : (
-                                      <button
-                                        type="button"
-                                        onClick={async () => {
-                                          await apiFetch(`/api/obligations/${entry.entityId}/toggle-paid`, {
-                                            method: 'POST',
-                                            body: JSON.stringify({ yearMonth, paid: false }),
-                                          });
-                                          await reloadAll();
-                                        }}
-                                        className="inline-flex items-center gap-1 px-2 py-1 rounded border border-amber-200 bg-amber-50/70 text-[11px] text-amber-800 hover:bg-amber-600 hover:text-white transition"
-                                      >
-                                        <RotateCcw className="w-3 h-3" /> {t.undoBtn}
-                                      </button>
-                                    )}
-                                  </div>
-                                </td>
-                              </tr>
-                            );
-                          })}
-                        </tbody>
-                      </table>
-                    )}
-                  </div>
-                )}
-              </div>
-            </section>
-
-            {/* Expected Salary & Income Arrivals (Tick when received in bank account!) */}
-            <section className="bg-white border border-slate-200 rounded-lg overflow-hidden">
-              <div className="px-5 py-3.5 border-b border-slate-200 flex items-center justify-between bg-emerald-50/40">
-                <div>
-                  <h3 className="text-xs font-mono-num uppercase tracking-wider text-emerald-900 font-semibold">
-                    {t.incomeArrivalsTitle} ({yearMonth})
-                  </h3>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setModal({ kind: 'income' })}
-                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded border border-emerald-700/30 bg-white text-emerald-900 text-xs font-medium hover:bg-emerald-50"
-                >
-                  <Plus className="w-3.5 h-3.5" /> {t.addIncomeBtn}
-                </button>
-              </div>
-              <div className="divide-y divide-slate-100">
-                {budget.incomes.map((inc) => (
-                  <div
-                    key={inc.id}
-                    className="px-5 py-3 flex flex-wrap items-center justify-between gap-3 hover:bg-slate-50/70"
-                  >
-                    <div className="flex items-center gap-3">
-                      <button
-                        type="button"
-                        disabled={busy}
-                        onClick={() => void handleToggleIncomeReceived(inc)}
-                        className="text-slate-400 hover:text-emerald-700 transition"
-                        title={inc.isReceivedThisMonth ? t.markIncomePending : t.markIncomeReceived}
-                      >
-                        {inc.isReceivedThisMonth ? (
-                          <CheckCircle2 className="w-5 h-5 text-emerald-600" />
-                        ) : (
-                          <Circle className="w-5 h-5 text-emerald-600/60" />
-                        )}
-                      </button>
-                      <div>
-                        <div className="flex items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={() => openEntityDrawer('income', inc.id)}
-                            className="text-sm font-medium text-slate-900 hover:text-teal-800 hover:underline text-left"
-                          >
-                            {inc.name}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => openEntityDrawer('income', inc.id)}
-                            title={t.editBtn}
-                            className="p-1 rounded text-slate-400 hover:text-slate-800 hover:bg-slate-100"
-                          >
-                            <Pencil className="w-3 h-3" />
-                          </button>
-                          <span
-                            className={`text-[10px] font-mono-num px-1.5 py-0.5 rounded ${
-                              inc.isReceivedThisMonth
-                                ? 'bg-emerald-100 text-emerald-800 font-semibold'
-                                : 'bg-amber-50 text-amber-800 border border-amber-200 border-dashed'
-                            }`}
-                          >
-                            {inc.isReceivedThisMonth
-                              ? t.statusReceivedBadge
-                              : t.statusAwaitingBadge(inc.paydayDay)}
-                          </span>
-                        </div>
-                        <div className="text-xs text-slate-500 font-mono-num">
-                          {inc.expectedDate} · {inc.cadence}
-                          {inc.accountName && (
-                            <span className="ml-2 text-slate-600">· 🏦 {inc.accountName}</span>
+                    {isFirstWarningAnchor && <span id="checklist-shortfall-anchor" className="sr-only" />}
+                    <div className="flex items-start justify-between gap-4">
+                      {/* Left Column: Checkbox + Title + Wrapped/Truncated Metadata */}
+                      <div className="flex items-start gap-3 min-w-0 flex-1">
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() => void handleTogglePaid(ob)}
+                          className={`mt-0.5 shrink-0 transition ${
+                            riskInfo ? 'text-rose-600 hover:text-rose-800' : 'text-slate-400 hover:text-teal-700'
+                          }`}
+                          title={
+                            isDueNow
+                              ? ob.isPaidThisMonth
+                                ? t.markUnpaid
+                                : t.markPaid
+                              : ob.isPaidThisMonth
+                              ? t.markPreserveUndone
+                              : t.markPreserveDone
+                          }
+                        >
+                          {ob.isPaidThisMonth ? (
+                            <CheckCircle2 className="w-5 h-5 text-emerald-600" />
+                          ) : riskInfo ? (
+                            <AlertTriangle className="w-5 h-5 text-rose-600" />
+                          ) : (
+                            <Circle className="w-5 h-5" />
                           )}
-                        </div>
-                      </div>
-                    </div>
-                    <div className="font-mono-num text-sm font-semibold text-emerald-800">
-                      +{fmt(inc.monthlyDisplayMinor)}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </section>
+                        </button>
 
-            {/* Chronological Monthly Payment Checklist & Unified Sinking Set-Aside ('Preserve') */}
-            <section className="bg-white border border-slate-200 rounded-lg overflow-hidden">
-              <div className="px-5 py-3.5 border-b border-slate-200 space-y-2">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div>
-                    <h3 className="text-xs font-mono-num uppercase tracking-wider text-slate-600 font-semibold">
-                      {t.checklistTitle} ({yearMonth})
-                    </h3>
-                    <p className="text-xs text-slate-400">{t.checklistSub}</p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => setModal({ kind: 'obligation' })}
-                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded bg-slate-900 text-white text-xs font-medium"
-                  >
-                    <Plus className="w-3.5 h-3.5" /> {t.addScheduledBtn}
-                  </button>
-                </div>
-
-                {/* Clear explanation of 'Preserve' (Monthly Sinking Set-Aside) */}
-                <div className="text-[11px] text-teal-900 bg-teal-50/70 border border-teal-200/70 rounded px-3 py-1.5 flex items-start gap-2">
-                  <PiggyBank className="w-3.5 h-3.5 text-teal-700 shrink-0 mt-0.5" />
-                  <span>{t.preserveExplainer}</span>
-                </div>
-              </div>
-
-              <div className="divide-y divide-slate-100">
-                {budget.obligations.map((ob) => {
-                  const isDueNow = ob.metrics.isDueThisMonth;
-                  const isMultiMonth = ob.intervalMonths > 1 || ob.cadence === 'annual';
-                  const isExpanded = preserveExpandedIds.has(ob.id);
-                  const progressPct =
-                    ob.amountMinor > 0 ? Math.min(100, Math.round((ob.preservedMinor / ob.amountMinor) * 100)) : 0;
-                  const paidTimestamp =
-                    ob.isPaidThisMonth && ob.occurrence?.paidAt
-                      ? `${ob.occurrence.paidAt.slice(0, 10)} ${ob.occurrence.paidAt.slice(11, 16) || '09:00'}`
-                      : null;
-
-                  return (
-                    <div
-                      key={ob.id}
-                      className={`px-5 py-3 space-y-2 hover:bg-slate-50/70 ${
-                        ob.isPaidThisMonth ? 'bg-emerald-50/20' : ''
-                      }`}
-                    >
-                      <div className="flex flex-wrap items-center justify-between gap-3">
-                        <div className="flex items-center gap-3">
-                          <button
-                            type="button"
-                            disabled={busy}
-                            onClick={() => void handleTogglePaid(ob)}
-                            className="text-slate-400 hover:text-teal-700 transition"
-                            title={
-                              isDueNow
-                                ? ob.isPaidThisMonth
-                                  ? t.markUnpaid
-                                  : t.markPaid
-                                : ob.isPaidThisMonth
-                                ? t.markPreserveUndone
-                                : t.markPreserveDone
-                            }
-                          >
-                            {ob.isPaidThisMonth ? (
-                              <CheckCircle2 className="w-5 h-5 text-emerald-600" />
-                            ) : (
-                              <Circle className="w-5 h-5" />
-                            )}
-                          </button>
-                          <div>
-                            <div className="flex flex-wrap items-center gap-2">
-                              {isMultiMonth && (
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    setPreserveExpandedIds((prev) => {
-                                      const next = new Set(prev);
-                                      if (next.has(ob.id)) next.delete(ob.id);
-                                      else next.add(ob.id);
-                                      return next;
-                                    })
-                                  }
-                                  className="text-slate-400 hover:text-teal-700"
-                                  title="Unfold annual reserve progress & storage account"
-                                >
-                                  {isExpanded ? (
-                                    <ChevronDown className="w-3.5 h-3.5 text-teal-700" />
-                                  ) : (
-                                    <ChevronRight className="w-3.5 h-3.5" />
-                                  )}
-                                </button>
-                              )}
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            {isMultiMonth && (
                               <button
                                 type="button"
-                                onClick={() => openEntityDrawer('obligation', ob.id)}
-                                className={`text-sm font-medium text-left hover:text-teal-800 hover:underline ${
-                                  ob.isPaidThisMonth ? 'line-through text-slate-500' : 'text-slate-900'
+                                onClick={() =>
+                                  setPreserveExpandedIds((prev) => {
+                                    const next = new Set(prev);
+                                    if (next.has(ob.id)) next.delete(ob.id);
+                                    else next.add(ob.id);
+                                    return next;
+                                  })
+                                }
+                                className="text-slate-400 hover:text-teal-700 shrink-0"
+                                title="Unfold annual reserve progress & storage account"
+                              >
+                                {isExpanded ? (
+                                  <ChevronDown className="w-3.5 h-3.5 text-teal-700" />
+                                ) : (
+                                  <ChevronRight className="w-3.5 h-3.5" />
+                                )}
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => openEntityDrawer('obligation', ob.id)}
+                              title={ob.name}
+                              className={`text-sm font-medium text-left hover:underline truncate max-w-full sm:max-w-[440px] ${
+                                ob.isPaidThisMonth
+                                  ? 'line-through text-slate-500 hover:text-teal-800'
+                                  : riskInfo
+                                  ? 'text-rose-950 font-semibold hover:text-rose-800'
+                                  : 'text-slate-900 hover:text-teal-800'
+                              }`}
+                            >
+                              {ob.name}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => openEntityDrawer('obligation', ob.id)}
+                              title={t.editBtn}
+                              className="p-1 rounded text-slate-400 hover:text-slate-800 hover:bg-slate-100 shrink-0"
+                            >
+                              <Pencil className="w-3 h-3" />
+                            </button>
+                            {riskInfo && (
+                              <span
+                                className={`text-[10px] font-mono-num px-1.5 py-0.5 rounded font-semibold shrink-0 ${
+                                  riskInfo.isDirectlyUncovered
+                                    ? 'bg-rose-600 text-white'
+                                    : 'bg-rose-100 text-rose-900 border border-rose-300'
                                 }`}
                               >
-                                {ob.name}
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => openEntityDrawer('obligation', ob.id)}
-                                title={t.editBtn}
-                                className="p-1 rounded text-slate-400 hover:text-slate-800 hover:bg-slate-100"
+                                {riskInfo.isDirectlyUncovered
+                                  ? `⚠️ Uncovered on ${riskInfo.accountName.split('—')[0].trim()} (Shortfall -${fmt(
+                                      riskInfo.accountDeficitMinor
+                                    )})`
+                                  : `⚠️ Low Account Balance (${riskInfo.accountName.split('—')[0].trim()})`}
+                              </span>
+                            )}
+                            {!isDueNow && (
+                              <span
+                                className={`text-[10px] font-mono-num px-1.5 py-0.5 rounded shrink-0 ${
+                                  ob.isPaidThisMonth
+                                    ? 'bg-emerald-100 text-emerald-800 font-semibold'
+                                    : 'bg-teal-50 text-teal-800 border border-teal-200'
+                                }`}
                               >
-                                <Pencil className="w-3 h-3" />
-                              </button>
-                              {!isDueNow && (
-                                <span
-                                  className={`text-[10px] font-mono-num px-1.5 py-0.5 rounded ${
-                                    ob.isPaidThisMonth
-                                      ? 'bg-emerald-100 text-emerald-800 font-semibold'
-                                      : 'bg-teal-50 text-teal-800 border border-teal-200'
-                                  }`}
-                                >
-                                  {ob.isPaidThisMonth ? t.sinkingSetAsideDoneBadge : t.sinkingBadge}
-                                </span>
-                              )}
-                              {ob.currency !== cur && !privacyMode && (
-                                <span className="text-[10px] font-mono-num px-1.5 py-0.5 rounded bg-amber-50 text-amber-800">
-                                  {ob.currency}
-                                </span>
-                              )}
-                              {ob.manageUrl && (
-                                <a
-                                  href={ob.manageUrl}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                  className="text-teal-700 hover:text-teal-900 inline-flex items-center gap-0.5 text-[11px]"
-                                >
-                                  <ExternalLink className="w-3 h-3" />
-                                </a>
-                              )}
-                            </div>
-                            <div className="text-xs text-slate-500 font-mono-num mt-0.5">
+                                {ob.isPaidThisMonth ? t.sinkingSetAsideDoneBadge : t.sinkingBadge}
+                              </span>
+                            )}
+                            {ob.currency !== cur && !privacyMode && (
+                              <span className="text-[10px] font-mono-num px-1.5 py-0.5 rounded bg-amber-50 text-amber-800 shrink-0">
+                                {ob.currency}
+                              </span>
+                            )}
+                            {ob.manageUrl && (
+                              <a
+                                href={ob.manageUrl}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="text-teal-700 hover:text-teal-900 inline-flex items-center gap-0.5 text-[11px] shrink-0"
+                              >
+                                <ExternalLink className="w-3 h-3" />
+                              </a>
+                            )}
+                          </div>
+
+                          {/* Metadata Line: cleanly wraps pills onto next line & truncates long names with ... */}
+                          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-500 font-mono-num mt-1">
+                            <span className="whitespace-nowrap">
                               {isDueNow
                                 ? `${t.dueLabel} ${yearMonth}-${String(ob.dueDay).padStart(2, '0')} · ${ob.cadence}`
                                 : `${t.dueLabel} ${ob.nextDueDate} (${ob.metrics.monthsUntilDue}${t.monthsLeft}) · ${t.preservedPct} ${progressPct}%${
@@ -2346,90 +2130,667 @@ export const App: React.FC = () => {
                                       ? ` (${fmt(ob.preservedDisplayMinor)} / ${fmt(ob.targetDisplayMinor)})`
                                       : ''
                                   }`}
-                              {ob.accountName && (
-                                <span className="ml-2 text-slate-600">· 🏦 Paid from: {ob.accountName}</span>
-                              )}
-                              {isMultiMonth && (ob.preserveAccountName || ob.accountName) && (
-                                <span className="ml-2 text-teal-800 font-medium">
-                                  · 🔒 Reserve on: {ob.preserveAccountName || ob.accountName}
-                                </span>
-                              )}
-                              {ob.liabilityName && (
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    if (ob.liabilityId) openEntityDrawer('liability', ob.liabilityId);
-                                  }}
-                                  className="ml-2 text-amber-800 hover:underline font-medium"
-                                  title="Linked Mortgage / Loan (auto-updates balance when ticked)"
-                                >
-                                  · 🏠 {ob.liabilityName}
-                                </button>
-                              )}
-                              {paidTimestamp && (
-                                <span className="ml-2 text-emerald-700 font-semibold">· ✓ {paidTimestamp}</span>
-                              )}
-                            </div>
-                          </div>
-                        </div>
-
-                        <div className="flex items-center gap-3 font-mono-num">
-                          <div className="text-right">
-                            <div className="text-sm font-semibold text-slate-900">
-                              {isDueNow ? fmt(ob.dueDisplayMinor) : `${fmt(ob.preserveDisplayMinor)}/mo`}
-                            </div>
-                            {!isDueNow && !privacyMode && (
-                              <div className="text-[10px] text-slate-400">
-                                {t.targetLabel} {fmt(ob.targetDisplayMinor)}
-                              </div>
+                            </span>
+                            {ob.accountName && (
+                              <span
+                                title={`Paid from: ${ob.accountName}`}
+                                className={`inline-flex items-center gap-1 max-w-[240px] sm:max-w-[300px] truncate ${
+                                  riskInfo ? 'text-rose-800 font-medium' : 'text-slate-600'
+                                }`}
+                              >
+                                · 🏦 Paid from: {ob.accountName}
+                              </span>
+                            )}
+                            {isMultiMonth && (ob.preserveAccountName || ob.accountName) && (
+                              <span
+                                title={`Reserve on: ${ob.preserveAccountName || ob.accountName}`}
+                                className="inline-flex items-center gap-1 max-w-[240px] sm:max-w-[280px] truncate text-teal-800 font-medium"
+                              >
+                                · 🔒 Reserve on: {ob.preserveAccountName || ob.accountName}
+                              </span>
+                            )}
+                            {ob.liabilityName && (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  if (ob.liabilityId) openEntityDrawer('liability', ob.liabilityId);
+                                }}
+                                title={`Linked Liability: ${ob.liabilityName}`}
+                                className="inline-flex items-center gap-1 max-w-[230px] sm:max-w-[280px] truncate text-amber-800 hover:underline font-medium"
+                              >
+                                · 🏠 <span className="truncate">{ob.liabilityName}</span>
+                              </button>
+                            )}
+                            {paidTimestamp && (
+                              <span className="text-emerald-700 font-semibold whitespace-nowrap">
+                                · ✓ {paidTimestamp}
+                              </span>
                             )}
                           </div>
                         </div>
                       </div>
 
-                      {isMultiMonth && isExpanded && (
-                        <div className="ml-8 p-3 rounded-md bg-[#FAF9F6] border border-slate-200 space-y-2 text-xs font-mono-num">
-                          <div className="w-full h-2 bg-slate-200 rounded-full overflow-hidden">
-                            <div
-                              className="h-full bg-teal-600 rounded-full transition-all"
-                              style={{ width: `${progressPct}%` }}
-                            />
+                      {/* Right Column: Pinned Price (never wraps to left!) */}
+                      <div className="shrink-0 text-right font-mono-num pl-2">
+                        <div
+                          className={`text-sm font-semibold whitespace-nowrap ${
+                            riskInfo ? 'text-rose-700 font-bold' : 'text-slate-900'
+                          }`}
+                        >
+                          {isDueNow ? fmt(ob.dueDisplayMinor) : `${fmt(ob.preserveDisplayMinor)}/mo`}
+                        </div>
+                        {!isDueNow && !privacyMode && (
+                          <div className="text-[10px] text-slate-400 whitespace-nowrap">
+                            {t.targetLabel} {fmt(ob.targetDisplayMinor)}
                           </div>
-                          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-[11px]">
-                            <div>
-                              <span className="text-slate-400 block">Progress Saved:</span>
-                              <span className="font-semibold text-emerald-800">
-                                {fmt(ob.preservedDisplayMinor)} of {fmt(ob.targetDisplayMinor)} ({progressPct}%)
+                        )}
+                        {riskInfo && riskInfo.isDirectlyUncovered && !privacyMode && (
+                          <div className="text-[10px] text-rose-600 font-semibold whitespace-nowrap">
+                            Bal after: -{fmt(Math.abs(riskInfo.runningAfterMinor))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    {isMultiMonth && isExpanded && (
+                      <div className="ml-8 p-3 rounded-md bg-[#FAF9F6] border border-slate-200 space-y-2 text-xs font-mono-num">
+                        <div className="w-full h-2 bg-slate-200 rounded-full overflow-hidden">
+                          <div
+                            className="h-full bg-teal-600 rounded-full transition-all"
+                            style={{ width: `${progressPct}%` }}
+                          />
+                        </div>
+                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-[11px]">
+                          <div>
+                            <span className="text-slate-400 block">Progress Saved:</span>
+                            <span className="font-semibold text-emerald-800">
+                              {fmt(ob.preservedDisplayMinor)} of {fmt(ob.targetDisplayMinor)} ({progressPct}%)
+                            </span>
+                          </div>
+                          <div>
+                            <span className="text-slate-400 block">Sitting on Account:</span>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const targetAccId = ob.preserveAccountId || ob.accountId;
+                                if (targetAccId) openEntityDrawer('account', targetAccId);
+                              }}
+                              className="font-semibold text-teal-800 hover:underline text-left truncate max-w-full"
+                            >
+                              🏦 {ob.preserveAccountName || ob.accountName || 'Lloyds Standard Saver'}
+                            </button>
+                          </div>
+                          <div>
+                            <span className="text-slate-400 block">Pot / Category:</span>
+                            <span className="font-semibold text-slate-700 truncate block">
+                              {ob.potId ? potBreadcrumbs.get(ob.potId)?.pathString || '—' : '—'}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              };
+
+              return (
+                <>
+                  <section className="bg-white border border-slate-200 rounded-lg p-5 space-y-4">
+                    {timelineAccountId !== 'all' && (
+                      <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 rounded-md bg-teal-50 border border-teal-200 text-xs text-teal-950">
+                        <div className="flex items-center gap-2">
+                          <Landmark className="w-4 h-4 text-teal-700 shrink-0" />
+                          <span>
+                            Showing isolated timeline & cashflow for{' '}
+                            <strong>
+                              {allAvailableAccounts.find((a) => a.id === timelineAccountId)?.name || timelineAccountId}
+                            </strong>
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setTimelineAccountId('all')}
+                          className="px-2 py-0.5 rounded bg-white border border-teal-300 text-[11px] font-medium text-teal-900 hover:bg-teal-800 hover:text-white transition"
+                        >
+                          Reset to All Accounts
+                        </button>
+                      </div>
+                    )}
+
+                    {/* Top Red Notification Banner for Accounts with Insufficient Funds Before Salary (Scrolls down to checklist items!) */}
+                    {atRiskObligations.length > 0 && (
+                      <div className="rounded-lg border border-rose-300 bg-rose-50/90 px-4 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                        <div className="space-y-1 min-w-0">
+                          <div className="flex items-center gap-2 text-xs font-semibold text-rose-950">
+                            <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+                            <span>
+                              Account Shortfall Alert: {atRiskObligations.length} upcoming pre-payday payments (
+                              {fmt(atRiskTotalMinor)}) are scheduled on an account without sufficient funds!
+                            </span>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+                            {atRiskObligations.slice(0, 5).map((ob) => {
+                              const r = atRiskObInfo.get(ob.id);
+                              return (
+                                <button
+                                  key={ob.id}
+                                  type="button"
+                                  onClick={() => scrollToChecklistObligation(ob.id)}
+                                  className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10.5px] font-mono-num transition ${
+                                    r?.isDirectlyUncovered
+                                      ? 'bg-rose-600 text-white font-semibold hover:bg-rose-700'
+                                      : 'bg-white border border-rose-300 text-rose-900 hover:bg-rose-100'
+                                  }`}
+                                  title={`Click to scroll to ${ob.name}`}
+                                >
+                                  <span className="truncate max-w-[150px]">{ob.name}</span>
+                                  <span>{fmt(ob.dueDisplayMinor)}</span>
+                                </button>
+                              );
+                            })}
+                            {atRiskObligations.length > 5 && (
+                              <span className="text-[10.5px] font-mono-num text-rose-800">
+                                +{atRiskObligations.length - 5} more
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => scrollToChecklistObligation(firstWarningObId)}
+                          className="shrink-0 inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-md bg-rose-700 text-white text-xs font-semibold hover:bg-rose-800 shadow-xs transition"
+                        >
+                          <span>Scroll to Uncovered Payments ↓</span>
+                        </button>
+                      </div>
+                    )}
+
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <span
+                            className={`inline-block w-2.5 h-2.5 rounded-full ${
+                              budget.runway.isSufficient ? 'bg-emerald-600' : 'bg-amber-600'
+                            }`}
+                          />
+                          <h2 className="text-sm font-semibold text-slate-900">
+                            {budget.runway.isSufficient ? t.runwaySufficient : t.runwayShortfall}
+                          </h2>
+                        </div>
+                        <p className="text-xs text-slate-500 mt-0.5 font-mono-num">
+                          {t.runwayCash}: {fmt(budget.runway.runwayCashMinor)} · {t.unpaidDue}:{' '}
+                          {fmt(budget.runway.unpaidPrePaydayBillsMinor)} · {t.preserveTransfers}:{' '}
+                          {fmt(budget.runway.totalPreserveSliceMinor)} · {t.remainingEnvelopes}:{' '}
+                          {fmt(budget.runway.unallocatedEnvelopeRemainingMinor)}
+                        </p>
+                        {budget.cashflowBridge.nextMonthPreSalaryMinor > 0 && timelineAccountId === 'all' && (
+                          <p className="text-xs text-rose-700 mt-1 font-mono-num">
+                            {t.nextMonthReserveLabel}{' '}
+                            <span className="font-semibold">{fmt(budget.cashflowBridge.nextMonthPreSalaryMinor)}</span>
+                          </p>
+                        )}
+                      </div>
+
+                      <div className="text-right font-mono-num">
+                        <div className="text-[11px] uppercase text-slate-400">
+                          {budget.runway.isSufficient ? t.projectedBuffer : t.requiredTopUp}
+                        </div>
+                        <div
+                          className={`text-xl font-semibold ${
+                            budget.runway.isSufficient
+                              ? 'text-emerald-700'
+                              : 'bg-amber-700 text-white px-2 py-0.5 rounded'
+                          }`}
+                        >
+                          {budget.runway.isSufficient
+                            ? fmt(budget.runway.prePaydayBufferMinor)
+                            : fmt(budget.runway.shortfallMinor)}
+                        </div>
+                      </div>
+                    </div>
+
+                    <DailyRunwayChart
+                      curve={budget.runway.dailyCurve}
+                      currency={cur}
+                      privacyMode={privacyMode}
+                      t={t}
+                      onSelectDay={() => setLedgerOpen(true)}
+                    />
+
+                    {/* Folded-by-Default Chronological Table of All Month Expenses & Completed Checklist Payments */}
+                    <div className="border-t border-slate-200 pt-3">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setLedgerOpen((prev) => !prev)}
+                          className="flex items-center gap-2 text-left group"
+                        >
+                          {ledgerOpen ? (
+                            <ChevronDown className="w-4 h-4 text-teal-700 shrink-0" />
+                          ) : (
+                            <ChevronRight className="w-4 h-4 text-slate-400 group-hover:text-teal-700 shrink-0" />
+                          )}
+                          <div>
+                            <div className="text-xs font-mono-num uppercase tracking-wider text-slate-700 font-semibold group-hover:text-teal-800">
+                              {t.ledgerFoldedTitle(budget.timelineLedger.length)}
+                              {budgetHorizon > 1 && budget.horizonSummary
+                                ? ` (${budget.horizonSummary.startYearMonth} → ${budget.horizonSummary.endYearMonth})`
+                                : ` (${yearMonth})`}{' '}
+                              ·{' '}
+                              <span className="text-slate-900">
+                                {fmt(budget.timelineLedger.reduce((s, e) => s + e.displayAmountMinor, 0))}
                               </span>
                             </div>
-                            <div>
-                              <span className="text-slate-400 block">Sitting on Account:</span>
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  const targetAccId = ob.preserveAccountId || ob.accountId;
-                                  if (targetAccId) openEntityDrawer('account', targetAccId);
-                                }}
-                                className="font-semibold text-teal-800 hover:underline text-left"
-                              >
-                                🏦 {ob.preserveAccountName || ob.accountName || 'Lloyds Standard Saver'}
-                              </button>
-                            </div>
-                            <div>
-                              <span className="text-slate-400 block">Pot / Category:</span>
-                              <span className="font-semibold text-slate-700">
-                                {ob.potId ? potBreadcrumbs.get(ob.potId)?.pathString || '—' : '—'}
-                              </span>
-                            </div>
+                            <div className="text-[11px] text-slate-400">{t.ledgerFoldedSub}</div>
                           </div>
+                        </button>
+
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => setModal({ kind: 'expense' })}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded border border-slate-200 bg-white text-xs font-medium text-slate-700 hover:bg-slate-50"
+                          >
+                            <Plus className="w-3.5 h-3.5" /> {t.btnAddExpense}
+                          </button>
+                        </div>
+                      </div>
+
+                      {ledgerOpen && (
+                        <div className="mt-3 border border-slate-200 rounded-lg overflow-x-auto max-h-[460px] overflow-y-auto bg-white">
+                          {budget.timelineLedger.length === 0 ? (
+                            <div className="p-4 text-xs text-slate-400 font-mono-num text-center">
+                              {t.emptyLedgerMsg}
+                            </div>
+                          ) : (
+                            <table className="w-full text-left border-collapse text-xs">
+                              <thead className="sticky top-0 z-10">
+                                <tr className="border-b border-slate-200 bg-[#FAF9F6] text-[10px] font-mono-num uppercase text-slate-500">
+                                  <th className="py-2 px-3">{t.colDateTime}</th>
+                                  <th className="py-2 px-3">{t.colItemMerchant}</th>
+                                  <th className="py-2 px-3">{t.colPot}</th>
+                                  <th className="py-2 px-3">{t.colAccount}</th>
+                                  <th className="py-2 px-3">{t.colType}</th>
+                                  <th className="py-2 px-3 text-right">{t.colAmount}</th>
+                                  <th className="py-2 px-3 text-right">{t.colActions}</th>
+                                </tr>
+                              </thead>
+                              <tbody className="divide-y divide-slate-100">
+                                {budget.timelineLedger.map((entry) => {
+                                  const formattedTs = `${entry.date} ${entry.timestamp.slice(11, 16) || '12:00'}`;
+                                  const potPath = entry.potId
+                                    ? potBreadcrumbs.get(entry.potId)?.pathString || entry.potName
+                                    : '—';
+                                  const isInflow = entry.flowDirection === 'inflow';
+                                  return (
+                                    <tr key={entry.id} className="hover:bg-slate-50/80">
+                                      <td className="py-2.5 px-3 font-mono-num text-[11px] text-slate-600 whitespace-nowrap">
+                                        {formattedTs}
+                                      </td>
+                                      <td className="py-2.5 px-3">
+                                        <button
+                                          type="button"
+                                          onClick={() => openEntityDrawer(entry.entityType, entry.entityId)}
+                                          className="font-medium text-slate-900 hover:text-teal-800 hover:underline text-left"
+                                        >
+                                          {entry.title}
+                                        </button>
+                                        {entry.subtitle && (
+                                          <div className="text-[11px] text-slate-400 truncate max-w-[220px]">
+                                            {entry.subtitle}
+                                          </div>
+                                        )}
+                                      </td>
+                                      <td className="py-2.5 px-3">
+                                        <span className="inline-flex items-center gap-1.5 text-[11px] text-slate-600">
+                                          <span
+                                            className="w-2 h-2 rounded-full shrink-0"
+                                            style={{ backgroundColor: entry.potColor }}
+                                          />
+                                          <span className="truncate max-w-[160px]">{potPath}</span>
+                                        </span>
+                                      </td>
+                                      <td className="py-2.5 px-3 whitespace-nowrap text-[11px] text-slate-600">
+                                        {entry.accountName ? (
+                                          <button
+                                            type="button"
+                                            onClick={() =>
+                                              entry.accountId && openEntityDrawer('account', entry.accountId)
+                                            }
+                                            className="inline-flex items-center gap-1 text-slate-700 hover:text-teal-800 hover:underline"
+                                          >
+                                            <Landmark className="w-3 h-3 text-teal-700 shrink-0" />
+                                            <span>{entry.accountName}</span>
+                                          </button>
+                                        ) : (
+                                          <span className="text-slate-400">—</span>
+                                        )}
+                                      </td>
+                                      <td className="py-2.5 px-3 whitespace-nowrap">
+                                        <span
+                                          className={`inline-flex px-2 py-0.5 rounded text-[10px] font-mono-num ${
+                                            isInflow
+                                              ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
+                                              : entry.kind === 'expense'
+                                              ? 'bg-rose-50 text-rose-800 border border-rose-200'
+                                              : entry.kind === 'paid_bill'
+                                              ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
+                                              : 'bg-teal-50 text-teal-800 border border-teal-200'
+                                          }`}
+                                        >
+                                          {isInflow
+                                            ? t.typeDeposit
+                                            : entry.kind === 'expense'
+                                            ? t.typeExpense
+                                            : entry.kind === 'paid_bill'
+                                            ? t.typePaidBill
+                                            : t.typeSinkingSetAside}
+                                        </span>
+                                      </td>
+                                      <td
+                                        className={`py-2.5 px-3 text-right font-mono-num font-semibold whitespace-nowrap ${
+                                          isInflow ? 'text-emerald-700' : 'text-slate-900'
+                                        }`}
+                                      >
+                                        {isInflow ? '+' : '-'}
+                                        {fmt(entry.displayAmountMinor)}
+                                        {entry.currency !== cur && !privacyMode && (
+                                          <div className="text-[10px] text-slate-400 font-normal">
+                                            {CURRENCY_SYMBOLS[entry.currency]}
+                                            {(entry.amountMinor / 100).toFixed(2)}
+                                          </div>
+                                        )}
+                                      </td>
+                                      <td className="py-2.5 px-3 text-right whitespace-nowrap">
+                                        <div className="inline-flex items-center gap-1.5">
+                                          <button
+                                            type="button"
+                                            onClick={() => openEntityDrawer(entry.entityType, entry.entityId)}
+                                            className="inline-flex items-center gap-1 px-2 py-1 rounded border border-slate-200 bg-white text-[11px] text-slate-700 hover:bg-slate-900 hover:text-white transition"
+                                          >
+                                            <Pencil className="w-3 h-3" /> {t.editBtn}
+                                          </button>
+                                          {entry.entityType === 'expense' ? (
+                                            <button
+                                              type="button"
+                                              onClick={async () => {
+                                                if (!confirm(`Delete "${entry.title}"?`)) return;
+                                                await apiFetch(`/api/expenses/${entry.entityId}`, { method: 'DELETE' });
+                                                await reloadAll();
+                                              }}
+                                              className="inline-flex items-center gap-1 px-2 py-1 rounded border border-rose-200 bg-rose-50/60 text-[11px] text-rose-700 hover:bg-rose-600 hover:text-white transition"
+                                            >
+                                              <Trash2 className="w-3 h-3" /> {t.deleteBtn}
+                                            </button>
+                                          ) : (
+                                            <button
+                                              type="button"
+                                              onClick={async () => {
+                                                await apiFetch(`/api/obligations/${entry.entityId}/toggle-paid`, {
+                                                  method: 'POST',
+                                                  body: JSON.stringify({ yearMonth, paid: false }),
+                                                });
+                                                await reloadAll();
+                                              }}
+                                              className="inline-flex items-center gap-1 px-2 py-1 rounded border border-amber-200 bg-amber-50/70 text-[11px] text-amber-800 hover:bg-amber-600 hover:text-white transition"
+                                            >
+                                              <RotateCcw className="w-3 h-3" /> {t.undoBtn}
+                                            </button>
+                                          )}
+                                        </div>
+                                      </td>
+                                    </tr>
+                                  );
+                                })}
+                              </tbody>
+                            </table>
+                          )}
                         </div>
                       )}
                     </div>
-                  );
-                })}
-              </div>
-            </section>
+                  </section>
+
+                  {/* Expected Salary & Income Arrivals (Tick when received in bank account!) */}
+                  <section className="bg-white border border-slate-200 rounded-lg overflow-hidden">
+                    <div className="px-5 py-3.5 border-b border-slate-200 flex items-center justify-between bg-emerald-50/40">
+                      <div>
+                        <h3 className="text-xs font-mono-num uppercase tracking-wider text-emerald-900 font-semibold">
+                          {t.incomeArrivalsTitle} ({yearMonth})
+                        </h3>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setModal({ kind: 'income' })}
+                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded border border-emerald-700/30 bg-white text-emerald-900 text-xs font-medium hover:bg-emerald-50"
+                      >
+                        <Plus className="w-3.5 h-3.5" /> {t.addIncomeBtn}
+                      </button>
+                    </div>
+                    <div className="divide-y divide-slate-100">
+                      {budget.incomes.map((inc) => (
+                        <div
+                          key={inc.id}
+                          className="px-4 sm:px-5 py-3 flex items-start justify-between gap-4 hover:bg-slate-50/70"
+                        >
+                          <div className="flex items-start gap-3 min-w-0 flex-1">
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() => void handleToggleIncomeReceived(inc)}
+                              className="mt-0.5 shrink-0 text-slate-400 hover:text-emerald-700 transition"
+                              title={inc.isReceivedThisMonth ? t.markIncomePending : t.markIncomeReceived}
+                            >
+                              {inc.isReceivedThisMonth ? (
+                                <CheckCircle2 className="w-5 h-5 text-emerald-600" />
+                              ) : (
+                                <Circle className="w-5 h-5 text-emerald-600/60" />
+                              )}
+                            </button>
+                            <div className="min-w-0 flex-1">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => openEntityDrawer('income', inc.id)}
+                                  className="text-sm font-medium text-slate-900 hover:text-teal-800 hover:underline text-left truncate max-w-full sm:max-w-[420px]"
+                                >
+                                  {inc.name}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => openEntityDrawer('income', inc.id)}
+                                  title={t.editBtn}
+                                  className="p-1 rounded text-slate-400 hover:text-slate-800 hover:bg-slate-100 shrink-0"
+                                >
+                                  <Pencil className="w-3 h-3" />
+                                </button>
+                                <span
+                                  className={`text-[10px] font-mono-num px-1.5 py-0.5 rounded shrink-0 ${
+                                    inc.isReceivedThisMonth
+                                      ? 'bg-emerald-100 text-emerald-800 font-semibold'
+                                      : 'bg-amber-50 text-amber-800 border border-amber-200 border-dashed'
+                                  }`}
+                                >
+                                  {inc.isReceivedThisMonth
+                                    ? t.statusReceivedBadge
+                                    : t.statusAwaitingBadge(inc.paydayDay)}
+                                </span>
+                              </div>
+                              <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-500 font-mono-num mt-0.5">
+                                <span>
+                                  {inc.expectedDate} · {inc.cadence}
+                                </span>
+                                {inc.accountName && (
+                                  <span className="text-slate-600 truncate max-w-[260px]">· 🏦 {inc.accountName}</span>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                          <div className="shrink-0 font-mono-num text-sm font-semibold text-emerald-800 whitespace-nowrap pl-2">
+                            +{fmt(inc.monthlyDisplayMinor)}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+
+                  {/* Chronological Monthly Payment Checklist & Unified Sinking Set-Aside ('Preserve') */}
+                  <section id="checklist-section" className="bg-white border border-slate-200 rounded-lg overflow-hidden">
+                    <div className="px-5 py-3.5 border-b border-slate-200 space-y-3">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div>
+                          <h3 className="text-xs font-mono-num uppercase tracking-wider text-slate-600 font-semibold">
+                            {t.checklistTitle} ({yearMonth})
+                          </h3>
+                          <p className="text-xs text-slate-400">{t.checklistSub}</p>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          {paidAllObs.length > 0 && (
+                            <button
+                              type="button"
+                              onClick={() => setChecklistPaidFolded((prev) => !prev)}
+                              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded border border-emerald-200 bg-emerald-50/70 text-emerald-900 text-xs font-medium hover:bg-emerald-100 transition"
+                            >
+                              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                              <span>
+                                {checklistPaidFolded
+                                  ? `Show Paid (${paidAllObs.length})`
+                                  : `Fold Paid (${paidAllObs.length})`}
+                              </span>
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => setModal({ kind: 'obligation' })}
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded bg-slate-900 text-white text-xs font-medium"
+                          >
+                            <Plus className="w-3.5 h-3.5" /> {t.addScheduledBtn}
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* Summary Calculation Strip: Upcoming Before Salary vs After Salary vs Sinking vs Paid */}
+                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5 pt-1">
+                        <div
+                          onClick={() => firstWarningObId && scrollToChecklistObligation(firstWarningObId)}
+                          className={`rounded-md border p-2.5 font-mono-num ${
+                            atRiskObligations.length > 0
+                              ? 'border-rose-300 bg-rose-50/70 cursor-pointer hover:border-rose-500'
+                              : 'border-amber-200 bg-amber-50/40'
+                          }`}
+                        >
+                          <div className="text-[10px] uppercase tracking-wider text-slate-500 flex items-center justify-between">
+                            <span>Unpaid Before Salary (1st–{primaryPaydayDay - 1}th)</span>
+                            {atRiskObligations.length > 0 && (
+                              <span className="text-rose-700 font-bold">⚠️ {atRiskObligations.length} At Risk</span>
+                            )}
+                          </div>
+                          <div
+                            className={`text-sm font-bold mt-0.5 ${
+                              atRiskObligations.length > 0 ? 'text-rose-700' : 'text-slate-900'
+                            }`}
+                          >
+                            {fmt(unpaidPrePaydaySumMinor)}
+                          </div>
+                          <div className="text-[10px] text-slate-500">
+                            {unpaidPrePaydayObs.length} scheduled bills before payday
+                          </div>
+                        </div>
+
+                        <div className="rounded-md border border-slate-200 bg-[#FAF9F6] p-2.5 font-mono-num">
+                          <div className="text-[10px] uppercase tracking-wider text-slate-500">
+                            Upcoming On/After Salary ({primaryPaydayDay}th+)
+                          </div>
+                          <div className="text-sm font-bold text-slate-900 mt-0.5">
+                            {fmt(unpaidPostPaydaySumMinor)}
+                          </div>
+                          <div className="text-[10px] text-slate-500">
+                            {unpaidPostPaydayObs.length} bills covered by incoming salary
+                          </div>
+                        </div>
+
+                        <div className="rounded-md border border-teal-200 bg-teal-50/40 p-2.5 font-mono-num">
+                          <div className="text-[10px] uppercase tracking-wider text-teal-800">
+                            Pending Sinking ("Preserve")
+                          </div>
+                          <div className="text-sm font-bold text-teal-900 mt-0.5">
+                            {fmt(unpaidPreserveSumMinor)}/mo
+                          </div>
+                          <div className="text-[10px] text-teal-700">
+                            {unpaidPreserveObs.length} annual/multi-month slices pending
+                          </div>
+                        </div>
+
+                        <button
+                          type="button"
+                          onClick={() => setChecklistPaidFolded((prev) => !prev)}
+                          className="rounded-md border border-emerald-200 bg-emerald-50/40 p-2.5 font-mono-num text-left hover:bg-emerald-50 transition"
+                        >
+                          <div className="text-[10px] uppercase tracking-wider text-emerald-800 flex items-center justify-between">
+                            <span>Completed This Month</span>
+                            <span>{checklistPaidFolded ? 'Unfold ▾' : 'Fold ▴'}</span>
+                          </div>
+                          <div className="text-sm font-bold text-emerald-800 mt-0.5">{fmt(paidSumMinor)}</div>
+                          <div className="text-[10px] text-emerald-700">
+                            ✓ {paidAllObs.length} items already paid ({checklistPaidFolded ? 'folded' : 'open'})
+                          </div>
+                        </button>
+                      </div>
+
+                      {/* Clear explanation of 'Preserve' (Monthly Sinking Set-Aside) */}
+                      <div className="text-[11px] text-teal-900 bg-teal-50/70 border border-teal-200/70 rounded px-3 py-1.5 flex items-start gap-2">
+                        <PiggyBank className="w-3.5 h-3.5 text-teal-700 shrink-0 mt-0.5" />
+                        <span>{t.preserveExplainer}</span>
+                      </div>
+                    </div>
+
+                    {/* Active / Unpaid Obligations List */}
+                    <div className="divide-y divide-slate-100">
+                      {unpaidAllObs.length === 0 ? (
+                        <div className="px-5 py-6 text-center text-xs font-mono-num text-emerald-800 bg-emerald-50/30">
+                          ✓ All {paidAllObs.length} scheduled payments and sinking reserves for {yearMonth} are marked as
+                          completed!
+                        </div>
+                      ) : (
+                        unpaidAllObs.map((ob) => renderChecklistRow(ob, ob.id === firstWarningObId))
+                      )}
+                    </div>
+
+                    {/* Folded-by-Default Completed / Already Paid Section */}
+                    {paidAllObs.length > 0 && (
+                      <div className="border-t border-slate-200 bg-emerald-50/20">
+                        <button
+                          type="button"
+                          onClick={() => setChecklistPaidFolded((prev) => !prev)}
+                          className="w-full px-5 py-3 flex items-center justify-between gap-2 text-left hover:bg-emerald-50/50 transition"
+                        >
+                          <div className="flex items-center gap-2">
+                            {checklistPaidFolded ? (
+                              <ChevronRight className="w-4 h-4 text-emerald-700 shrink-0" />
+                            ) : (
+                              <ChevronDown className="w-4 h-4 text-emerald-700 shrink-0" />
+                            )}
+                            <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                            <span className="text-xs font-mono-num uppercase tracking-wider font-semibold text-emerald-900">
+                              Already Paid & Completed This Month ({paidAllObs.length}) · {fmt(paidSumMinor)}
+                            </span>
+                          </div>
+                          <span className="text-[11px] font-mono-num text-emerald-800">
+                            {checklistPaidFolded ? 'Click to unfold completed items ▾' : 'Click to fold ▴'}
+                          </span>
+                        </button>
+
+                        {!checklistPaidFolded && (
+                          <div className="divide-y divide-slate-100 border-t border-emerald-200/60 bg-white">
+                            {paidAllObs.map((ob) => renderChecklistRow(ob, false))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </section>
+                </>
+              );
+            })()}
           </>
         )}
 
