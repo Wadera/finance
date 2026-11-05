@@ -156,7 +156,8 @@ export const App: React.FC = () => {
   const [yearMonth, setYearMonth] = useState<string>(() => new Date().toISOString().slice(0, 7));
   const [budgetHorizon, setBudgetHorizon] = useState<1 | 3 | 6 | 12 | 60 | 120>(1);
   const [scope, setScope] = useState<string>('all');
-  const [horizonYears, setHorizonYears] = useState<number>(10);
+  const [wealthPastYears, setWealthPastYears] = useState<number>(5);
+  const [horizonYears, setHorizonYears] = useState<number>(5);
   const [wealthMode, setWealthMode] = useState<'combined' | 'mine'>('combined');
   const [selectedPotId, setSelectedPotId] = useState<string | null>(null);
 
@@ -248,7 +249,7 @@ export const App: React.FC = () => {
           `/api/budget/month?ym=${encodeURIComponent(yearMonth)}&scope=${encodeURIComponent(scope)}&horizon=${budgetHorizon}`
         ),
         apiFetch<WealthOverviewResponse>(
-          `/api/wealth/overview?horizon=${horizonYears}&scope=${encodeURIComponent(scope)}`
+          `/api/wealth/overview?horizon=${horizonYears}&past=${wealthPastYears}&scope=${encodeURIComponent(scope)}`
         ),
       ]);
       setBoot(b);
@@ -257,7 +258,7 @@ export const App: React.FC = () => {
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Failed to load data');
     }
-  }, [yearMonth, scope, horizonYears, budgetHorizon]);
+  }, [yearMonth, scope, horizonYears, wealthPastYears, budgetHorizon]);
 
   useEffect(() => {
     void reloadAll();
@@ -2370,34 +2371,64 @@ export const App: React.FC = () => {
             </div>
 
             <section className="bg-white border border-slate-200 rounded-lg p-5 space-y-3">
-              <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
                   <h2 className="text-xs font-mono-num uppercase tracking-wider text-slate-500 font-semibold">
                     {t.trajectoryTitle(
                       wealthMode === 'combined' ? t.combinedWealthCard : boot.user.displayName,
                       horizonYears
                     )}
+                    {wealthPastYears > 0 ? ` · -${wealthPastYears}Y HISTORY` : ''}
                   </h2>
                   <p className="text-xs text-slate-400">{t.trajectorySub}</p>
                 </div>
-                <div className="flex items-center gap-1.5">
-                  {[5, 10, 20].map((yr) => (
-                    <button
-                      key={yr}
-                      type="button"
-                      onClick={() => setHorizonYears(yr)}
-                      className={`px-2.5 py-1 rounded text-xs font-mono-num ${
-                        horizonYears === yr ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-600'
-                      }`}
-                    >
-                      +{yr}Y
-                    </button>
-                  ))}
+                <div className="flex flex-wrap items-center gap-2">
+                  {/* Past History Lookback (-10Y / -5Y / -3Y / -1Y / 0Y) */}
+                  <div className="inline-flex items-center border border-slate-200 bg-[#FAF9F6] rounded-md p-0.5 text-xs font-mono-num">
+                    <span className="px-2 text-[10px] uppercase text-slate-400">History</span>
+                    {[10, 5, 3, 1, 0].map((pastYr) => (
+                      <button
+                        key={`past-${pastYr}`}
+                        type="button"
+                        onClick={() => setWealthPastYears(pastYr)}
+                        className={`px-2 py-0.5 rounded transition ${
+                          wealthPastYears === pastYr
+                            ? 'bg-teal-700 text-white font-semibold'
+                            : 'text-slate-600 hover:text-slate-900'
+                        }`}
+                      >
+                        {pastYr === 0 ? '0Y' : `-${pastYr}Y`}
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Future Forecast Horizon (0Y / +5Y / +10Y / +20Y) */}
+                  <div className="inline-flex items-center border border-slate-200 bg-[#FAF9F6] rounded-md p-0.5 text-xs font-mono-num">
+                    <span className="px-2 text-[10px] uppercase text-slate-400">Forecast</span>
+                    {[0, 5, 10, 20].map((yr) => (
+                      <button
+                        key={`fwd-${yr}`}
+                        type="button"
+                        onClick={() => setHorizonYears(yr)}
+                        className={`px-2 py-0.5 rounded transition ${
+                          horizonYears === yr
+                            ? 'bg-slate-900 text-white font-semibold'
+                            : 'text-slate-600 hover:text-slate-900'
+                        }`}
+                      >
+                        {yr === 0 ? '0Y' : `+${yr}Y`}
+                      </button>
+                    ))}
+                  </div>
                 </div>
               </div>
 
               <WealthHorizonChart
-                history={wealthMode === 'combined' ? wealth.combinedFamilyWealth.history : []}
+                history={
+                  wealthMode === 'combined'
+                    ? wealth.combinedFamilyWealth.history
+                    : wealth.myWealth.history || []
+                }
                 projection={
                   wealthMode === 'combined' ? wealth.combinedFamilyWealth.projection : wealth.myWealth.projection
                 }

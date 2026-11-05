@@ -1453,113 +1453,321 @@ export const PotProportionStrip: React.FC<{
 };
 
 /**
- * 5. Long-Horizon Wealth & Belongings Forecast Chart (Wealth Tab)
+ * 5. Long-Horizon Wealth History & Belongings Forecast Chart (Wealth Tab)
+ * Supports Past History (-10Y / -5Y / -3Y / -1Y) AND Future Forecast (+5Y / +10Y / +20Y),
+ * interactive year inspection, and zero-overlap label geometry.
  */
 export const WealthHorizonChart: React.FC<{
-  history: Array<{ date: string; netWorthMinor: number }>;
+  history: Array<{ date: string; netWorthMinor: number; assetsMinor?: number; liabilitiesMinor?: number }>;
   projection: HorizonProjectionPoint[];
   currency: CurrencyCode;
   privacyMode: boolean;
   t: TranslationDict;
 }> = ({ history, projection, currency, privacyMode, t }) => {
+  const [hoveredYear, setHoveredYear] = useState<number | null>(null);
   if (!projection.length) return null;
-  const width = 800;
-  const height = 230;
-  const padX = 36;
-  const padY = 24;
 
-  const histPoints = history.map((h) => ({
-    year: Number(h.date.slice(0, 4)),
-    netWorthMinor: h.netWorthMinor,
-    propertyMinor: 0,
-    liabilitiesMinor: 0,
-    isHistory: true,
-  }));
+  const width = 820;
+  const height = 248;
+  const padL = 44;
+  const padR = 44;
+  const padTop = 34;
+  const padBot = 28;
+  const plotH = height - padTop - padBot;
+
+  const nowYear = projection[0]?.year ?? new Date().getFullYear();
+
+  const histPoints = history
+    .map((h) => ({
+      year: Number(h.date.slice(0, 4)),
+      netWorthMinor: h.netWorthMinor,
+      totalAssetsMinor: h.assetsMinor ?? h.netWorthMinor,
+      liabilitiesMinor: h.liabilitiesMinor ?? 0,
+      isHistory: true,
+    }))
+    .filter((h) => h.year < nowYear);
 
   const projPoints = projection.map((p) => ({
     year: p.year,
     netWorthMinor: p.netWorthMinor,
     totalAssetsMinor: p.totalAssetsMinor,
-    propertyMinor: p.propertyMinor,
     liabilitiesMinor: p.totalLiabilitiesMinor,
     isHistory: false,
   }));
 
-  const combined = [...histPoints.filter((h) => h.year < projPoints[0].year), ...projPoints];
+  const combined = [...histPoints, ...projPoints];
+  if (!combined.length) return null;
 
-  const minYear = combined[0].year;
-  const maxYear = combined[combined.length - 1].year;
+  const minYear = combined[0]?.year ?? nowYear;
+  const maxYear = combined[combined.length - 1]?.year ?? nowYear;
   const yearSpan = Math.max(1, maxYear - minYear);
 
   const allVals = [
     0,
     ...combined.map((c) => c.netWorthMinor),
-    ...projPoints.map((p) => p.totalAssetsMinor ?? p.netWorthMinor),
-    ...projPoints.map((p) => -p.liabilitiesMinor),
+    ...combined.map((c) => c.totalAssetsMinor),
+    ...combined.map((c) => c.liabilitiesMinor),
   ];
   const minV = Math.min(0, ...allVals);
-  const maxV = Math.max(100, ...allVals);
+  const maxV = Math.max(100, Math.round(Math.max(...allVals) * 1.12));
   const valSpan = Math.max(1, maxV - minV);
 
-  const toX = (yr: number) => padX + ((yr - minYear) / yearSpan) * (width - padX * 2);
-  const toY = (v: number) => height - padY - ((v - minV) / valSpan) * (height - padY * 2);
+  const toX = (yr: number) =>
+    yearSpan === 0 ? width / 2 : padL + ((yr - minYear) / yearSpan) * (width - padL - padR);
+  const toY = (v: number) => padTop + plotH - ((v - minV) / valSpan) * plotH;
   const zeroY = toY(0);
 
   const nwLine = combined.map((c) => `${toX(c.year).toFixed(1)},${toY(c.netWorthMinor).toFixed(1)}`).join(' ');
-  const nwArea = `${toX(combined[0].year).toFixed(1)},${zeroY.toFixed(1)} ${nwLine} ${toX(
-    combined[combined.length - 1].year
-  ).toFixed(1)},${zeroY.toFixed(1)}`;
+  const nwArea = `${toX(minYear).toFixed(1)},${zeroY.toFixed(1)} ${nwLine} ${toX(maxYear).toFixed(1)},${zeroY.toFixed(1)}`;
 
-  const debtLine = projPoints
-    .map((p) => `${toX(p.year).toFixed(1)},${toY(-p.liabilitiesMinor).toFixed(1)}`)
+  const assetsLine = combined
+    .map((c) => `${toX(c.year).toFixed(1)},${toY(c.totalAssetsMinor).toFixed(1)}`)
+    .join(' ');
+  const debtLine = combined
+    .map((c) => `${toX(c.year).toFixed(1)},${toY(c.liabilitiesMinor).toFixed(1)}`)
     .join(' ');
 
-  const baselineMinor = projPoints[0]?.netWorthMinor || 1;
-  const nowX = toX(projPoints[0].year);
+  const nowPt = projPoints[0] ?? combined[combined.length - 1]!;
+  const startPt = combined[0]!;
+  const endPt = combined[combined.length - 1]!;
+  const baselineMinor = Math.max(1, Math.abs(nowPt.netWorthMinor || 1));
+  const nowX = toX(nowPt.year);
+
+  const activePt =
+    combined.find((c) => c.year === hoveredYear) ||
+    (endPt.year !== nowPt.year ? endPt : startPt) ||
+    nowPt;
+
+  const hasDebt = combined.some((c) => c.liabilitiesMinor > 0);
+
+  // Pick non-overlapping X-axis year tick labels
+  const xTickYears: number[] = [];
+  let lastTickX = -999;
+  for (const pt of combined) {
+    const cx = toX(pt.year);
+    const isMilestone = pt.year === minYear || pt.year === nowPt.year || pt.year === maxYear;
+    if (isMilestone || cx - lastTickX >= 56) {
+      if (xTickYears.length > 0 && cx - lastTickX < 36 && pt.year !== nowPt.year && pt.year !== maxYear) {
+        continue;
+      }
+      if (xTickYears.length > 0 && cx - lastTickX < 36 && (pt.year === nowPt.year || pt.year === maxYear)) {
+        xTickYears.pop();
+      }
+      xTickYears.push(pt.year);
+      lastTickX = cx;
+    }
+  }
 
   return (
-    <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-auto select-none">
-      <line x1={padX} x2={width - padX} y1={zeroY} y2={zeroY} stroke="#CBD5E1" strokeWidth={1} />
-      <line
-        x1={nowX}
-        x2={nowX}
-        y1={padY - 6}
-        y2={height - padY}
-        stroke="#64748B"
-        strokeDasharray="3 3"
-        strokeOpacity={0.5}
-      />
-      <text x={nowX + 5} y={padY + 4} className="fill-slate-500 text-[10px] font-mono-num">
-        {t.nowLabel} ({projPoints[0].year})
-      </text>
+    <div className="space-y-3">
+      {/* Legend & Milestone Summary Bar */}
+      <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono-num text-slate-600">
+        <div className="flex flex-wrap items-center gap-4">
+          <span className="inline-flex items-center gap-1.5 font-semibold text-teal-900">
+            <span className="w-3 h-1 rounded bg-[#1E5F74] inline-block" />
+            Net Worth
+          </span>
+          <span className="inline-flex items-center gap-1.5 text-emerald-800">
+            <span className="w-3 h-0.5 border-t-2 border-dashed border-emerald-600 inline-block" />
+            {t.assetsShort}
+          </span>
+          {hasDebt && (
+            <span className="inline-flex items-center gap-1.5 text-amber-800">
+              <span className="w-3 h-0.5 border-t-2 border-dashed border-amber-600 inline-block" />
+              {t.debtShort}
+            </span>
+          )}
+        </div>
 
-      <polygon points={nwArea} fill="#1E5F74" fillOpacity={0.12} />
-      <polyline fill="none" stroke="#1E5F74" strokeWidth={2.4} points={nwLine} />
+        {/* Non-overlapping Milestone Pills: History Start · Now · Forecast End */}
+        <div className="flex flex-wrap items-center gap-2">
+          {startPt.year < nowPt.year && (
+            <span className="px-2 py-0.5 rounded bg-slate-100 text-slate-700 border border-slate-200">
+              {startPt.year}:{' '}
+              <strong>{formatIndexedWealth(startPt.netWorthMinor, baselineMinor, currency, privacyMode)}</strong>
+            </span>
+          )}
+          <span className="px-2 py-0.5 rounded bg-teal-50 text-teal-900 border border-teal-200">
+            {t.nowLabel} ({nowPt.year}):{' '}
+            <strong>{formatIndexedWealth(nowPt.netWorthMinor, baselineMinor, currency, privacyMode)}</strong>
+          </span>
+          {endPt.year > nowPt.year && (
+            <span className="px-2 py-0.5 rounded bg-slate-900 text-white">
+              {endPt.year}:{' '}
+              <strong>{formatIndexedWealth(endPt.netWorthMinor, baselineMinor, currency, privacyMode)}</strong>
+            </span>
+          )}
+        </div>
+      </div>
 
-      {projPoints.some((p) => p.liabilitiesMinor > 0) && (
+      {/* SVG Trajectory Plot */}
+      <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-auto select-none">
+        {/* Zero Baseline */}
+        <line x1={padL} x2={width - padR} y1={zeroY} y2={zeroY} stroke="#CBD5E1" strokeWidth={1} />
+
+        {/* Shaded Net Worth Area */}
+        <polygon points={nwArea} fill="#1E5F74" fillOpacity={0.12} />
+
+        {/* Total Assets Upper Dashed Curve */}
         <polyline
           fill="none"
-          stroke="#C2410C"
+          stroke="#059669"
           strokeWidth={1.6}
           strokeDasharray="4 3"
-          strokeOpacity={0.7}
-          points={debtLine}
+          strokeOpacity={0.65}
+          points={assetsLine}
         />
-      )}
 
-      {[combined[0], projPoints[0], projPoints[projPoints.length - 1]].map((pt, i) => (
-        <g key={`${pt.year}-${i}`}>
-          <circle cx={toX(pt.year)} cy={toY(pt.netWorthMinor)} r={3.5} fill="#1E5F74" />
+        {/* Mortgage & Debt Lower Dashed Curve (Amortizing down toward 0) */}
+        {hasDebt && (
+          <polyline
+            fill="none"
+            stroke="#D97706"
+            strokeWidth={1.6}
+            strokeDasharray="4 3"
+            strokeOpacity={0.75}
+            points={debtLine}
+          />
+        )}
+
+        {/* Primary Net Worth Curve */}
+        <polyline fill="none" stroke="#1E5F74" strokeWidth={2.6} points={nwLine} />
+
+        {/* Vertical 'Now' Divider Line + Top Header Label (Placed at y=16 above plot area so it NEVER overlaps curve labels) */}
+        <line
+          x1={nowX}
+          x2={nowX}
+          y1={20}
+          y2={height - padBot}
+          stroke="#0F766E"
+          strokeDasharray="3 3"
+          strokeOpacity={0.65}
+        />
+        <text
+          x={Math.min(width - padR - 4, Math.max(padL + 4, nowX))}
+          y={14}
+          textAnchor={
+            nowX < padL + 70 ? 'start' : nowX > width - padR - 70 ? 'end' : 'middle'
+          }
+          className="fill-teal-800 text-[10px] font-mono-num font-semibold"
+        >
+          {t.nowLabel} ({nowPt.year}): {formatIndexedWealth(nowPt.netWorthMinor, baselineMinor, currency, privacyMode)}
+        </text>
+
+        {/* Leftmost & Rightmost Curve Endpoint Callouts (Only rendered if >= 95px away from each other) */}
+        {startPt.year < nowPt.year && nowX - toX(startPt.year) >= 95 && (
           <text
-            x={toX(pt.year)}
-            y={Math.max(12, toY(pt.netWorthMinor) - 8)}
-            textAnchor={i === 0 ? 'start' : i === 2 ? 'end' : 'middle'}
-            className="fill-slate-700 text-[10px] font-mono-num font-medium"
+            x={toX(startPt.year) + 4}
+            y={Math.max(28, toY(startPt.netWorthMinor) - 9)}
+            textAnchor="start"
+            className="fill-slate-600 text-[10px] font-mono-num font-medium"
           >
-            {pt.year}: {formatIndexedWealth(pt.netWorthMinor, baselineMinor, currency, privacyMode)}
+            {startPt.year}: {formatIndexedWealth(startPt.netWorthMinor, baselineMinor, currency, privacyMode)}
           </text>
-        </g>
-      ))}
-    </svg>
+        )}
+        {endPt.year > nowPt.year && toX(endPt.year) - nowX >= 95 && (
+          <text
+            x={toX(endPt.year) - 4}
+            y={Math.max(28, toY(endPt.netWorthMinor) - 9)}
+            textAnchor="end"
+            className="fill-slate-800 text-[10px] font-mono-num font-semibold"
+          >
+            {endPt.year}: {formatIndexedWealth(endPt.netWorthMinor, baselineMinor, currency, privacyMode)}
+          </text>
+        )}
+
+        {/* Interactive Year Dots */}
+        {combined.map((pt) => {
+          const cx = toX(pt.year);
+          const cy = toY(pt.netWorthMinor);
+          const isHovered = activePt.year === pt.year;
+          const isNow = pt.year === nowPt.year;
+          return (
+            <g
+              key={pt.year}
+              className="cursor-pointer"
+              onMouseEnter={() => setHoveredYear(pt.year)}
+              onClick={() => setHoveredYear(pt.year)}
+            >
+              {isHovered && (
+                <line
+                  x1={cx}
+                  x2={cx}
+                  y1={padTop}
+                  y2={height - padBot}
+                  stroke="#0F766E"
+                  strokeOpacity={0.25}
+                />
+              )}
+              <circle
+                cx={cx}
+                cy={cy}
+                r={isHovered ? 5 : isNow ? 4.2 : 3}
+                fill={isNow ? '#0F766E' : pt.isHistory ? '#475569' : '#1E5F74'}
+                stroke="#FFFFFF"
+                strokeWidth={1.6}
+              />
+            </g>
+          );
+        })}
+
+        {/* Bottom X-Axis Year Tick Labels */}
+        {xTickYears.map((yr) => (
+          <text
+            key={`tick-${yr}`}
+            x={toX(yr)}
+            y={height - 8}
+            textAnchor="middle"
+            className={`text-[10px] font-mono-num ${
+              yr === nowPt.year
+                ? 'fill-teal-800 font-semibold'
+                : activePt.year === yr
+                ? 'fill-slate-900 font-semibold'
+                : 'fill-slate-400'
+            }`}
+          >
+            {yr}
+          </text>
+        ))}
+      </svg>
+
+      {/* Interactive Hovered/Selected Year Breakdown Bar */}
+      <div className="px-3 py-2 rounded-md bg-[#FAF9F6] border border-slate-200 flex flex-wrap items-center justify-between gap-2 text-xs font-mono-num">
+        <div className="flex items-center gap-2">
+          <span className="font-semibold text-slate-900">{activePt.year}</span>
+          <span
+            className={`px-1.5 py-0.5 rounded text-[10px] ${
+              activePt.year < nowPt.year
+                ? 'bg-slate-200/80 text-slate-700'
+                : activePt.year === nowPt.year
+                ? 'bg-teal-100 text-teal-900 font-semibold'
+                : 'bg-emerald-50 text-emerald-800 border border-emerald-200'
+            }`}
+          >
+            {activePt.year < nowPt.year
+              ? `${activePt.year - nowPt.year}Y History`
+              : activePt.year === nowPt.year
+              ? t.nowLabel
+              : `+${activePt.year - nowPt.year}Y Forecast`}
+          </span>
+        </div>
+        <div className="flex flex-wrap items-center gap-4">
+          <span>
+            Net Worth:{' '}
+            <strong className="text-teal-900">
+              {formatIndexedWealth(activePt.netWorthMinor, baselineMinor, currency, privacyMode)}
+            </strong>
+          </span>
+          <span className="text-emerald-800">
+            {t.assetsShort}:{' '}
+            <strong>{formatIndexedWealth(activePt.totalAssetsMinor, baselineMinor, currency, privacyMode)}</strong>
+          </span>
+          <span className="text-amber-800">
+            {t.debtShort}:{' '}
+            <strong>{formatIndexedWealth(activePt.liabilitiesMinor, baselineMinor, currency, privacyMode)}</strong>
+          </span>
+        </div>
+      </div>
+    </div>
   );
 };

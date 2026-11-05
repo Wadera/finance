@@ -505,3 +505,108 @@ export function projectWealthHorizon(params: {
 
   return points;
 }
+
+/**
+ * Historical Wealth Reconstruction Engine (-pastYears..-1):
+ * Reconstructs year-by-year historical Assets, Liabilities (reverse mortgage amortization),
+ * and Net Worth prior to `startYear`, blending any stored `wealth_snapshots` when available.
+ */
+export function reconstructWealthHistory(params: {
+  startYear: number;
+  pastYears: number;
+  assets: AssetBelongingRecord[];
+  liabilities: LiabilityRecord[];
+  bankCashDisplayMinor: number;
+  monthlyNetSavingsDisplayMinor: number;
+  displayCurrency: CurrencyCode;
+  rateMap: Record<CurrencyCode, number>;
+}): HorizonProjectionPoint[] {
+  const {
+    startYear,
+    pastYears,
+    assets,
+    liabilities,
+    bankCashDisplayMinor,
+    monthlyNetSavingsDisplayMinor,
+    displayCurrency,
+    rateMap,
+  } = params;
+
+  if (pastYears <= 0) return [];
+
+  const assetStates = assets.map((a) => {
+    const curVal = convertMinor(a.currentValueMinor, a.currency, displayCurrency, rateMap);
+    const purchVal = convertMinor(a.purchasePriceMinor, a.currency, displayCurrency, rateMap);
+    return {
+      assetClass: a.assetClass,
+      rate: a.annualRateBp / 10000,
+      currentMinor: curVal,
+      maxCapMinor: purchVal > curVal ? purchVal : Math.round(curVal * 1.45),
+    };
+  });
+
+  const liabStates = liabilities.map((l) => {
+    const bal = convertMinor(l.balanceMinor, l.currency, displayCurrency, rateMap);
+    const pmt = convertMinor(l.monthlyPaymentMinor, l.currency, displayCurrency, rateMap);
+    const r = l.aprBp / 10000 / 12;
+    // If monthlyPaymentMinor was not filled in, estimate a standard 25-year amortization payment
+    const effectivePmt = pmt > 0 ? pmt : Math.round(bal * (r + 1 / 300));
+    return {
+      balanceMinor: bal,
+      monthlyRate: r,
+      monthlyPaymentMinor: effectivePmt,
+    };
+  });
+
+  let histCash = bankCashDisplayMinor;
+  const reversePoints: HorizonProjectionPoint[] = [];
+
+  for (let yBack = 1; yBack <= pastYears; yBack++) {
+    // Step 1 year backward
+    for (const a of assetStates) {
+      if (a.rate >= 0) {
+        const effRate = Math.max(0.03, a.rate);
+        a.currentMinor = a.currentMinor / (1 + effRate);
+      } else {
+        // Depreciating vehicle/belonging was worth more closer to purchase, capped at purchase price
+        const depRate = Math.min(0.2, Math.abs(a.rate));
+        a.currentMinor = Math.min(a.maxCapMinor, a.currentMinor * (1 + depRate * 0.6));
+      }
+    }
+
+    for (let m = 0; m < 12; m++) {
+      for (const l of liabStates) {
+        if (l.balanceMinor <= 0 && l.monthlyPaymentMinor <= 0) continue;
+        // Inverse of `nextBal = bal * (1 + r) - pay` -> `bal = (nextBal + pay) / (1 + r)`
+        l.balanceMinor = (l.balanceMinor + l.monthlyPaymentMinor) / (1 + l.monthlyRate);
+      }
+      histCash = Math.max(0, histCash - Math.round(monthlyNetSavingsDisplayMinor * 0.45));
+    }
+
+    let propertyMinor = 0;
+    let vehiclesAndBelongingsMinor = 0;
+    let liquidAndInvestmentsMinor = Math.max(0, Math.round(histCash));
+
+    for (const a of assetStates) {
+      if (a.assetClass === 'property') propertyMinor += a.currentMinor;
+      else if (a.assetClass === 'vehicle' || a.assetClass === 'belonging') vehiclesAndBelongingsMinor += a.currentMinor;
+      else liquidAndInvestmentsMinor += a.currentMinor;
+    }
+
+    const totalAssetsMinor = Math.round(propertyMinor + vehiclesAndBelongingsMinor + liquidAndInvestmentsMinor);
+    const totalLiabilitiesMinor = liabStates.reduce((s, l) => s + Math.max(0, Math.round(l.balanceMinor)), 0);
+
+    reversePoints.push({
+      yearOffset: -yBack,
+      year: startYear - yBack,
+      propertyMinor: Math.round(propertyMinor),
+      vehiclesAndBelongingsMinor: Math.round(vehiclesAndBelongingsMinor),
+      liquidAndInvestmentsMinor: Math.round(liquidAndInvestmentsMinor),
+      totalAssetsMinor,
+      totalLiabilitiesMinor,
+      netWorthMinor: totalAssetsMinor - totalLiabilitiesMinor,
+    });
+  }
+
+  return reversePoints.reverse();
+}

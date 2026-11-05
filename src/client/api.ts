@@ -242,11 +242,13 @@ export interface BudgetMonthResponse {
 export interface WealthOverviewResponse {
   displayCurrency: CurrencyCode;
   horizonYears: number;
+  pastYears?: number;
   scope?: string;
   myWealth: {
     totalAssetsMinor: number;
     totalLiabilitiesMinor: number;
     netWorthMinor: number;
+    history?: Array<{ date: string; netWorthMinor: number; assetsMinor: number; liabilitiesMinor: number }>;
     projection: HorizonProjectionPoint[];
   };
   partnerWealth: {

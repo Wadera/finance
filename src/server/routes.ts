@@ -11,6 +11,7 @@ import {
   computeMonthlyIncomeMinor,
   computeObligationMonthMetrics,
   projectWealthHorizon,
+  reconstructWealthHistory,
   resolveWaderaShareBp,
 } from '../shared/financeEngine.js';
 import type {
@@ -1226,8 +1227,9 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     const user = requireUser(req, reply, store, cfg);
     if (!user) return;
 
-    const q = (req.query || {}) as { horizon?: string; scope?: string };
-    const horizonYears = Math.min(30, Math.max(3, Number(q.horizon || 10)));
+    const q = (req.query || {}) as { horizon?: string; past?: string; scope?: string };
+    const horizonYears = Math.min(30, Math.max(0, q.horizon !== undefined ? Number(q.horizon) : 5));
+    const pastYears = Math.min(20, Math.max(0, q.past !== undefined ? Number(q.past) : 5));
     const scope = q.scope || 'all';
     const cur = user.defaultCurrency;
     const rateMap = buildRateMap(store.getFxRates());
@@ -1354,46 +1356,74 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       rateMap,
     });
 
+    const myScaledAssets = [
+      ...personalSummary.assets,
+      ...sharedHalfSummary.assets.map((a) => ({
+        ...a,
+        currentValueMinor: Math.round(a.currentValueMinor * 0.5),
+        purchasePriceMinor: Math.round(a.purchasePriceMinor * 0.5),
+        residualFloorMinor: Math.round(a.residualFloorMinor * 0.5),
+      })),
+    ];
+    const myScaledLiabilities = [
+      ...personalSummary.liabilities,
+      ...sharedHalfSummary.liabilities.map((l) => ({
+        ...l,
+        balanceMinor: Math.round(l.balanceMinor * 0.5),
+        monthlyPaymentMinor: Math.round(l.monthlyPaymentMinor * 0.5),
+      })),
+    ];
+    const myCashMinor = personalSummary.cashMinor + sharedHalfSummary.cashMinor;
+    const myMonthlySavings = Math.round(estMonthlySavings * (hasHomeShare ? 0.55 : 1.0));
+
     const myHorizonProjection = projectWealthHorizon({
       startYear: currentYear,
       horizonYears,
-      assets: [
-        ...personalSummary.assets,
-        ...sharedHalfSummary.assets.map((a) => ({
-          ...a,
-          currentValueMinor: Math.round(a.currentValueMinor * 0.5),
-          residualFloorMinor: Math.round(a.residualFloorMinor * 0.5),
-        })),
-      ],
-      liabilities: [
-        ...personalSummary.liabilities,
-        ...sharedHalfSummary.liabilities.map((l) => ({
-          ...l,
-          balanceMinor: Math.round(l.balanceMinor * 0.5),
-          monthlyPaymentMinor: Math.round(l.monthlyPaymentMinor * 0.5),
-        })),
-      ],
-      bankCashDisplayMinor: personalSummary.cashMinor + sharedHalfSummary.cashMinor,
-      monthlyNetSavingsDisplayMinor: Math.round(estMonthlySavings * (hasHomeShare ? 0.55 : 1.0)),
+      assets: myScaledAssets,
+      liabilities: myScaledLiabilities,
+      bankCashDisplayMinor: myCashMinor,
+      monthlyNetSavingsDisplayMinor: myMonthlySavings,
       displayCurrency: cur,
       rateMap,
     });
 
-    // Historical snapshots aggregated by date
-    const rawSnaps = store.listSnapshots(combinedWsIds);
-    const snapByDate = new Map<string, { date: string; netWorthMinor: number; assetsMinor: number; liabilitiesMinor: number }>();
-    for (const s of rawSnaps) {
-      const curEntry = snapByDate.get(s.snapshotDate) ?? {
-        date: s.snapshotDate,
-        netWorthMinor: 0,
-        assetsMinor: 0,
-        liabilitiesMinor: 0,
-      };
-      curEntry.netWorthMinor += convertMinor(s.netWorthGbpMinor, 'GBP', cur, rateMap);
-      curEntry.assetsMinor += convertMinor(s.totalAssetsGbpMinor, 'GBP', cur, rateMap);
-      curEntry.liabilitiesMinor += convertMinor(s.totalLiabilitiesGbpMinor, 'GBP', cur, rateMap);
-      snapByDate.set(s.snapshotDate, curEntry);
-    }
+    const combinedHistoryPoints = reconstructWealthHistory({
+      startYear: currentYear,
+      pastYears,
+      assets: combinedAssets,
+      liabilities: combinedLiabilities,
+      bankCashDisplayMinor: combinedCashMinor,
+      monthlyNetSavingsDisplayMinor: estMonthlySavings,
+      displayCurrency: cur,
+      rateMap,
+    });
+
+    const myHistoryPoints = reconstructWealthHistory({
+      startYear: currentYear,
+      pastYears,
+      assets: myScaledAssets,
+      liabilities: myScaledLiabilities,
+      bankCashDisplayMinor: myCashMinor,
+      monthlyNetSavingsDisplayMinor: myMonthlySavings,
+      displayCurrency: cur,
+      rateMap,
+    });
+
+    const combinedHistory = combinedHistoryPoints.map((pt) => ({
+      date: `${pt.year}-01-01`,
+      year: pt.year,
+      netWorthMinor: pt.netWorthMinor,
+      assetsMinor: pt.totalAssetsMinor,
+      liabilitiesMinor: pt.totalLiabilitiesMinor,
+    }));
+
+    const myHistory = myHistoryPoints.map((pt) => ({
+      date: `${pt.year}-01-01`,
+      year: pt.year,
+      netWorthMinor: pt.netWorthMinor,
+      assetsMinor: pt.totalAssetsMinor,
+      liabilitiesMinor: pt.totalLiabilitiesMinor,
+    }));
 
     // Visible item lists (never expose partner items unless partnerVisibility === 'readonly')
     const itemVisibleWsIds = store.readableWorkspaceIds(user.id, scope);
@@ -1404,20 +1434,26 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     }));
     const visibleLiabilities = store.listLiabilities(itemVisibleWsIds).map((l) => ({
       ...l,
-      displayBalanceMinor: convertMinor(l.balanceMinor, l.currency, cur, rateMap),
-      displayMonthlyMinor: convertMinor(l.monthlyPaymentMinor, l.currency, cur, rateMap),
+      displayBalanceMinor: convertMinor(l.balanceMinor, aCurrency(l.currency), cur, rateMap),
+      displayMonthlyMinor: convertMinor(l.monthlyPaymentMinor, aCurrency(l.currency), cur, rateMap),
     }));
+
+    function aCurrency(c: CurrencyCode): CurrencyCode {
+      return c || 'GBP';
+    }
 
     const salaryWsIds = scope && scope !== 'all' ? itemVisibleWsIds : [user.personalWorkspaceId];
 
     return {
       displayCurrency: cur,
       horizonYears,
+      pastYears,
       scope,
       myWealth: {
         totalAssetsMinor: myTotalAssetsMinor,
         totalLiabilitiesMinor: myTotalLiabilitiesMinor,
         netWorthMinor: myNetWorthMinor,
+        history: myHistory,
         projection: myHorizonProjection,
       },
       partnerWealth: partnerSummaryPublic,
@@ -1426,7 +1462,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
         totalLiabilitiesMinor: horizonProjection[0]?.totalLiabilitiesMinor ?? 0,
         netWorthMinor: horizonProjection[0]?.netWorthMinor ?? 0,
         estMonthlySavingsMinor: estMonthlySavings,
-        history: Array.from(snapByDate.values()).sort((a, b) => a.date.localeCompare(b.date)),
+        history: combinedHistory,
         projection: horizonProjection,
       },
       assets: visibleAssets,
