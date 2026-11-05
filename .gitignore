@@ -1,6 +1,7 @@
 node_modules/
 dist/
 data/
+statements/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
