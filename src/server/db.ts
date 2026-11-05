@@ -344,7 +344,9 @@ export class FinanceStore {
     addColumnIfMissing('expenses', 'account_id', 'TEXT REFERENCES accounts(id) ON DELETE SET NULL');
     addColumnIfMissing('expenses', 'liability_id', 'TEXT REFERENCES liabilities(id) ON DELETE SET NULL');
     addColumnIfMissing('expenses', 'flow_direction', "TEXT NOT NULL DEFAULT 'outflow'");
+    addColumnIfMissing('accounts', 'pocket_money_target_minor', 'INTEGER NOT NULL DEFAULT 0');
     addColumnIfMissing('obligations', 'account_id', 'TEXT REFERENCES accounts(id) ON DELETE SET NULL');
+    addColumnIfMissing('obligations', 'preserve_account_id', 'TEXT REFERENCES accounts(id) ON DELETE SET NULL');
     addColumnIfMissing('obligations', 'liability_id', 'TEXT REFERENCES liabilities(id) ON DELETE SET NULL');
     addColumnIfMissing('payment_occurrences', 'account_id', 'TEXT REFERENCES accounts(id) ON DELETE SET NULL');
     addColumnIfMissing('payment_occurrences', 'liability_id', 'TEXT REFERENCES liabilities(id) ON DELETE SET NULL');
@@ -917,6 +919,7 @@ export class FinanceStore {
       institution: String(r.institution ?? ''),
       currency: r.currency as CurrencyCode,
       balanceMinor: Number(r.balance_minor),
+      pocketMoneyTargetMinor: Number(r.pocket_money_target_minor ?? 0),
       isPrimaryRunway: Boolean(r.is_primary_runway),
       portalUrl: (r.portal_url as string | null) ?? null,
       notes: (r.notes as string | null) ?? null,
@@ -980,6 +983,7 @@ export class FinanceStore {
       workspaceId: String(r.workspace_id),
       potId: (r.pot_id as string | null) ?? null,
       accountId: (r.account_id as string | null) ?? null,
+      preserveAccountId: (r.preserve_account_id as string | null) ?? null,
       liabilityId: (r.liability_id as string | null) ?? null,
       name: String(r.name),
       amountMinor: Number(r.amount_minor),

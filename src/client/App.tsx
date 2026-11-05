@@ -189,6 +189,11 @@ export const App: React.FC = () => {
   const [drawerAttachments, setDrawerAttachments] = useState<AttachmentRecord[]>([]);
   const [drawerSavedMsg, setDrawerSavedMsg] = useState<string | null>(null);
   const [ledgerOpen, setLedgerOpen] = useState<boolean>(false);
+  const [timelineAccountId, setTimelineAccountId] = useState<string>('all');
+  const [accountsFolded, setAccountsFolded] = useState<boolean>(true);
+  const [advisoryOpen, setAdvisoryOpen] = useState<boolean>(true);
+  const [preserveExpandedIds, setPreserveExpandedIds] = useState<Set<string>>(() => new Set());
+  const [sankeyShowLayers, setSankeyShowLayers] = useState<boolean>(true);
   const [horizonMenuOpen, setHorizonMenuOpen] = useState<boolean>(false);
   const [quickMenuOpen, setQuickMenuOpen] = useState<boolean>(false);
   const [newlyMintedKey, setNewlyMintedKey] = useState<string | null>(null);
@@ -243,10 +248,12 @@ export const App: React.FC = () => {
       }
       if (!st.authenticated) return;
 
+      const accQuery =
+        timelineAccountId && timelineAccountId !== 'all' ? `&accountId=${encodeURIComponent(timelineAccountId)}` : '';
       const [b, m, w] = await Promise.all([
         apiFetch<BootstrapResponse>('/api/bootstrap'),
         apiFetch<BudgetMonthResponse>(
-          `/api/budget/month?ym=${encodeURIComponent(yearMonth)}&scope=${encodeURIComponent(scope)}&horizon=${budgetHorizon}`
+          `/api/budget/month?ym=${encodeURIComponent(yearMonth)}&scope=${encodeURIComponent(scope)}&horizon=${budgetHorizon}${accQuery}`
         ),
         apiFetch<WealthOverviewResponse>(
           `/api/wealth/overview?horizon=${horizonYears}&past=${wealthPastYears}&scope=${encodeURIComponent(scope)}`
@@ -258,7 +265,7 @@ export const App: React.FC = () => {
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Failed to load data');
     }
-  }, [yearMonth, scope, horizonYears, wealthPastYears, budgetHorizon]);
+  }, [yearMonth, scope, horizonYears, wealthPastYears, budgetHorizon, timelineAccountId]);
 
   useEffect(() => {
     void reloadAll();
@@ -298,15 +305,17 @@ export const App: React.FC = () => {
 
   const visiblePotTreeRows = useMemo(() => {
     if (!budget) return [];
+    const sourceObs = budget.allObligations ?? budget.obligations;
+    const sourceExps = budget.allExpenses ?? budget.expenses;
     const obsByPot = new Map<string, EnrichedObligation[]>();
-    for (const ob of budget.obligations) {
+    for (const ob of sourceObs) {
       if (!ob.isActive || !ob.potId) continue;
       const list = obsByPot.get(ob.potId) ?? [];
       list.push(ob);
       obsByPot.set(ob.potId, list);
     }
     const expsByPot = new Map<string, EnrichedExpense[]>();
-    for (const exp of budget.expenses) {
+    for (const exp of sourceExps) {
       if (!exp.potId) continue;
       const list = expsByPot.get(exp.potId) ?? [];
       list.push(exp);
@@ -520,7 +529,7 @@ export const App: React.FC = () => {
   ) => {
     setDrawerSavedMsg(null);
     if (entityType === 'obligation') {
-      const ob = budget.obligations.find((o) => o.id === entityId);
+      const ob = (budget.allObligations ?? budget.obligations).find((o) => o.id === entityId);
       if (ob) {
         setDrawer({
           entityType: 'obligation',
@@ -536,7 +545,7 @@ export const App: React.FC = () => {
         });
       }
     } else if (entityType === 'expense') {
-      const exp = budget.expenses.find((e) => e.id === entityId);
+      const exp = (budget.allExpenses ?? budget.expenses).find((e) => e.id === entityId);
       if (exp) {
         setDrawer({
           entityType: 'expense',
@@ -1092,54 +1101,128 @@ export const App: React.FC = () => {
               );
             })()}
 
-            {/* Live Bank & Runway Accounts Bar (Click Edit on any account to rename or adjust balance) */}
-            <section className="bg-white border border-slate-200 rounded-lg p-3.5">
-              <div className="flex flex-wrap items-center justify-between gap-2 mb-2.5">
-                <div className="text-[11px] font-mono-num uppercase tracking-wider text-slate-500 font-semibold flex items-center gap-1.5">
-                  <Landmark className="w-3.5 h-3.5 text-teal-700" /> {t.bankAccountsTitle}
-                </div>
+            {/* Live Bank & Runway Accounts Bar (Folded by default; shows Total vs Locked Annual Reserves vs Real Free Cash) */}
+            <section className="bg-white border border-slate-200 rounded-lg px-4 py-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
                 <button
                   type="button"
-                  onClick={() => setModal({ kind: 'account' })}
-                  className="inline-flex items-center gap-1 px-2 py-1 rounded border border-slate-200 bg-white text-[11px] font-medium text-slate-700 hover:bg-slate-50"
+                  onClick={() => setAccountsFolded((prev) => !prev)}
+                  className="flex items-center gap-2 text-left group"
                 >
-                  <Plus className="w-3 h-3" /> {t.addAccountBtn}
+                  {accountsFolded ? (
+                    <ChevronRight className="w-4 h-4 text-slate-400 group-hover:text-teal-700 shrink-0" />
+                  ) : (
+                    <ChevronDown className="w-4 h-4 text-teal-700 shrink-0" />
+                  )}
+                  <Landmark className="w-3.5 h-3.5 text-teal-700 shrink-0" />
+                  <span className="text-[11px] font-mono-num uppercase tracking-wider text-slate-700 font-semibold group-hover:text-teal-800">
+                    {t.bankAccountsTitle} ({allAvailableAccounts.length})
+                  </span>
+                  <span className="text-[11px] font-mono-num text-slate-500">
+                    · {accountsFolded ? 'Click to open accounts & locked reserves' : 'Click to fold'}
+                  </span>
                 </button>
-              </div>
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5">
-                {allAvailableAccounts.map((acc) => (
-                  <div
-                    key={acc.id}
-                    onClick={() => openEntityDrawer('account', acc.id)}
-                    className="border border-slate-200 rounded-md px-3 py-2 bg-[#FAF9F6]/60 hover:border-teal-700/50 cursor-pointer flex items-center justify-between gap-2 transition"
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setAccountsFolded((prev) => !prev)}
+                    className="px-2 py-1 rounded border border-slate-200 bg-[#FAF9F6] text-[11px] font-mono-num text-slate-700 hover:bg-slate-100"
                   >
-                    <div className="min-w-0">
-                      <div className="text-xs font-semibold text-slate-900 truncate">{acc.name}</div>
-                      <div className="text-[11px] text-slate-400 truncate">
-                        {acc.institution || acc.currency}
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-2 shrink-0">
-                      <span className="font-mono-num text-xs font-semibold text-slate-900">
-                        {formatDisplayValue(acc.balanceMinor, { currency: acc.currency, privacyMode })}
-                      </span>
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          openEntityDrawer('account', acc.id);
-                        }}
-                        className="inline-flex items-center gap-1 px-2 py-1 rounded border border-slate-300 bg-white text-[11px] font-medium text-slate-700 hover:bg-slate-900 hover:text-white transition"
-                      >
-                        <Pencil className="w-3 h-3" /> {t.editBtn}
-                      </button>
-                    </div>
-                  </div>
-                ))}
+                    {accountsFolded ? 'Open Accounts ▾' : 'Fold Accounts ▴'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setModal({ kind: 'account' })}
+                    className="inline-flex items-center gap-1 px-2 py-1 rounded border border-slate-200 bg-white text-[11px] font-medium text-slate-700 hover:bg-slate-50"
+                  >
+                    <Plus className="w-3 h-3" /> {t.addAccountBtn}
+                  </button>
+                </div>
               </div>
+
+              {!accountsFolded && (
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5 mt-3 pt-2.5 border-t border-slate-100">
+                  {allAvailableAccounts.map((acc) => {
+                    const stat = budget.accountAnalytics?.find((a) => a.accountId === acc.id);
+                    const hasLocked = (stat?.lockedPreserveDisplayMinor ?? 0) > 0;
+                    const hasDeficit = stat && !stat.isPrePaydaySufficient && stat.unpaidPrePaydayDisplayMinor > 0;
+                    return (
+                      <div
+                        key={acc.id}
+                        onClick={() => openEntityDrawer('account', acc.id)}
+                        className={`border rounded-md px-3 py-2.5 cursor-pointer flex flex-col justify-between gap-2 transition ${
+                          hasDeficit
+                            ? 'border-amber-300 bg-amber-50/40 hover:border-amber-500'
+                            : hasLocked
+                            ? 'border-teal-300 bg-teal-50/30 hover:border-teal-600'
+                            : 'border-slate-200 bg-[#FAF9F6]/60 hover:border-teal-700/50'
+                        }`}
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0">
+                            <div className="text-xs font-semibold text-slate-900 truncate">{acc.name}</div>
+                            <div className="text-[11px] text-slate-400 truncate">
+                              {acc.institution || acc.currency}
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            <span className="font-mono-num text-xs font-semibold text-slate-900">
+                              {formatDisplayValue(acc.balanceMinor, { currency: acc.currency, privacyMode })}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                openEntityDrawer('account', acc.id);
+                              }}
+                              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-slate-300 bg-white text-[10px] font-medium text-slate-700 hover:bg-slate-900 hover:text-white transition"
+                            >
+                              <Pencil className="w-2.5 h-2.5" /> {t.editBtn}
+                            </button>
+                          </div>
+                        </div>
+
+                        {stat && (hasLocked || stat.unpaidPrePaydayDisplayMinor > 0 || stat.pocketMoneyTargetMinor > 0) && (
+                          <div className="pt-1.5 border-t border-slate-200/70 space-y-1 text-[10px] font-mono-num">
+                            {hasLocked && (
+                              <div className="flex items-center justify-between text-teal-900">
+                                <span>🔒 Planned Annual Reserves:</span>
+                                <span className="font-semibold">
+                                  {fmt(stat.lockedPreserveDisplayMinor)} · Free: {fmt(stat.trueAvailableDisplayMinor)}
+                                </span>
+                              </div>
+                            )}
+                            {stat.unpaidPrePaydayDisplayMinor > 0 && (
+                              <div
+                                className={`flex items-center justify-between ${
+                                  stat.isPrePaydaySufficient ? 'text-slate-600' : 'text-amber-800 font-semibold'
+                                }`}
+                              >
+                                <span>Pre-Payday Bills Due:</span>
+                                <span>
+                                  {fmt(stat.unpaidPrePaydayDisplayMinor)}{' '}
+                                  {!stat.isPrePaydaySufficient && `(Need +${fmt(Math.abs(stat.netPrePaydayDisplayMinor))})`}
+                                </span>
+                              </div>
+                            )}
+                            {stat.pocketMoneyTargetDisplayMinor > 0 && (
+                              <div className="flex items-center justify-between text-indigo-800">
+                                <span>🎯 Pocket Money Left:</span>
+                                <span>
+                                  {fmt(stat.pocketMoneyRemainingDisplayMinor)} / {fmt(stat.pocketMoneyTargetDisplayMinor)}
+                                </span>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </section>
 
-            {/* Cashflow Sankey Card with Unlimited-Depth Unfold & Two-Track Payday Bridge */}
+            {/* Cashflow Sankey Card with Unlimited-Depth Unfold, Multi-Layer Account/Workspace Routing & Two-Track Payday Bridge */}
             <section className="bg-white border border-slate-200 rounded-lg p-5 space-y-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div>
@@ -1149,6 +1232,20 @@ export const App: React.FC = () => {
                   <p className="text-xs text-slate-400">{t.sankeySub}</p>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setSankeyShowLayers((prev) => !prev)}
+                    className={`px-2.5 py-1.5 rounded border text-xs font-mono-num transition ${
+                      sankeyShowLayers
+                        ? 'border-teal-700 bg-teal-700 text-white font-semibold'
+                        : 'border-slate-200 bg-[#FAF9F6] text-slate-700 hover:bg-slate-100'
+                    }`}
+                    title="Toggle intermediate Bank Account -> Workspace Scope mixing layers on the Sankey diagram"
+                  >
+                    {sankeyShowLayers
+                      ? 'Layers: Accounts → Workspaces → Pots'
+                      : 'Layers: Direct to Pots'}
+                  </button>
                   {(sankeyExpandedPots.size > 0 || sankeyExpandedExps.size > 0) && (
                     <button
                       type="button"
@@ -1225,10 +1322,13 @@ export const App: React.FC = () => {
 
               <CashflowSankeyChart
                 incomes={budget.incomes}
+                accounts={allAvailableAccounts}
+                workspaces={boot.workspaces}
+                showRoutingLayers={sankeyShowLayers}
                 cashflowBridge={budget.cashflowBridge}
                 potTree={budget.potTree}
-                obligations={budget.obligations}
-                expenses={budget.expenses}
+                obligations={budget.allObligations ?? budget.obligations}
+                expenses={budget.allExpenses ?? budget.expenses}
                 totalIncomeMinor={budget.kpis.totalIncomeMinor}
                 potPlannedTotalMinor={budget.kpis.potPlannedTotalMinor}
                 netMonthlySurplusMinor={budget.kpis.netMonthlySurplusMinor}
@@ -1313,33 +1413,48 @@ export const App: React.FC = () => {
                   </div>
                   <p className="text-[11px] text-slate-500 mb-3">{t.preserveExplainer}</p>
                   <div className="space-y-2.5">
-                    {budget.obligations
-                      .filter((o) => !o.metrics.isDueThisMonth && o.preserveDisplayMinor > 0)
-                      .slice(0, 5)
+                    {(budget.allObligations ?? budget.obligations)
+                      .filter((o) => o.cadence !== 'monthly' && (o.preserveDisplayMinor > 0 || o.preservedDisplayMinor > 0))
                       .map((ob) => {
                         const progressPct =
                           ob.amountMinor > 0 ? Math.min(100, Math.round((ob.preservedMinor / ob.amountMinor) * 100)) : 0;
+                        const isUnfolded = preserveExpandedIds.has(ob.id);
+                        const potLabel = ob.potId ? potBreadcrumbs.get(ob.potId)?.pathString || 'Annual Goal' : 'Annual Goal';
                         return (
                           <div
                             key={ob.id}
-                            onClick={() => openEntityDrawer('obligation', ob.id)}
-                            className="border border-slate-100 rounded-md p-2.5 bg-[#FAF9F6]/60 hover:border-teal-600/40 cursor-pointer transition"
+                            className="border border-slate-200 rounded-md p-2.5 bg-[#FAF9F6]/80 hover:border-teal-600/50 transition"
                           >
-                            <div className="flex items-center justify-between text-xs">
-                              <span className="font-medium text-slate-800 inline-flex items-center gap-1.5">
-                                <span>{ob.name}</span>
-                                <Pencil className="w-3 h-3 text-slate-400" />
+                            <div
+                              onClick={() =>
+                                setPreserveExpandedIds((prev) => {
+                                  const next = new Set(prev);
+                                  if (next.has(ob.id)) next.delete(ob.id);
+                                  else next.add(ob.id);
+                                  return next;
+                                })
+                              }
+                              className="flex items-center justify-between text-xs cursor-pointer"
+                            >
+                              <span className="font-medium text-slate-900 inline-flex items-center gap-1.5 min-w-0">
+                                {isUnfolded ? (
+                                  <ChevronDown className="w-3.5 h-3.5 text-teal-700 shrink-0" />
+                                ) : (
+                                  <ChevronRight className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                                )}
+                                <span className="truncate">{ob.name}</span>
                               </span>
-                              <span className="font-mono-num font-semibold text-teal-800">
+                              <span className="font-mono-num font-semibold text-teal-800 shrink-0">
                                 +{fmt(ob.preserveDisplayMinor)}/mo
                               </span>
                             </div>
+
                             <div className="flex items-center justify-between text-[11px] text-slate-500 mt-1 font-mono-num">
                               <span>
                                 {t.dueLabel} {ob.nextDueDate} ({ob.metrics.monthsUntilDue}
                                 {t.monthsLeft})
                               </span>
-                              <span>
+                              <span className="font-semibold text-slate-700">
                                 {t.preservedPct} {progressPct}%{' '}
                                 {!privacyMode && `(${fmt(ob.preservedDisplayMinor)} / ${fmt(ob.targetDisplayMinor)})`}
                               </span>
@@ -1347,6 +1462,44 @@ export const App: React.FC = () => {
                             <div className="w-full h-1.5 bg-slate-200 rounded-full overflow-hidden mt-1.5">
                               <div className="h-full bg-teal-700" style={{ width: `${progressPct}%` }} />
                             </div>
+
+                            {isUnfolded && (
+                              <div className="mt-2.5 pt-2 border-t border-slate-200/80 space-y-1.5 text-[11px] font-mono-num">
+                                <div className="flex items-center justify-between text-slate-600">
+                                  <span>Category / Pot:</span>
+                                  <span className="font-medium text-slate-800 truncate max-w-[180px]">{potLabel}</span>
+                                </div>
+                                <div className="flex items-center justify-between text-slate-600">
+                                  <span>Sitting on Account:</span>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      const targetAcc = ob.preserveAccountId || ob.accountId;
+                                      if (targetAcc) openEntityDrawer('account', targetAcc);
+                                    }}
+                                    className="font-semibold text-teal-800 hover:underline"
+                                  >
+                                    🏦 {ob.preserveAccountName || ob.accountName || 'Lloyds Standard Saver'}
+                                  </button>
+                                </div>
+                                <div className="flex items-center justify-between text-slate-600">
+                                  <span>Remaining Still Needed:</span>
+                                  <span className="font-semibold text-amber-800">
+                                    {fmt(Math.max(0, ob.targetDisplayMinor - ob.preservedDisplayMinor))} by {ob.nextDueDate}
+                                  </span>
+                                </div>
+                                <div className="flex items-center justify-end gap-2 pt-1">
+                                  <button
+                                    type="button"
+                                    onClick={() => openEntityDrawer('obligation', ob.id)}
+                                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded border border-slate-300 bg-white text-[10px] font-sans font-medium text-slate-700 hover:bg-slate-900 hover:text-white transition"
+                                  >
+                                    <Pencil className="w-2.5 h-2.5" /> Edit Reserve / Account
+                                  </button>
+                                </div>
+                              </div>
+                            )}
                           </div>
                         );
                       })}
@@ -1360,53 +1513,358 @@ export const App: React.FC = () => {
         {/* ======================== TAB 2: TIMELINE & SUFFICIENCY ======================== */}
         {tab === 'timeline' && (
           <>
-            {/* Live Bank & Runway Accounts Strip on Timeline */}
-            <section className="bg-white border border-slate-200 rounded-lg px-4 py-3">
-              <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
-                <span className="text-[11px] font-mono-num uppercase tracking-wider text-slate-500 font-semibold flex items-center gap-1.5">
-                  <Landmark className="w-3.5 h-3.5 text-teal-700" /> {t.bankAccountsTitle}
+            {/* Per-Account Timeline Selector + Folded-by-Default Bank & Runway Accounts Section */}
+            <section className="bg-white border border-slate-200 rounded-lg px-4 py-3 space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <button
+                  type="button"
+                  onClick={() => setAccountsFolded((prev) => !prev)}
+                  className="flex items-center gap-2 text-left group"
+                >
+                  {accountsFolded ? (
+                    <ChevronRight className="w-4 h-4 text-slate-400 group-hover:text-teal-700 shrink-0" />
+                  ) : (
+                    <ChevronDown className="w-4 h-4 text-teal-700 shrink-0" />
+                  )}
+                  <span className="text-[11px] font-mono-num uppercase tracking-wider text-slate-600 font-semibold flex items-center gap-1.5 group-hover:text-teal-800">
+                    <Landmark className="w-3.5 h-3.5 text-teal-700" /> {t.bankAccountsTitle} ({allAvailableAccounts.length})
+                  </span>
+                  <span className="text-[11px] font-mono-num text-slate-500">
+                    · Total: <strong className="text-slate-900">{fmt(budget.runway.totalLiquidAssetsMinor)}</strong>
+                  </span>
+                </button>
+
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setAccountsFolded((prev) => !prev)}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded border border-slate-200 bg-[#FAF9F6] text-[11px] font-medium text-slate-700 hover:bg-slate-100"
+                  >
+                    {accountsFolded ? 'Open Accounts & Reserves' : 'Fold Accounts'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setModal({ kind: 'account' })}
+                    className="inline-flex items-center gap-1 px-2 py-1 rounded border border-slate-200 text-[11px] font-medium text-slate-700 hover:bg-slate-50"
+                  >
+                    <Plus className="w-3 h-3" /> {t.addAccountBtn}
+                  </button>
+                </div>
+              </div>
+
+              {/* Per-Account Timeline Filter Pills (Default: All Accounts Combined, or click any account to isolate its timeline & money flow) */}
+              <div className="flex flex-wrap items-center gap-1.5 pt-1 border-t border-slate-100">
+                <span className="text-[10px] font-mono-num uppercase tracking-wider text-slate-400 mr-1">
+                  Timeline Source:
                 </span>
                 <button
                   type="button"
-                  onClick={() => setModal({ kind: 'account' })}
-                  className="inline-flex items-center gap-1 px-2 py-1 rounded border border-slate-200 text-[11px] font-medium text-slate-700 hover:bg-slate-50"
+                  onClick={() => setTimelineAccountId('all')}
+                  className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium transition ${
+                    timelineAccountId === 'all'
+                      ? 'bg-slate-900 text-white shadow-sm'
+                      : 'bg-[#FAF9F6] text-slate-700 border border-slate-200 hover:border-teal-600/50'
+                  }`}
                 >
-                  <Plus className="w-3 h-3" /> {t.addAccountBtn}
+                  <span>All Accounts (Combined)</span>
+                  <span className="font-mono-num text-[11px] opacity-80">
+                    {fmt(budget.runway.totalLiquidAssetsMinor)}
+                  </span>
                 </button>
-              </div>
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5">
-                {allAvailableAccounts.map((acc) => (
-                  <div
-                    key={acc.id}
-                    onClick={() => openEntityDrawer('account', acc.id)}
-                    className="flex items-center justify-between gap-2 px-3 py-2 rounded-md border border-slate-200 bg-[#FAF9F6]/70 hover:border-teal-600/50 cursor-pointer transition"
-                  >
-                    <div className="min-w-0">
-                      <div className="text-xs font-medium text-slate-800 truncate">{acc.name}</div>
-                      <div className="text-[10px] text-slate-400 truncate">{acc.institution}</div>
-                    </div>
-                    <div className="flex items-center gap-2 shrink-0">
-                      <span className="font-mono-num text-xs font-semibold text-slate-900">
+                {allAvailableAccounts.map((acc) => {
+                  const analytics = (budget.accountAnalytics || []).find((a) => a.accountId === acc.id);
+                  const isSelected = timelineAccountId === acc.id;
+                  const hasShortfall = analytics && !analytics.isPrePaydaySufficient;
+                  const hasLocked = analytics && analytics.lockedPreserveDisplayMinor > 0;
+                  return (
+                    <button
+                      key={acc.id}
+                      type="button"
+                      onClick={() => setTimelineAccountId(isSelected ? 'all' : acc.id)}
+                      className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium transition ${
+                        isSelected
+                          ? 'bg-teal-800 text-white shadow-sm'
+                          : 'bg-[#FAF9F6] text-slate-700 border border-slate-200 hover:border-teal-600/50'
+                      }`}
+                      title={
+                        hasLocked
+                          ? `${acc.name}: Free ${fmt(analytics.trueAvailableDisplayMinor)} (${fmt(analytics.lockedPreserveDisplayMinor)} locked for annual renewals)`
+                          : acc.name
+                      }
+                    >
+                      <span
+                        className={`w-2 h-2 rounded-full shrink-0 ${
+                          hasShortfall
+                            ? 'bg-amber-500'
+                            : hasLocked
+                            ? 'bg-teal-500'
+                            : 'bg-emerald-500'
+                        }`}
+                      />
+                      <span className="truncate max-w-[165px]">{acc.name.split('—')[0].trim()}</span>
+                      <span
+                        className={`font-mono-num text-[11px] ${
+                          isSelected ? 'text-teal-100' : 'text-slate-900 font-semibold'
+                        }`}
+                      >
                         {formatDisplayValue(acc.balanceMinor, { currency: acc.currency, privacyMode })}
                       </span>
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          openEntityDrawer('account', acc.id);
-                        }}
-                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded border border-slate-300 bg-white text-[10px] font-medium text-slate-700 hover:bg-slate-900 hover:text-white hover:border-slate-900 transition"
-                      >
-                        <Pencil className="w-2.5 h-2.5" /> {t.editBtn}
-                      </button>
-                    </div>
-                  </div>
-                ))}
+                    </button>
+                  );
+                })}
               </div>
+
+              {/* Expanded Detailed Account Cards (with Locked Annual Reserves vs Real Free Cash & Pocket Money) */}
+              {!accountsFolded && (
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5 pt-2 border-t border-slate-100">
+                  {allAvailableAccounts.map((acc) => {
+                    const analytics = (budget.accountAnalytics || []).find((a) => a.accountId === acc.id);
+                    const hasLocked = analytics && analytics.lockedPreserveDisplayMinor > 0;
+                    const hasShortfall = analytics && !analytics.isPrePaydaySufficient;
+                    const isSelected = timelineAccountId === acc.id;
+                    return (
+                      <div
+                        key={acc.id}
+                        onClick={() => openEntityDrawer('account', acc.id)}
+                        className={`flex flex-col justify-between gap-2 px-3 py-2.5 rounded-md border cursor-pointer transition ${
+                          isSelected
+                            ? 'border-teal-700 bg-teal-50/30 ring-1 ring-teal-700/30'
+                            : hasShortfall
+                            ? 'border-amber-300 bg-amber-50/30 hover:border-amber-500'
+                            : 'border-slate-200 bg-[#FAF9F6]/70 hover:border-teal-600/50'
+                        }`}
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0">
+                            <div className="text-xs font-medium text-slate-800 truncate">{acc.name}</div>
+                            <div className="text-[10px] text-slate-400 truncate">{acc.institution}</div>
+                          </div>
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            <span className="font-mono-num text-xs font-semibold text-slate-900">
+                              {formatDisplayValue(acc.balanceMinor, { currency: acc.currency, privacyMode })}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                openEntityDrawer('account', acc.id);
+                              }}
+                              className="inline-flex items-center gap-1 px-2 py-0.5 rounded border border-slate-300 bg-white text-[10px] font-medium text-slate-700 hover:bg-slate-900 hover:text-white hover:border-slate-900 transition"
+                            >
+                              <Pencil className="w-2.5 h-2.5" /> {t.editBtn}
+                            </button>
+                          </div>
+                        </div>
+
+                        {analytics && (hasLocked || analytics.unpaidPrePaydayDisplayMinor > 0 || analytics.pocketMoneyTargetMinor > 0) && (
+                          <div className="pt-1.5 border-t border-slate-200/70 space-y-1 text-[10px] font-mono-num">
+                            {hasLocked && (
+                              <>
+                                <div className="flex items-center justify-between text-amber-800">
+                                  <span>🔒 Planned Annual Reserves:</span>
+                                  <span className="font-semibold">-{fmt(analytics.lockedPreserveDisplayMinor)}</span>
+                                </div>
+                                <div className="flex items-center justify-between text-emerald-800">
+                                  <span>✓ Real Free Available Cash:</span>
+                                  <span className="font-semibold">{fmt(analytics.trueAvailableDisplayMinor)}</span>
+                                </div>
+                                {analytics.lockedItems.length > 0 && (
+                                  <div className="text-[9.5px] text-slate-500 pl-2 border-l-2 border-amber-300 space-y-0.5 mt-0.5">
+                                    {analytics.lockedItems.map((li) => (
+                                      <div key={li.id} className="flex justify-between">
+                                        <span className="truncate max-w-[160px]">{li.name}</span>
+                                        <span>
+                                          {fmt(li.preservedDisplayMinor)} / {fmt(li.targetDisplayMinor)}
+                                        </span>
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
+                              </>
+                            )}
+                            {analytics.unpaidPrePaydayDisplayMinor > 0 && (
+                              <div className="flex items-center justify-between text-slate-600">
+                                <span>Pre-Payday Bills Due:</span>
+                                <span className={hasShortfall ? 'text-rose-700 font-semibold' : 'text-slate-800'}>
+                                  {fmt(analytics.unpaidPrePaydayDisplayMinor)}
+                                  {hasShortfall ? ` (Need +${fmt(Math.abs(analytics.netPrePaydayDisplayMinor))})` : ''}
+                                </span>
+                              </div>
+                            )}
+                            {analytics.pocketMoneyTargetMinor > 0 && (
+                              <div className="flex items-center justify-between text-teal-800">
+                                <span>🎯 Pocket Money Left:</span>
+                                <span className="font-semibold">
+                                  {formatDisplayValue(analytics.pocketMoneyRemainingMinor, {
+                                    currency: acc.currency,
+                                    privacyMode,
+                                  })}{' '}
+                                  /{' '}
+                                  {formatDisplayValue(analytics.pocketMoneyTargetMinor, {
+                                    currency: acc.currency,
+                                    privacyMode,
+                                  })}
+                                </span>
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        <div className="flex items-center justify-between pt-1 border-t border-slate-100">
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setTimelineAccountId(isSelected ? 'all' : acc.id);
+                            }}
+                            className={`text-[10px] font-medium px-2 py-0.5 rounded transition ${
+                              isSelected
+                                ? 'bg-teal-800 text-white'
+                                : 'bg-white border border-slate-200 text-teal-800 hover:bg-teal-50'
+                            }`}
+                          >
+                            {isSelected ? '✓ Viewing This Account Timeline' : 'Filter Timeline to Account'}
+                          </button>
+                          {acc.isPrimaryRunway && (
+                            <span className="text-[9.5px] font-mono-num text-slate-400">Runway Active</span>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </section>
+
+            {/* Automated Financial Advisory & Smart Money Movement Recommendations */}
+            {budget.advisories && budget.advisories.length > 0 && (
+              <section className="bg-white border border-slate-200 rounded-lg px-4 py-3 space-y-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setAdvisoryOpen((prev) => !prev)}
+                    className="flex items-center gap-2 text-left group"
+                  >
+                    {advisoryOpen ? (
+                      <ChevronDown className="w-4 h-4 text-teal-700 shrink-0" />
+                    ) : (
+                      <ChevronRight className="w-4 h-4 text-slate-400 group-hover:text-teal-700 shrink-0" />
+                    )}
+                    <span className="text-[11px] font-mono-num uppercase tracking-wider text-slate-700 font-semibold flex items-center gap-1.5">
+                      <Sparkles className="w-3.5 h-3.5 text-amber-600" /> Automated Financial Advisory & Money Flow Alerts (
+                      {budget.advisories.length})
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setAdvisoryOpen((prev) => !prev)}
+                    className="text-[11px] text-slate-500 hover:text-slate-800"
+                  >
+                    {advisoryOpen ? 'Hide Advisory' : 'Show Advisory'}
+                  </button>
+                </div>
+
+                {advisoryOpen && (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5 pt-1">
+                    {budget.advisories.map((adv) => {
+                      const isWarn = adv.severity === 'warning';
+                      const isSuccess = adv.severity === 'success';
+                      return (
+                        <div
+                          key={adv.id}
+                          className={`rounded-lg border p-3 flex flex-col justify-between gap-2 ${
+                            isWarn
+                              ? 'bg-amber-50/70 border-amber-200 text-amber-950'
+                              : isSuccess
+                              ? 'bg-emerald-50/60 border-emerald-200 text-emerald-950'
+                              : 'bg-teal-50/50 border-teal-200 text-teal-950'
+                          }`}
+                        >
+                          <div className="space-y-1">
+                            <div className="flex items-start justify-between gap-2">
+                              <div className="flex items-center gap-1.5 text-xs font-semibold">
+                                {isWarn ? (
+                                  <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                                ) : isSuccess ? (
+                                  <PiggyBank className="w-4 h-4 text-emerald-600 shrink-0" />
+                                ) : (
+                                  <Landmark className="w-4 h-4 text-teal-700 shrink-0" />
+                                )}
+                                <span>{adv.title}</span>
+                              </div>
+                              {adv.recommendedAmountDisplayMinor && adv.recommendedAmountDisplayMinor > 0 ? (
+                                <span
+                                  className={`font-mono-num text-xs font-bold px-2 py-0.5 rounded shrink-0 ${
+                                    isWarn
+                                      ? 'bg-amber-200/70 text-amber-950'
+                                      : isSuccess
+                                      ? 'bg-emerald-200/70 text-emerald-950'
+                                      : 'bg-teal-200/70 text-teal-950'
+                                  }`}
+                                >
+                                  {fmt(adv.recommendedAmountDisplayMinor)}
+                                </span>
+                              ) : null}
+                            </div>
+                            <p className="text-[11px] leading-relaxed opacity-90">{adv.message}</p>
+                          </div>
+
+                          <div className="flex flex-wrap items-center justify-between gap-2 pt-1.5 border-t border-black/5 text-[10px]">
+                            <div className="flex items-center gap-1.5 font-mono-num">
+                              {adv.accountName && (
+                                <button
+                                  type="button"
+                                  onClick={() => adv.accountId && setTimelineAccountId(adv.accountId)}
+                                  className="px-2 py-0.5 rounded bg-white/80 border border-black/10 hover:bg-slate-900 hover:text-white transition"
+                                >
+                                  🏦 Filter Timeline: {adv.accountName.split('—')[0].trim()}
+                                </button>
+                              )}
+                              {adv.accountId && (
+                                <button
+                                  type="button"
+                                  onClick={() => adv.accountId && openEntityDrawer('account', adv.accountId)}
+                                  className="px-2 py-0.5 rounded bg-white/80 border border-black/10 hover:bg-slate-900 hover:text-white transition"
+                                >
+                                  <Pencil className="w-2.5 h-2.5 inline mr-0.5" /> Configure Account / Pocket Money
+                                </button>
+                              )}
+                            </div>
+                            <span className="font-mono-num uppercase text-[9.5px] opacity-60">
+                              {adv.kind.replace(/_/g, ' ')}
+                            </span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </section>
+            )}
 
             {/* Pre-Payday Sufficiency Banner + Plotted Runway Curve + Folded-by-Default Expenses & Completed Payments Table */}
             <section className="bg-white border border-slate-200 rounded-lg p-5 space-y-4">
+              {timelineAccountId !== 'all' && (
+                <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 rounded-md bg-teal-50 border border-teal-200 text-xs text-teal-950">
+                  <div className="flex items-center gap-2">
+                    <Landmark className="w-4 h-4 text-teal-700 shrink-0" />
+                    <span>
+                      Showing isolated timeline & cashflow for{' '}
+                      <strong>
+                        {allAvailableAccounts.find((a) => a.id === timelineAccountId)?.name || timelineAccountId}
+                      </strong>
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setTimelineAccountId('all')}
+                    className="px-2 py-0.5 rounded bg-white border border-teal-300 text-[11px] font-medium text-teal-900 hover:bg-teal-800 hover:text-white transition"
+                  >
+                    Reset to All Accounts
+                  </button>
+                </div>
+              )}
+
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
                   <div className="flex items-center gap-2">
@@ -1425,7 +1883,7 @@ export const App: React.FC = () => {
                     {fmt(budget.runway.totalPreserveSliceMinor)} · {t.remainingEnvelopes}:{' '}
                     {fmt(budget.runway.unallocatedEnvelopeRemainingMinor)}
                   </p>
-                  {budget.cashflowBridge.nextMonthPreSalaryMinor > 0 && (
+                  {budget.cashflowBridge.nextMonthPreSalaryMinor > 0 && timelineAccountId === 'all' && (
                     <p className="text-xs text-rose-700 mt-1 font-mono-num">
                       {t.nextMonthReserveLabel}{' '}
                       <span className="font-semibold">{fmt(budget.cashflowBridge.nextMonthPreSalaryMinor)}</span>
@@ -1439,7 +1897,7 @@ export const App: React.FC = () => {
                   </div>
                   <div
                     className={`text-xl font-semibold ${
-                      budget.runway.isSufficient ? 'text-emerald-700' : 'bg-amber-700'
+                      budget.runway.isSufficient ? 'text-emerald-700' : 'bg-amber-700 text-white px-2 py-0.5 rounded'
                     }`}
                   >
                     {budget.runway.isSufficient
@@ -1756,6 +2214,8 @@ export const App: React.FC = () => {
               <div className="divide-y divide-slate-100">
                 {budget.obligations.map((ob) => {
                   const isDueNow = ob.metrics.isDueThisMonth;
+                  const isMultiMonth = ob.metrics.intervalMonths > 1 || ob.cadence === 'annual';
+                  const isExpanded = preserveExpandedIds.has(ob.id);
                   const progressPct =
                     ob.amountMinor > 0 ? Math.min(100, Math.round((ob.preservedMinor / ob.amountMinor) * 100)) : 0;
                   const paidTimestamp =
@@ -1766,121 +2226,185 @@ export const App: React.FC = () => {
                   return (
                     <div
                       key={ob.id}
-                      className={`px-5 py-3 flex flex-wrap items-center justify-between gap-3 hover:bg-slate-50/70 ${
+                      className={`px-5 py-3 space-y-2 hover:bg-slate-50/70 ${
                         ob.isPaidThisMonth ? 'bg-emerald-50/20' : ''
                       }`}
                     >
-                      <div className="flex items-center gap-3">
-                        <button
-                          type="button"
-                          disabled={busy}
-                          onClick={() => void handleTogglePaid(ob)}
-                          className="text-slate-400 hover:text-teal-700 transition"
-                          title={
-                            isDueNow
-                              ? ob.isPaidThisMonth
-                                ? t.markUnpaid
-                                : t.markPaid
-                              : ob.isPaidThisMonth
-                              ? t.markPreserveUndone
-                              : t.markPreserveDone
-                          }
-                        >
-                          {ob.isPaidThisMonth ? (
-                            <CheckCircle2 className="w-5 h-5 text-emerald-600" />
-                          ) : (
-                            <Circle className="w-5 h-5" />
-                          )}
-                        </button>
-                        <div>
-                          <div className="flex flex-wrap items-center gap-2">
-                            <button
-                              type="button"
-                              onClick={() => openEntityDrawer('obligation', ob.id)}
-                              className={`text-sm font-medium text-left hover:text-teal-800 hover:underline ${
-                                ob.isPaidThisMonth ? 'line-through text-slate-500' : 'text-slate-900'
-                              }`}
-                            >
-                              {ob.name}
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => openEntityDrawer('obligation', ob.id)}
-                              title={t.editBtn}
-                              className="p-1 rounded text-slate-400 hover:text-slate-800 hover:bg-slate-100"
-                            >
-                              <Pencil className="w-3 h-3" />
-                            </button>
-                            {!isDueNow && (
-                              <span
-                                className={`text-[10px] font-mono-num px-1.5 py-0.5 rounded ${
-                                  ob.isPaidThisMonth
-                                    ? 'bg-emerald-100 text-emerald-800 font-semibold'
-                                    : 'bg-teal-50 text-teal-800 border border-teal-200'
-                                }`}
-                              >
-                                {ob.isPaidThisMonth ? t.sinkingSetAsideDoneBadge : t.sinkingBadge}
-                              </span>
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <div className="flex items-center gap-3">
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() => void handleTogglePaid(ob)}
+                            className="text-slate-400 hover:text-teal-700 transition"
+                            title={
+                              isDueNow
+                                ? ob.isPaidThisMonth
+                                  ? t.markUnpaid
+                                  : t.markPaid
+                                : ob.isPaidThisMonth
+                                ? t.markPreserveUndone
+                                : t.markPreserveDone
+                            }
+                          >
+                            {ob.isPaidThisMonth ? (
+                              <CheckCircle2 className="w-5 h-5 text-emerald-600" />
+                            ) : (
+                              <Circle className="w-5 h-5" />
                             )}
-                            {ob.currency !== cur && !privacyMode && (
-                              <span className="text-[10px] font-mono-num px-1.5 py-0.5 rounded bg-amber-50 text-amber-800">
-                                {ob.currency}
-                              </span>
-                            )}
-                            {ob.manageUrl && (
-                              <a
-                                href={ob.manageUrl}
-                                target="_blank"
-                                rel="noreferrer"
-                                className="text-teal-700 hover:text-teal-900 inline-flex items-center gap-0.5 text-[11px]"
-                              >
-                                <ExternalLink className="w-3 h-3" />
-                              </a>
-                            )}
-                          </div>
-                          <div className="text-xs text-slate-500 font-mono-num mt-0.5">
-                            {isDueNow
-                              ? `${t.dueLabel} ${yearMonth}-${String(ob.dueDay).padStart(2, '0')} · ${ob.cadence}`
-                              : `${t.dueLabel} ${ob.nextDueDate} (${ob.metrics.monthsUntilDue}${t.monthsLeft}) · ${t.preservedPct} ${progressPct}%${
-                                  !privacyMode
-                                    ? ` (${fmt(ob.preservedDisplayMinor)} / ${fmt(ob.targetDisplayMinor)})`
-                                    : ''
-                                }`}
-                            {ob.accountName && (
-                              <span className="ml-2 text-slate-600">· 🏦 {ob.accountName}</span>
-                            )}
-                            {ob.liabilityName && (
+                          </button>
+                          <div>
+                            <div className="flex flex-wrap items-center gap-2">
+                              {isMultiMonth && (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setPreserveExpandedIds((prev) => {
+                                      const next = new Set(prev);
+                                      if (next.has(ob.id)) next.delete(ob.id);
+                                      else next.add(ob.id);
+                                      return next;
+                                    })
+                                  }
+                                  className="text-slate-400 hover:text-teal-700"
+                                  title="Unfold annual reserve progress & storage account"
+                                >
+                                  {isExpanded ? (
+                                    <ChevronDown className="w-3.5 h-3.5 text-teal-700" />
+                                  ) : (
+                                    <ChevronRight className="w-3.5 h-3.5" />
+                                  )}
+                                </button>
+                              )}
                               <button
                                 type="button"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  if (ob.liabilityId) openEntityDrawer('liability', ob.liabilityId);
-                                }}
-                                className="ml-2 text-amber-800 hover:underline font-medium"
-                                title="Linked Mortgage / Loan (auto-updates balance when ticked)"
+                                onClick={() => openEntityDrawer('obligation', ob.id)}
+                                className={`text-sm font-medium text-left hover:text-teal-800 hover:underline ${
+                                  ob.isPaidThisMonth ? 'line-through text-slate-500' : 'text-slate-900'
+                                }`}
                               >
-                                · 🏠 {ob.liabilityName}
+                                {ob.name}
                               </button>
-                            )}
-                            {paidTimestamp && (
-                              <span className="ml-2 text-emerald-700 font-semibold">· ✓ {paidTimestamp}</span>
+                              <button
+                                type="button"
+                                onClick={() => openEntityDrawer('obligation', ob.id)}
+                                title={t.editBtn}
+                                className="p-1 rounded text-slate-400 hover:text-slate-800 hover:bg-slate-100"
+                              >
+                                <Pencil className="w-3 h-3" />
+                              </button>
+                              {!isDueNow && (
+                                <span
+                                  className={`text-[10px] font-mono-num px-1.5 py-0.5 rounded ${
+                                    ob.isPaidThisMonth
+                                      ? 'bg-emerald-100 text-emerald-800 font-semibold'
+                                      : 'bg-teal-50 text-teal-800 border border-teal-200'
+                                  }`}
+                                >
+                                  {ob.isPaidThisMonth ? t.sinkingSetAsideDoneBadge : t.sinkingBadge}
+                                </span>
+                              )}
+                              {ob.currency !== cur && !privacyMode && (
+                                <span className="text-[10px] font-mono-num px-1.5 py-0.5 rounded bg-amber-50 text-amber-800">
+                                  {ob.currency}
+                                </span>
+                              )}
+                              {ob.manageUrl && (
+                                <a
+                                  href={ob.manageUrl}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="text-teal-700 hover:text-teal-900 inline-flex items-center gap-0.5 text-[11px]"
+                                >
+                                  <ExternalLink className="w-3 h-3" />
+                                </a>
+                              )}
+                            </div>
+                            <div className="text-xs text-slate-500 font-mono-num mt-0.5">
+                              {isDueNow
+                                ? `${t.dueLabel} ${yearMonth}-${String(ob.dueDay).padStart(2, '0')} · ${ob.cadence}`
+                                : `${t.dueLabel} ${ob.nextDueDate} (${ob.metrics.monthsUntilDue}${t.monthsLeft}) · ${t.preservedPct} ${progressPct}%${
+                                    !privacyMode
+                                      ? ` (${fmt(ob.preservedDisplayMinor)} / ${fmt(ob.targetDisplayMinor)})`
+                                      : ''
+                                  }`}
+                              {ob.accountName && (
+                                <span className="ml-2 text-slate-600">· 🏦 Paid from: {ob.accountName}</span>
+                              )}
+                              {isMultiMonth && (ob.preserveAccountName || ob.accountName) && (
+                                <span className="ml-2 text-teal-800 font-medium">
+                                  · 🔒 Reserve on: {ob.preserveAccountName || ob.accountName}
+                                </span>
+                              )}
+                              {ob.liabilityName && (
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    if (ob.liabilityId) openEntityDrawer('liability', ob.liabilityId);
+                                  }}
+                                  className="ml-2 text-amber-800 hover:underline font-medium"
+                                  title="Linked Mortgage / Loan (auto-updates balance when ticked)"
+                                >
+                                  · 🏠 {ob.liabilityName}
+                                </button>
+                              )}
+                              {paidTimestamp && (
+                                <span className="ml-2 text-emerald-700 font-semibold">· ✓ {paidTimestamp}</span>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-3 font-mono-num">
+                          <div className="text-right">
+                            <div className="text-sm font-semibold text-slate-900">
+                              {isDueNow ? fmt(ob.dueDisplayMinor) : `${fmt(ob.preserveDisplayMinor)}/mo`}
+                            </div>
+                            {!isDueNow && !privacyMode && (
+                              <div className="text-[10px] text-slate-400">
+                                {t.targetLabel} {fmt(ob.targetDisplayMinor)}
+                              </div>
                             )}
                           </div>
                         </div>
                       </div>
 
-                      <div className="flex items-center gap-3 font-mono-num">
-                        <div className="text-right">
-                          <div className="text-sm font-semibold text-slate-900">
-                            {isDueNow ? fmt(ob.dueDisplayMinor) : `${fmt(ob.preserveDisplayMinor)}/mo`}
+                      {isMultiMonth && isExpanded && (
+                        <div className="ml-8 p-3 rounded-md bg-[#FAF9F6] border border-slate-200 space-y-2 text-xs font-mono-num">
+                          <div className="w-full h-2 bg-slate-200 rounded-full overflow-hidden">
+                            <div
+                              className="h-full bg-teal-600 rounded-full transition-all"
+                              style={{ width: `${progressPct}%` }}
+                            />
                           </div>
-                          {!isDueNow && !privacyMode && (
-                            <div className="text-[10px] text-slate-400">
-                              {t.targetLabel} {fmt(ob.targetDisplayMinor)}
+                          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-[11px]">
+                            <div>
+                              <span className="text-slate-400 block">Progress Saved:</span>
+                              <span className="font-semibold text-emerald-800">
+                                {fmt(ob.preservedDisplayMinor)} of {fmt(ob.targetDisplayMinor)} ({progressPct}%)
+                              </span>
                             </div>
-                          )}
+                            <div>
+                              <span className="text-slate-400 block">Sitting on Account:</span>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const targetAccId = ob.preserveAccountId || ob.accountId;
+                                  if (targetAccId) openEntityDrawer('account', targetAccId);
+                                }}
+                                className="font-semibold text-teal-800 hover:underline text-left"
+                              >
+                                🏦 {ob.preserveAccountName || ob.accountName || 'Lloyds Standard Saver'}
+                              </button>
+                            </div>
+                            <div>
+                              <span className="text-slate-400 block">Pot / Category:</span>
+                              <span className="font-semibold text-slate-700">{ob.potName}</span>
+                            </div>
+                          </div>
                         </div>
-                      </div>
+                      )}
                     </div>
                   );
                 })}
@@ -3303,7 +3827,7 @@ export const App: React.FC = () => {
             {/* INLINE UNIVERSAL EDIT FORM FOR ALL ENTITY TYPES */}
             {(() => {
               if (drawer.entityType === 'obligation') {
-                const ob = budget.obligations.find((o) => o.id === drawer.entityId);
+                const ob = (budget.allObligations || budget.obligations).find((o) => o.id === drawer.entityId);
                 if (!ob) return null;
                 const occDateTimeDefault =
                   ob.isPaidThisMonth && ob.occurrence?.paidAt && ob.occurrence.paidAt.length >= 16
@@ -3331,6 +3855,7 @@ export const App: React.FC = () => {
                           workspaceId: fd.get('workspaceId') || ob.workspaceId,
                           potId: fd.get('potId') || null,
                           accountId: fd.get('accountId') || null,
+                          preserveAccountId: fd.get('preserveAccountId') || null,
                           liabilityId: fd.get('liabilityId') || null,
                           name: nextName,
                           amountMinor: Math.round(Number(fd.get('amountMajor') || 0) * 100),
@@ -3424,6 +3949,21 @@ export const App: React.FC = () => {
                           className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
                         >
                           <option value="">{t.noAccountLinkOption}</option>
+                          {allAvailableAccounts.map((acc) => (
+                            <option key={acc.id} value={acc.id}>
+                              🏦 {acc.name} ({acc.institution} · {formatDisplayValue(acc.balanceMinor, { currency: acc.currency, privacyMode })})
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="block space-y-1">
+                        <span className="text-teal-900 font-medium">🔒 Sinking Reserve ("Preserve") Held on Account</span>
+                        <select
+                          name="preserveAccountId"
+                          defaultValue={ob.preserveAccountId || ''}
+                          className="w-full border border-teal-300 bg-white rounded px-2 py-1.5"
+                        >
+                          <option value="">— Default (Saver / Same as Payment Account) —</option>
                           {allAvailableAccounts.map((acc) => (
                             <option key={acc.id} value={acc.id}>
                               🏦 {acc.name} ({acc.institution} · {formatDisplayValue(acc.balanceMinor, { currency: acc.currency, privacyMode })})
@@ -3575,7 +4115,7 @@ export const App: React.FC = () => {
               }
 
               if (drawer.entityType === 'expense') {
-                const exp = budget.expenses.find((e) => e.id === drawer.entityId);
+                const exp = (budget.allExpenses || budget.expenses).find((e) => e.id === drawer.entityId);
                 if (!exp) return null;
                 const defaultTime =
                   exp.createdAt && exp.createdAt.length >= 16 && /^\d{2}:\d{2}/.test(exp.createdAt.slice(11, 16))
@@ -4107,127 +4647,199 @@ export const App: React.FC = () => {
               if (drawer.entityType === 'account') {
                 const acc = allAvailableAccounts.find((a) => a.id === drawer.entityId);
                 if (!acc) return null;
+                const analytics = (budget.accountAnalytics || []).find((a) => a.accountId === acc.id);
 
                 return (
-                  <form
-                    key={`edit-acc-${acc.id}`}
-                    className="p-3.5 rounded-lg border border-slate-200 bg-[#FAF9F6]/60 space-y-2.5 text-xs"
-                    onSubmit={async (e) => {
-                      e.preventDefault();
-                      const fd = new FormData(e.currentTarget);
-                      const nextName = String(fd.get('name') || acc.name).trim();
-                      const nextInst = String(fd.get('institution') || '').trim();
-                      const nextPortal = String(fd.get('portalUrl') || '').trim() || null;
-                      const nextNotes = String(fd.get('notes') || '').trim() || null;
+                  <div className="space-y-3">
+                    {analytics &&
+                      (analytics.lockedPreserveDisplayMinor > 0 ||
+                        analytics.unpaidPrePaydayDisplayMinor > 0 ||
+                        analytics.pocketMoneyTargetMinor > 0) && (
+                        <div className="p-3 rounded-lg border border-amber-200 bg-amber-50/60 space-y-2 text-xs font-mono-num">
+                          <div className="text-[11px] uppercase tracking-wider font-semibold text-amber-950 flex items-center gap-1.5">
+                            <PiggyBank className="w-3.5 h-3.5 text-amber-700" /> Account Balance & Earmarked Reserves Breakdown
+                          </div>
+                          <div className="space-y-1">
+                            <div className="flex justify-between text-slate-700">
+                              <span>Total Sitting on Account:</span>
+                              <span className="font-semibold">
+                                {formatDisplayValue(acc.balanceMinor, { currency: acc.currency, privacyMode })}
+                              </span>
+                            </div>
+                            {analytics.lockedPreserveDisplayMinor > 0 && (
+                              <>
+                                <div className="flex justify-between text-amber-900">
+                                  <span>🔒 Earmarked for Upcoming Annual Payments:</span>
+                                  <span className="font-semibold">-{fmt(analytics.lockedPreserveDisplayMinor)}</span>
+                                </div>
+                                <div className="pl-2.5 border-l-2 border-amber-300 space-y-1 text-[10.5px] text-slate-600 my-1">
+                                  {analytics.lockedItems.map((li) => (
+                                    <div key={li.id} className="flex justify-between gap-2">
+                                      <span className="truncate">
+                                        {li.name} (due {li.nextDueDate})
+                                      </span>
+                                      <span className="shrink-0 font-semibold text-amber-900">
+                                        {fmt(li.preservedDisplayMinor)} / {fmt(li.targetDisplayMinor)}
+                                      </span>
+                                    </div>
+                                  ))}
+                                </div>
+                              </>
+                            )}
+                            <div className="flex justify-between text-emerald-900 pt-1 border-t border-amber-200/70">
+                              <span className="font-semibold">✓ Real Free / Available Money:</span>
+                              <span className="font-bold text-sm">{fmt(analytics.trueAvailableDisplayMinor)}</span>
+                            </div>
+                            {analytics.unpaidPrePaydayDisplayMinor > 0 && (
+                              <div className="flex justify-between text-slate-600 pt-1">
+                                <span>Scheduled Bills Before Payday:</span>
+                                <span
+                                  className={
+                                    !analytics.isPrePaydaySufficient ? 'text-rose-700 font-bold' : 'text-slate-800'
+                                  }
+                                >
+                                  {fmt(analytics.unpaidPrePaydayDisplayMinor)}
+                                </span>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      )}
 
-                      await apiFetch('/api/accounts', {
-                        method: 'POST',
-                        body: JSON.stringify({
-                          id: acc.id,
-                          workspaceId: fd.get('workspaceId') || acc.workspaceId,
-                          name: nextName,
-                          institution: nextInst,
-                          balanceMinor: Math.round(Number(fd.get('balanceMajor') || 0) * 100),
-                          currency: fd.get('currency') || acc.currency,
-                          isPrimaryRunway: fd.get('isPrimaryRunway') === 'on',
-                          portalUrl: nextPortal,
-                          notes: nextNotes,
-                        }),
-                      });
-                      setDrawer((prev) =>
-                        prev
-                          ? { ...prev, title: nextName, subtitle: nextInst, portalUrl: nextPortal, notes: nextNotes }
-                          : null
-                      );
-                      setDrawerSavedMsg(t.savedNotice);
-                      setTimeout(() => setDrawerSavedMsg(null), 3000);
-                      await reloadAll();
-                    }}
-                  >
-                    <div className="text-[11px] font-mono-num uppercase text-slate-600 font-semibold flex items-center gap-1.5">
-                      <Pencil className="w-3 h-3 text-teal-700" /> {t.editDetailsTitle}
-                    </div>
-                    <div className="grid grid-cols-2 gap-2">
-                      <label className="space-y-1">
-                        <span className="text-slate-600">{t.renameLabel}</span>
-                        <input
-                          required
-                          name="name"
-                          defaultValue={acc.name}
-                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
-                        />
-                      </label>
-                      <label className="space-y-1">
-                        <span className="text-slate-600">Institution</span>
-                        <input
-                          name="institution"
-                          defaultValue={acc.institution}
-                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
-                        />
-                      </label>
-                    </div>
-                    <div className="grid grid-cols-3 gap-2">
-                      <label className="space-y-1">
-                        <span className="text-slate-600">Workspace</span>
-                        <select
-                          name="workspaceId"
-                          defaultValue={acc.workspaceId}
-                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
-                        >
-                          {writableWorkspaces.map((w) => (
-                            <option key={w.id} value={w.id}>
-                              {w.name}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-                      <label className="space-y-1">
-                        <span className="text-slate-600">Balance</span>
-                        <input
-                          required
-                          type="number"
-                          step="0.01"
-                          name="balanceMajor"
-                          defaultValue={(acc.balanceMinor / 100).toFixed(2)}
-                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
-                        />
-                      </label>
-                      <label className="space-y-1">
-                        <span className="text-slate-600">Currency</span>
-                        <select
-                          name="currency"
-                          defaultValue={acc.currency}
-                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
-                        >
-                          {(['GBP', 'EUR', 'PLN', 'USD', 'CHF'] as CurrencyCode[]).map((c) => (
-                            <option key={c} value={c}>
-                              {c}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-                    </div>
-                    <label className="flex items-center gap-2">
-                      <input type="checkbox" name="isPrimaryRunway" defaultChecked={acc.isPrimaryRunway} />
-                      <span className="text-slate-600">Include in monthly sufficiency runway check</span>
-                    </label>
-                    <label className="block space-y-1">
-                      <span className="text-slate-600">{t.portalUrlLabel}</span>
-                      <input
-                        type="url"
-                        name="portalUrl"
-                        defaultValue={acc.portalUrl || ''}
-                        placeholder="https://..."
-                        className="w-full border border-slate-200 bg-white rounded px-2.5 py-1.5"
-                      />
-                    </label>
-                    <button
-                      type="submit"
-                      className="w-full py-2 rounded bg-slate-900 text-white font-medium hover:bg-slate-800 transition"
+                    <form
+                      key={`edit-acc-${acc.id}`}
+                      className="p-3.5 rounded-lg border border-slate-200 bg-[#FAF9F6]/60 space-y-2.5 text-xs"
+                      onSubmit={async (e) => {
+                        e.preventDefault();
+                        const fd = new FormData(e.currentTarget);
+                        const nextName = String(fd.get('name') || acc.name).trim();
+                        const nextInst = String(fd.get('institution') || '').trim();
+                        const nextPortal = String(fd.get('portalUrl') || '').trim() || null;
+                        const nextNotes = String(fd.get('notes') || '').trim() || null;
+
+                        await apiFetch('/api/accounts', {
+                          method: 'POST',
+                          body: JSON.stringify({
+                            id: acc.id,
+                            workspaceId: fd.get('workspaceId') || acc.workspaceId,
+                            name: nextName,
+                            institution: nextInst,
+                            balanceMinor: Math.round(Number(fd.get('balanceMajor') || 0) * 100),
+                            currency: fd.get('currency') || acc.currency,
+                            isPrimaryRunway: fd.get('isPrimaryRunway') === 'on',
+                            pocketMoneyTargetMinor: Math.round(Number(fd.get('pocketMoneyTargetMajor') || 0) * 100),
+                            portalUrl: nextPortal,
+                            notes: nextNotes,
+                          }),
+                        });
+                        setDrawer((prev) =>
+                          prev
+                            ? { ...prev, title: nextName, subtitle: nextInst, portalUrl: nextPortal, notes: nextNotes }
+                            : null
+                        );
+                        setDrawerSavedMsg(t.savedNotice);
+                        setTimeout(() => setDrawerSavedMsg(null), 3000);
+                        await reloadAll();
+                      }}
                     >
-                      {t.saveChangesBtn}
-                    </button>
-                  </form>
+                      <div className="text-[11px] font-mono-num uppercase text-slate-600 font-semibold flex items-center gap-1.5">
+                        <Pencil className="w-3 h-3 text-teal-700" /> {t.editDetailsTitle}
+                      </div>
+                      <div className="grid grid-cols-2 gap-2">
+                        <label className="space-y-1">
+                          <span className="text-slate-600">{t.renameLabel}</span>
+                          <input
+                            required
+                            name="name"
+                            defaultValue={acc.name}
+                            className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
+                          />
+                        </label>
+                        <label className="space-y-1">
+                          <span className="text-slate-600">Institution</span>
+                          <input
+                            name="institution"
+                            defaultValue={acc.institution}
+                            className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
+                          />
+                        </label>
+                      </div>
+                      <div className="grid grid-cols-3 gap-2">
+                        <label className="space-y-1">
+                          <span className="text-slate-600">Workspace</span>
+                          <select
+                            name="workspaceId"
+                            defaultValue={acc.workspaceId}
+                            className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
+                          >
+                            {writableWorkspaces.map((w) => (
+                              <option key={w.id} value={w.id}>
+                                {w.name}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label className="space-y-1">
+                          <span className="text-slate-600">Balance</span>
+                          <input
+                            required
+                            type="number"
+                            step="0.01"
+                            name="balanceMajor"
+                            defaultValue={(acc.balanceMinor / 100).toFixed(2)}
+                            className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
+                          />
+                        </label>
+                        <label className="space-y-1">
+                          <span className="text-slate-600">Currency</span>
+                          <select
+                            name="currency"
+                            defaultValue={acc.currency}
+                            className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
+                          >
+                            {(['GBP', 'EUR', 'PLN', 'USD', 'CHF'] as CurrencyCode[]).map((c) => (
+                              <option key={c} value={c}>
+                                {c}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      </div>
+                      <label className="block space-y-1">
+                        <span className="text-teal-900 font-medium">
+                          🎯 Monthly Pocket Money / Small Spending Allowance (0 = disabled)
+                        </span>
+                        <input
+                          type="number"
+                          step="1"
+                          name="pocketMoneyTargetMajor"
+                          defaultValue={((acc.pocketMoneyTargetMinor || 0) / 100).toFixed(2)}
+                          placeholder="e.g. 150.00"
+                          className="w-full border border-teal-300 bg-white rounded px-2.5 py-1.5 font-mono-num"
+                        />
+                      </label>
+                      <label className="flex items-center gap-2">
+                        <input type="checkbox" name="isPrimaryRunway" defaultChecked={acc.isPrimaryRunway} />
+                        <span className="text-slate-600">Include in monthly sufficiency runway check</span>
+                      </label>
+                      <label className="block space-y-1">
+                        <span className="text-slate-600">{t.portalUrlLabel}</span>
+                        <input
+                          type="url"
+                          name="portalUrl"
+                          defaultValue={acc.portalUrl || ''}
+                          placeholder="https://..."
+                          className="w-full border border-slate-200 bg-white rounded px-2.5 py-1.5"
+                        />
+                      </label>
+                      <button
+                        type="submit"
+                        className="w-full py-2 rounded bg-slate-900 text-white font-medium hover:bg-slate-800 transition"
+                      >
+                        {t.saveChangesBtn}
+                      </button>
+                    </form>
+                  </div>
                 );
               }
 
@@ -4794,6 +5406,7 @@ export const App: React.FC = () => {
                       workspaceId: fd.get('workspaceId'),
                       potId: fd.get('potId') || null,
                       accountId: fd.get('accountId') || null,
+                      preserveAccountId: fd.get('preserveAccountId') || null,
                       liabilityId: fd.get('liabilityId') || null,
                       name: fd.get('name'),
                       amountMinor: Math.round(Number(fd.get('amountMajor') || 0) * 100),
@@ -4852,6 +5465,21 @@ export const App: React.FC = () => {
                       className="w-full border border-teal-300 bg-white rounded px-2 py-1.5 font-medium"
                     >
                       <option value="">{t.noAccountLinkOption}</option>
+                      {allAvailableAccounts.map((acc) => (
+                        <option key={acc.id} value={acc.id}>
+                          🏦 {acc.name} ({acc.institution} · {formatDisplayValue(acc.balanceMinor, { currency: acc.currency, privacyMode })})
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="block space-y-1">
+                    <span className="font-medium text-teal-900">🔒 Sinking Reserve ("Preserve") Held on Account</span>
+                    <select
+                      name="preserveAccountId"
+                      defaultValue=""
+                      className="w-full border border-teal-200 bg-white rounded px-2 py-1.5"
+                    >
+                      <option value="">— Default (Saver / Same as Payment Account) —</option>
                       {allAvailableAccounts.map((acc) => (
                         <option key={acc.id} value={acc.id}>
                           🏦 {acc.name} ({acc.institution} · {formatDisplayValue(acc.balanceMinor, { currency: acc.currency, privacyMode })})
@@ -5570,6 +6198,7 @@ export const App: React.FC = () => {
                       balanceMinor: Math.round(Number(fd.get('balanceMajor') || 0) * 100),
                       currency: fd.get('currency'),
                       isPrimaryRunway: fd.get('isPrimaryRunway') === 'on',
+                      pocketMoneyTargetMinor: Math.round(Number(fd.get('pocketMoneyTargetMajor') || 0) * 100),
                     }),
                   });
                   setModal(null);
@@ -5635,6 +6264,16 @@ export const App: React.FC = () => {
                     </select>
                   </label>
                 </div>
+                <label className="block space-y-1">
+                  <span>🎯 Monthly Pocket Money Allowance (optional, 0 = none)</span>
+                  <input
+                    type="number"
+                    step="1"
+                    name="pocketMoneyTargetMajor"
+                    defaultValue="0"
+                    className="w-full border border-slate-200 rounded px-2.5 py-1.5 font-mono-num"
+                  />
+                </label>
                 <label className="flex items-center gap-2">
                   <input type="checkbox" name="isPrimaryRunway" defaultChecked />
                   <span>Include in monthly sufficiency runway check</span>
