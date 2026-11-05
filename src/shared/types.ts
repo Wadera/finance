@@ -74,6 +74,7 @@ export interface BankAccountRecord {
   institution: string;
   currency: CurrencyCode;
   balanceMinor: number;
+  pocketMoneyTargetMinor?: number;
   isPrimaryRunway: boolean;
   portalUrl: string | null;
   notes: string | null;
@@ -117,6 +118,7 @@ export interface ObligationRecord {
   workspaceId: string;
   potId: string | null;
   accountId?: string | null;
+  preserveAccountId?: string | null;
   liabilityId?: string | null;
   name: string;
   amountMinor: number;

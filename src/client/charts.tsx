@@ -4,10 +4,12 @@ import React, { useMemo, useState } from 'react';
 import { formatDisplayValue, formatIndexedWealth } from '../shared/currency.js';
 import { buildPotBreadcrumbs } from '../shared/financeEngine.js';
 import type {
+  BankAccountRecord,
   CurrencyCode,
   HorizonProjectionPoint,
   PotRecord,
   PotRollupNode,
+  WorkspaceRecord,
 } from '../shared/types.js';
 import type {
   CashflowBridgeData,
@@ -28,6 +30,8 @@ interface SankeyNodeDatum {
   nodeKind:
     | 'income'
     | 'pool'
+    | 'account'
+    | 'workspace'
     | 'pot'
     | 'obligation'
     | 'expense'
@@ -38,6 +42,8 @@ interface SankeyNodeDatum {
     | 'other';
   canUnfold: boolean;
   isExpanded: boolean;
+  accountId?: string;
+  workspaceId?: string;
   potRef?: PotRollupNode;
   obRef?: EnrichedObligation;
   expRef?: EnrichedExpense;
@@ -60,6 +66,9 @@ interface SankeyLinkDatum {
  */
 export const CashflowSankeyChart: React.FC<{
   incomes: EnrichedIncome[];
+  accounts?: BankAccountRecord[];
+  workspaces?: WorkspaceRecord[];
+  showRoutingLayers?: boolean;
   cashflowBridge?: CashflowBridgeData;
   potTree: PotRollupNode[];
   obligations: EnrichedObligation[];
@@ -74,10 +83,13 @@ export const CashflowSankeyChart: React.FC<{
   onTogglePot: (potId: string) => void;
   onToggleExpense: (expId: string) => void;
   onQuickAdd: (target: QuickAddTarget) => void;
-  onInspectItem?: (kind: 'pot' | 'obligation' | 'expense', id: string) => void;
+  onInspectItem?: (kind: 'pot' | 'obligation' | 'expense' | 'account', id: string) => void;
   t: TranslationDict;
 }> = ({
   incomes,
+  accounts = [],
+  workspaces = [],
+  showRoutingLayers = true,
   cashflowBridge,
   potTree,
   obligations,
@@ -348,43 +360,238 @@ export const CashflowSankeyChart: React.FC<{
       }
     };
 
-    for (const rootPot of potTree) {
-      if (rootPot.effectiveTotalDisplayMinor <= 0 && !expandedPotIds.has(rootPot.pot.id) && potTree.some((p) => p.effectiveTotalDisplayMinor > 0)) {
-        // Still render £0 top-level pots if user created one so they can click '+' right away!
-      }
-      emitPotSubtree(rootPot, poolId);
-    }
-
-    // Unassigned obligations & expenses (potId === null)
     const unassignedObs = (obsByPot.get(null) ?? []).filter((o) => o.effectiveDisplayMinor > 0);
     const unassignedExps = (expsByPot.get(null) ?? []).filter((e) => e.displayAmountMinor > 0);
-    for (const ob of unassignedObs) {
-      const obNodeId = `ob-${ob.id}`;
-      nodes.push({
-        id: obNodeId,
-        name: ob.name,
-        color: '#64748B',
-        displayMinor: ob.effectiveDisplayMinor,
-        nodeKind: 'obligation',
-        canUnfold: false,
-        isExpanded: false,
-        obRef: ob,
-      });
-      links.push({ source: poolId, target: obNodeId, value: Math.max(1, ob.effectiveDisplayMinor) });
-    }
-    for (const exp of unassignedExps) {
-      const expNodeId = `exp-${exp.id}`;
-      nodes.push({
-        id: expNodeId,
-        name: exp.merchant,
-        color: '#64748B',
-        displayMinor: exp.displayAmountMinor,
-        nodeKind: 'expense',
-        canUnfold: exp.items.length > 0,
-        isExpanded: false,
-        expRef: exp,
-      });
-      links.push({ source: poolId, target: expNodeId, value: Math.max(1, exp.displayAmountMinor) });
+
+    if (showRoutingLayers && accounts.length > 0) {
+      // --- MULTI-LAYER ARCHITECTURE:
+      // Inflows -> Monthly Pool -> Bank Accounts -> Workspace Scopes (Shared Household / Private / Polish Flat) -> Top-Level Pots -> Sub-Pots & Items
+      const accMap = new Map(accounts.map((a) => [a.id, a]));
+      const wsMap = new Map(workspaces.map((w) => [w.id, w]));
+
+      const defaultAccForWs = (wsId: string): string => {
+        const match =
+          accounts.find((a) => a.workspaceId === wsId && a.isPrimaryRunway) ||
+          accounts.find((a) => a.workspaceId === wsId) ||
+          accounts[0];
+        return match ? match.id : 'acc-unassigned';
+      };
+
+      // Collect all pot IDs inside a rootPot subtree
+      const collectSubtreeIds = (pn: PotRollupNode): string[] => [
+        pn.pot.id,
+        ...pn.children.flatMap((c) => collectSubtreeIds(c)),
+      ];
+
+      // Compute how each rootPot is funded by Bank Accounts
+      const accTotals = new Map<string, number>();
+      const accToWsTotals = new Map<string, number>(); // `${accId}|${wsId}` -> minor
+      const wsTotals = new Map<string, number>();
+
+      for (const rootPot of potTree) {
+        const wsId = rootPot.pot.workspaceId;
+        const val = rootPot.effectiveTotalDisplayMinor;
+        if (val <= 0) continue;
+        wsTotals.set(wsId, (wsTotals.get(wsId) ?? 0) + val);
+
+        const subtreeIds = collectSubtreeIds(rootPot);
+        const byAcc = new Map<string, number>();
+        let itemizedSum = 0;
+        for (const pid of subtreeIds) {
+          for (const ob of obsByPot.get(pid) ?? []) {
+            if (ob.effectiveDisplayMinor <= 0) continue;
+            const aid = ob.accountId && accMap.has(ob.accountId) ? ob.accountId : defaultAccForWs(wsId);
+            byAcc.set(aid, (byAcc.get(aid) ?? 0) + ob.effectiveDisplayMinor);
+            itemizedSum += ob.effectiveDisplayMinor;
+          }
+          for (const exp of expsByPot.get(pid) ?? []) {
+            if (exp.displayAmountMinor <= 0) continue;
+            const aid = exp.accountId && accMap.has(exp.accountId) ? exp.accountId : defaultAccForWs(wsId);
+            byAcc.set(aid, (byAcc.get(aid) ?? 0) + exp.displayAmountMinor);
+            itemizedSum += exp.displayAmountMinor;
+          }
+        }
+
+        if (itemizedSum < val) {
+          const rem = val - itemizedSum;
+          const aid = defaultAccForWs(wsId);
+          byAcc.set(aid, (byAcc.get(aid) ?? 0) + rem);
+        }
+
+        for (const [aid, amt] of byAcc.entries()) {
+          accTotals.set(aid, (accTotals.get(aid) ?? 0) + amt);
+          const pairKey = `${aid}|${wsId}`;
+          accToWsTotals.set(pairKey, (accToWsTotals.get(pairKey) ?? 0) + amt);
+        }
+      }
+
+      // Include unassigned obligations/expenses in Account -> Workspace routing
+      for (const ob of unassignedObs) {
+        const wsId = ob.workspaceId;
+        const aid = ob.accountId && accMap.has(ob.accountId) ? ob.accountId : defaultAccForWs(wsId);
+        accTotals.set(aid, (accTotals.get(aid) ?? 0) + ob.effectiveDisplayMinor);
+        wsTotals.set(wsId, (wsTotals.get(wsId) ?? 0) + ob.effectiveDisplayMinor);
+        const pairKey = `${aid}|${wsId}`;
+        accToWsTotals.set(pairKey, (accToWsTotals.get(pairKey) ?? 0) + ob.effectiveDisplayMinor);
+      }
+      for (const exp of unassignedExps) {
+        const wsId = exp.workspaceId;
+        const aid = exp.accountId && accMap.has(exp.accountId) ? exp.accountId : defaultAccForWs(wsId);
+        accTotals.set(aid, (accTotals.get(aid) ?? 0) + exp.displayAmountMinor);
+        wsTotals.set(wsId, (wsTotals.get(wsId) ?? 0) + exp.displayAmountMinor);
+        const pairKey = `${aid}|${wsId}`;
+        accToWsTotals.set(pairKey, (accToWsTotals.get(pairKey) ?? 0) + exp.displayAmountMinor);
+      }
+
+      const accPalette: Record<string, string> = {
+        'acc-club-lloyds': '#1D4ED8',
+        'acc-lloyds-classic': '#0F766E',
+        'acc-revolut-joint': '#7C3AED',
+        'acc-revolut-personal': '#2563EB',
+        'acc-alior-pln': '#B45309',
+        'acc-standard-saver': '#059669',
+      };
+
+      // Emit Stage 2: Bank Account Nodes
+      for (const [aid, totalAmt] of Array.from(accTotals.entries()).sort((a, b) => b[1] - a[1])) {
+        if (totalAmt <= 0) continue;
+        const acc = accMap.get(aid);
+        const accNodeId = `acc-node-${aid}`;
+        const shortName = acc
+          ? acc.name.replace(/\s*\([^)]*\)/g, '')
+          : 'Unassigned Account';
+        nodes.push({
+          id: accNodeId,
+          name: `🏦 ${shortName}`,
+          color: accPalette[aid] || '#0284C7',
+          displayMinor: totalAmt,
+          nodeKind: 'account',
+          accountId: aid,
+          canUnfold: false,
+          isExpanded: false,
+        });
+        links.push({
+          source: poolId,
+          target: accNodeId,
+          value: Math.max(1, totalAmt),
+          strokeColorOverride: accPalette[aid] || '#0284C7',
+        });
+      }
+
+      // Emit Stage 3: Workspace Mixing Nodes (Shared Household vs. Wadera Personal vs. Polish Flat)
+      const wsMeta = (wsId: string): { label: string; color: string } => {
+        const w = wsMap.get(wsId);
+        if (wsId === 'ws-home' || w?.kind === 'shared') {
+          return { label: `🏠 ${w?.name || 'Shared Household'}`, color: '#0F766E' };
+        }
+        if (wsId === 'ws-wadera') {
+          return { label: `👤 ${w?.name || 'Wadera Personal'}`, color: '#3B82F6' };
+        }
+        if (wsId.includes('polish') || w?.kind === 'company') {
+          return { label: `🇵🇱 ${w?.name || 'Polish Flat'}`, color: '#D97706' };
+        }
+        return { label: `📁 ${w?.name || wsId}`, color: '#475569' };
+      };
+
+      for (const [wsId, wsAmt] of Array.from(wsTotals.entries()).sort((a, b) => b[1] - a[1])) {
+        if (wsAmt <= 0) continue;
+        const wsNodeId = `ws-node-${wsId}`;
+        const meta = wsMeta(wsId);
+        nodes.push({
+          id: wsNodeId,
+          name: meta.label,
+          color: meta.color,
+          displayMinor: wsAmt,
+          nodeKind: 'workspace',
+          workspaceId: wsId,
+          canUnfold: false,
+          isExpanded: false,
+        });
+      }
+
+      // Connect Stage 2 (Bank Accounts) -> Stage 3 (Workspace Scopes)
+      for (const [pairKey, pairAmt] of accToWsTotals.entries()) {
+        if (pairAmt <= 0) continue;
+        const [aid, wsId] = pairKey.split('|');
+        const meta = wsMeta(wsId);
+        links.push({
+          source: `acc-node-${aid}`,
+          target: `ws-node-${wsId}`,
+          value: Math.max(1, pairAmt),
+          strokeColorOverride: meta.color,
+        });
+      }
+
+      // Connect Stage 3 (Workspace Scopes) -> Stage 4+ (Top-Level Pots & Unassigned Items)
+      for (const rootPot of potTree) {
+        const wsNodeId = `ws-node-${rootPot.pot.workspaceId}`;
+        if (!wsTotals.has(rootPot.pot.workspaceId)) continue;
+        emitPotSubtree(rootPot, wsNodeId);
+      }
+
+      for (const ob of unassignedObs) {
+        const obNodeId = `ob-${ob.id}`;
+        const parentWsNode = wsTotals.has(ob.workspaceId) ? `ws-node-${ob.workspaceId}` : poolId;
+        nodes.push({
+          id: obNodeId,
+          name: ob.name,
+          color: '#64748B',
+          displayMinor: ob.effectiveDisplayMinor,
+          nodeKind: 'obligation',
+          canUnfold: false,
+          isExpanded: false,
+          obRef: ob,
+        });
+        links.push({ source: parentWsNode, target: obNodeId, value: Math.max(1, ob.effectiveDisplayMinor) });
+      }
+      for (const exp of unassignedExps) {
+        const expNodeId = `exp-${exp.id}`;
+        const parentWsNode = wsTotals.has(exp.workspaceId) ? `ws-node-${exp.workspaceId}` : poolId;
+        nodes.push({
+          id: expNodeId,
+          name: exp.merchant,
+          color: '#64748B',
+          displayMinor: exp.displayAmountMinor,
+          nodeKind: 'expense',
+          canUnfold: exp.items.length > 0,
+          isExpanded: false,
+          expRef: exp,
+        });
+        links.push({ source: parentWsNode, target: expNodeId, value: Math.max(1, exp.displayAmountMinor) });
+      }
+    } else {
+      for (const rootPot of potTree) {
+        emitPotSubtree(rootPot, poolId);
+      }
+
+      for (const ob of unassignedObs) {
+        const obNodeId = `ob-${ob.id}`;
+        nodes.push({
+          id: obNodeId,
+          name: ob.name,
+          color: '#64748B',
+          displayMinor: ob.effectiveDisplayMinor,
+          nodeKind: 'obligation',
+          canUnfold: false,
+          isExpanded: false,
+          obRef: ob,
+        });
+        links.push({ source: poolId, target: obNodeId, value: Math.max(1, ob.effectiveDisplayMinor) });
+      }
+      for (const exp of unassignedExps) {
+        const expNodeId = `exp-${exp.id}`;
+        nodes.push({
+          id: expNodeId,
+          name: exp.merchant,
+          color: '#64748B',
+          displayMinor: exp.displayAmountMinor,
+          nodeKind: 'expense',
+          canUnfold: exp.items.length > 0,
+          isExpanded: false,
+          expRef: exp,
+        });
+        links.push({ source: poolId, target: expNodeId, value: Math.max(1, exp.displayAmountMinor) });
+      }
     }
 
     // Next Month Needed Before Salary (Dashed Red outflow from the same unified central pool, click-to-unfoldable!)
@@ -507,6 +714,9 @@ export const CashflowSankeyChart: React.FC<{
     return { graph, width, height, numCols, maxDepth, poolMinor };
   }, [
     incomes,
+    accounts,
+    workspaces,
+    showRoutingLayers,
     cashflowBridge,
     potTree,
     obligations,
@@ -567,6 +777,8 @@ export const CashflowSankeyChart: React.FC<{
   const handleNodeLabelClick = (node: SankeyNodeDatum) => {
     if (node.nodeKind === 'next_needed' && node.canUnfold) {
       onTogglePot('__next_month_needed__');
+    } else if (node.nodeKind === 'account' && node.accountId && onInspectItem) {
+      onInspectItem('account', node.accountId);
     } else if (node.nodeKind === 'pot' && node.potRef) {
       if (node.canUnfold) {
         onTogglePot(node.potRef.pot.id);

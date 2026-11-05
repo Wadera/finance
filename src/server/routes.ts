@@ -188,9 +188,10 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     const user = requireUser(req, reply, store, cfg);
     if (!user) return;
 
-    const q = (req.query || {}) as { ym?: string; scope?: string; horizon?: string };
+    const q = (req.query || {}) as { ym?: string; scope?: string; horizon?: string; accountId?: string };
     const ym = q.ym && /^\d{4}-\d{2}$/.test(q.ym) ? q.ym : new Date().toISOString().slice(0, 7);
     const scope = q.scope || 'all';
+    const selectedAccountId = q.accountId && q.accountId !== 'all' ? String(q.accountId) : null;
     const rawHorizon = Number(q.horizon || 1);
     const horizonMonths = ([1, 3, 6, 12, 60, 120].includes(rawHorizon) ? rawHorizon : 1) as 1 | 3 | 6 | 12 | 60 | 120;
     const cur = user.defaultCurrency;
@@ -260,12 +261,20 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       const targetDisplayMinor = convertMinor(ob.amountMinor, ob.currency, cur, rateMap);
       const preservedDisplayMinor = convertMinor(ob.preservedMinor, ob.currency, cur, rateMap);
       const resolvedAccId = (occ?.accountId ?? ob.accountId) || null;
+      const saverDefaultAcc =
+        allAccounts.find((a) => a.id === 'acc-standard-saver' || /saver|saving|oszcz/i.test(a.name)) ?? null;
+      const resolvedPreserveAccId =
+        ob.preserveAccountId ||
+        (!metrics.isDueThisMonth && ob.cadence !== 'monthly' && saverDefaultAcc ? saverDefaultAcc.id : resolvedAccId) ||
+        null;
       const resolvedLiabId = (occ?.liabilityId ?? ob.liabilityId) || null;
 
       return {
         ...ob,
         accountId: ob.accountId ?? null,
         accountName: resolvedAccId ? (accById.get(resolvedAccId)?.name ?? null) : null,
+        preserveAccountId: resolvedPreserveAccId,
+        preserveAccountName: resolvedPreserveAccId ? (accById.get(resolvedPreserveAccId)?.name ?? null) : null,
         liabilityId: ob.liabilityId ?? null,
         liabilityName: resolvedLiabId ? (liabById.get(resolvedLiabId)?.name ?? null) : null,
         metrics: {
@@ -419,40 +428,288 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     const upcomingSalaryPendingMinor = upcomingSalaryTotalMinor - upcomingSalaryReceivedMinor;
     const projectedFreeFromUpcomingMinor = Math.max(0, upcomingSalaryTotalMinor - nextMonthPreSalaryMinor);
 
-    // Account Runway & Month-End Sufficiency Engine
-    // Honest pre-salary sufficiency: unticked future salary is NOT counted as available cash before payday!
+    // --- Per-Account Diagnostics, Locked Sinking Reserves & Automated Smart Financial Advisory ---
     const [yrNum, moNum] = ym.split('-').map(Number);
     const daysInMonth = new Date(yrNum, moNum, 0).getDate();
     const todayIso = new Date().toISOString().slice(0, 10);
     const currentDay = todayIso.slice(0, 7) === ym ? Number(todayIso.slice(8, 10)) : 1;
+    const isPastMonth = ym < todayIso.slice(0, 7);
 
-    const runwayCashMinor = accounts
-      .filter((a) => a.isPrimaryRunway)
-      .reduce((s, a) => s + convertMinor(a.balanceMinor, a.currency, cur, rateMap), 0);
+    const potById = new Map(pots.map((p) => [p.id, p]));
+    const accountAnalytics = accounts.map((acc) => {
+      const displayBalanceMinor = convertMinor(acc.balanceMinor, acc.currency, cur, rateMap);
 
-    const unpaidBillsMinor = enrichedObligations
+      // 1. Locked Sinking Reserves ('Preserve') sitting on this account for upcoming multi-month / annual renewals
+      const lockedObs = enrichedObligations.filter(
+        (o) =>
+          o.isActive &&
+          o.cadence !== 'monthly' &&
+          o.preservedMinor > 0 &&
+          (o.preserveAccountId === acc.id || (!o.preserveAccountId && o.accountId === acc.id))
+      );
+      const lockedItems = lockedObs.map((o) => {
+        const preservedInAccCur = convertMinor(o.preservedMinor, o.currency, acc.currency, rateMap);
+        const amountInAccCur = convertMinor(o.amountMinor, o.currency, acc.currency, rateMap);
+        return {
+          obligationId: o.id,
+          name: o.name,
+          potId: o.potId,
+          potName: o.potId ? (potById.get(o.potId)?.name ?? null) : null,
+          cadence: o.cadence,
+          nextDueDate: o.nextDueDate,
+          monthsUntilDue: o.metrics.monthsUntilDue,
+          preservedMinor: preservedInAccCur,
+          amountMinor: amountInAccCur,
+          preservedDisplayMinor: o.preservedDisplayMinor,
+          targetDisplayMinor: o.targetDisplayMinor,
+          monthlySliceDisplayMinor: o.preserveDisplayMinor,
+        };
+      });
+
+      const lockedPreserveMinor = lockedItems.reduce((s, x) => s + x.preservedMinor, 0);
+      const lockedPreserveDisplayMinor = lockedItems.reduce((s, x) => s + x.preservedDisplayMinor, 0);
+      const trueAvailableMinor = Math.max(0, acc.balanceMinor - lockedPreserveMinor);
+      const trueAvailableDisplayMinor = convertMinor(trueAvailableMinor, acc.currency, cur, rateMap);
+      const unfundedPreserveShortfallMinor = Math.max(0, lockedPreserveMinor - Math.max(0, acc.balanceMinor));
+      const unfundedPreserveShortfallDisplayMinor = convertMinor(
+        unfundedPreserveShortfallMinor,
+        acc.currency,
+        cur,
+        rateMap
+      );
+
+      // 2. Unpaid obligations scheduled on this account (before payday vs full month)
+      const accUnpaidPrePaydayObs = isPastMonth
+        ? []
+        : enrichedObligations.filter(
+            (o) =>
+              o.accountId === acc.id &&
+              o.metrics.isDueThisMonth &&
+              !o.isPaidThisMonth &&
+              o.dueDay < primaryPaydayDay
+          );
+      const unpaidPrePaydayDisplayMinor = accUnpaidPrePaydayObs.reduce((s, o) => s + o.dueDisplayMinor, 0);
+      const unpaidPrePaydayNativeMinor = accUnpaidPrePaydayObs.reduce(
+        (s, o) => s + convertMinor(o.metrics.dueThisMonthNativeMinor, o.currency, acc.currency, rateMap),
+        0
+      );
+
+      const accUnpaidMonthObs = isPastMonth
+        ? []
+        : enrichedObligations.filter((o) => o.accountId === acc.id && o.metrics.isDueThisMonth && !o.isPaidThisMonth);
+      const unpaidMonthDisplayMinor = accUnpaidMonthObs.reduce((s, o) => s + o.dueDisplayMinor, 0);
+
+      // 3. Expected unticked income arrivals into this account
+      const accPendingIncomes = isPastMonth
+        ? []
+        : activeIncomes.filter((i) => i.accountId === acc.id && !i.isReceivedThisMonth);
+      const expectedIncomeDisplayMinor = accPendingIncomes.reduce((s, i) => s + i.monthlyDisplayMinor, 0);
+
+      // 4. Pocket Money / Discretionary Spending on this account this month
+      const accOutflowExps = outflowExpenses.filter((e) => e.accountId === acc.id);
+      const spentThisMonthNativeMinor = accOutflowExps.reduce(
+        (s, e) => s + convertMinor(e.amountMinor, e.currency, acc.currency, rateMap),
+        0
+      );
+      const spentThisMonthDisplayMinor = accOutflowExps.reduce((s, e) => s + e.displayAmountMinor, 0);
+      const pocketTargetNativeMinor = acc.pocketMoneyTargetMinor ?? 0;
+      const pocketTargetDisplayMinor = convertMinor(pocketTargetNativeMinor, acc.currency, cur, rateMap);
+      const pocketRemainingNativeMinor = Math.max(0, pocketTargetNativeMinor - spentThisMonthNativeMinor);
+      const pocketRemainingDisplayMinor = convertMinor(pocketRemainingNativeMinor, acc.currency, cur, rateMap);
+
+      // 5. Pre-payday net sufficiency on this specific account (True Available Cash minus Pre-Payday Unpaid Bills)
+      const netPrePaydayNativeMinor = trueAvailableMinor - unpaidPrePaydayNativeMinor;
+      const netPrePaydayDisplayMinor = trueAvailableDisplayMinor - unpaidPrePaydayDisplayMinor;
+
+      return {
+        accountId: acc.id,
+        workspaceId: acc.workspaceId,
+        name: acc.name,
+        institution: acc.institution,
+        currency: acc.currency,
+        isPrimaryRunway: acc.isPrimaryRunway,
+        balanceMinor: acc.balanceMinor,
+        displayBalanceMinor,
+        lockedPreserveMinor,
+        lockedPreserveDisplayMinor,
+        trueAvailableMinor,
+        trueAvailableDisplayMinor,
+        unfundedPreserveShortfallMinor,
+        unfundedPreserveShortfallDisplayMinor,
+        lockedItems,
+        unpaidPrePaydayNativeMinor,
+        unpaidPrePaydayDisplayMinor,
+        unpaidPrePaydayItems: accUnpaidPrePaydayObs.map((o) => ({
+          id: o.id,
+          name: o.name,
+          dueDay: o.dueDay,
+          displayMinor: o.dueDisplayMinor,
+        })),
+        unpaidMonthDisplayMinor,
+        expectedIncomeDisplayMinor,
+        spentThisMonthNativeMinor,
+        spentThisMonthDisplayMinor,
+        pocketMoneyTargetMinor: pocketTargetNativeMinor,
+        pocketMoneyTargetDisplayMinor: pocketTargetDisplayMinor,
+        pocketMoneyRemainingMinor: pocketRemainingNativeMinor,
+        pocketMoneyRemainingDisplayMinor: pocketRemainingDisplayMinor,
+        netPrePaydayNativeMinor,
+        netPrePaydayDisplayMinor,
+        isPrePaydaySufficient: netPrePaydayDisplayMinor >= 0,
+      };
+    });
+
+    // Generate Automated Smart Financial Advisories (Inter-Account Transfers, Locked Savers, Pocket Money & Month-End Sweep)
+    const advisories: Array<{
+      id: string;
+      kind: 'transfer_warning' | 'locked_saver_warning' | 'pocket_money_tracker' | 'savings_sweep';
+      severity: 'critical' | 'warning' | 'info' | 'good';
+      accountId: string | null;
+      accountName: string | null;
+      sourceAccountId?: string | null;
+      sourceAccountName?: string | null;
+      title: string;
+      description: string;
+      amountDisplayMinor: number;
+      secondaryDisplayMinor?: number;
+      actionLabel?: string;
+    }> = [];
+
+    if (!isPastMonth) {
+      const surplusAccounts = accountAnalytics
+        .filter((a) => a.isPrimaryRunway && a.netPrePaydayDisplayMinor > 2500)
+        .sort((a, b) => b.netPrePaydayDisplayMinor - a.netPrePaydayDisplayMinor);
+
+      // 1. Inter-Account Transfer Warnings for accounts that lack cash for upcoming pre-payday bills
+      for (const accStat of accountAnalytics) {
+        if (accStat.netPrePaydayDisplayMinor < 0 && accStat.unpaidPrePaydayDisplayMinor > 0) {
+          const deficitDisplay = Math.abs(accStat.netPrePaydayDisplayMinor);
+          const donor = surplusAccounts.find((d) => d.accountId !== accStat.accountId) ?? null;
+          const topBills = accStat.unpaidPrePaydayItems
+            .slice(0, 3)
+            .map((b) => `${b.name} (day ${b.dueDay})`)
+            .join(', ');
+          advisories.push({
+            id: `adv-transfer-${accStat.accountId}`,
+            kind: 'transfer_warning',
+            severity: deficitDisplay > 15000 ? 'critical' : 'warning',
+            accountId: accStat.accountId,
+            accountName: accStat.name,
+            sourceAccountId: donor?.accountId ?? null,
+            sourceAccountName: donor?.name ?? null,
+            title: `Low Pre-Payday Balance on ${accStat.name}`,
+            description: donor
+              ? `Upcoming bills before payday (${topBills}) exceed available cash on ${accStat.name}. Recommend moving funds from ${donor.name} (which has a free buffer) before day ${accStat.unpaidPrePaydayItems[0]?.dueDay || 10}.`
+              : `Upcoming bills before payday (${topBills}) exceed available cash on ${accStat.name}. Top up this account before day ${accStat.unpaidPrePaydayItems[0]?.dueDay || 10}.`,
+            amountDisplayMinor: deficitDisplay,
+            secondaryDisplayMinor: accStat.unpaidPrePaydayDisplayMinor,
+            actionLabel: donor ? `Transfer from ${donor.name}` : 'Top up account',
+          });
+        }
+      }
+    }
+
+    // 2. Locked Saver / Earmarked Annual Reserves Warning (always shown when an account holds Preserve funds)
+    for (const accStat of accountAnalytics) {
+      if (accStat.lockedPreserveDisplayMinor > 0) {
+        const itemNames = accStat.lockedItems
+          .map((i) => `${i.name} (due ${i.nextDueDate})`)
+          .join(', ');
+        advisories.push({
+          id: `adv-locked-${accStat.accountId}`,
+          kind: 'locked_saver_warning',
+          severity: accStat.unfundedPreserveShortfallDisplayMinor > 0 ? 'warning' : 'info',
+          accountId: accStat.accountId,
+          accountName: accStat.name,
+          title:
+            accStat.trueAvailableDisplayMinor === 0
+              ? `100% of ${accStat.name} is Committed to Upcoming Annual Bills`
+              : `Earmarked Sinking Reserves on ${accStat.name}`,
+          description:
+            accStat.trueAvailableDisplayMinor === 0
+              ? `Funds sitting on ${accStat.name} are already reserved for planned annual renewals (${itemNames}). Real free savings available to spend: 0.00. Avoid withdrawing these funds.`
+              : `Part of ${accStat.name} is locked for upcoming annual renewals (${itemNames}). Only the remaining unlocked balance is true free savings.`,
+          amountDisplayMinor: accStat.lockedPreserveDisplayMinor,
+          secondaryDisplayMinor: accStat.trueAvailableDisplayMinor,
+        });
+      }
+    }
+
+    // 3. Pocket Money / Discretionary Spending Allowance Tracker
+    for (const accStat of accountAnalytics) {
+      const effectiveTargetMinor =
+        accStat.pocketMoneyTargetDisplayMinor > 0
+          ? accStat.pocketMoneyTargetDisplayMinor
+          : accStat.accountId === 'acc-revolut-personal'
+          ? convertMinor(15000, 'GBP', cur, rateMap)
+          : 0;
+      if (effectiveTargetMinor > 0) {
+        const remainingMinor = Math.max(0, effectiveTargetMinor - accStat.spentThisMonthDisplayMinor);
+        const overBudgetMinor = Math.max(0, accStat.spentThisMonthDisplayMinor - effectiveTargetMinor);
+        const daysLeftToPayday = Math.max(1, primaryPaydayDay - currentDay);
+        advisories.push({
+          id: `adv-pocket-${accStat.accountId}`,
+          kind: 'pocket_money_tracker',
+          severity: overBudgetMinor > 0 ? 'warning' : 'good',
+          accountId: accStat.accountId,
+          accountName: accStat.name,
+          title: `Pocket Money Fund · ${accStat.name}`,
+          description:
+            overBudgetMinor > 0
+              ? `Small spending on ${accStat.name} has exceeded your monthly pocket-money allowance by ${(overBudgetMinor / 100).toFixed(2)}.`
+              : `You have ${(remainingMinor / 100).toFixed(2)} remaining in your monthly small-spending allowance (~${(remainingMinor / daysLeftToPayday / 100).toFixed(2)}/day until payday). Sticking to this target protects your month-end savings sweep!`,
+          amountDisplayMinor: remainingMinor,
+          secondaryDisplayMinor: effectiveTargetMinor,
+        });
+      }
+    }
+
+    // Filter Timeline items & curve when user selects a specific Bank Account on Timeline
+    const filteredIncomes = selectedAccountId
+      ? activeIncomes.filter((i) => i.accountId === selectedAccountId)
+      : activeIncomes;
+    const filteredObligations = selectedAccountId
+      ? enrichedObligations.filter(
+          (o) =>
+            o.accountId === selectedAccountId ||
+            (!o.metrics.isDueThisMonth && o.preserveAccountId === selectedAccountId)
+        )
+      : enrichedObligations;
+    const filteredExpenses = selectedAccountId
+      ? expenses.filter((e) => e.accountId === selectedAccountId)
+      : expenses;
+
+    const runwayCashMinor = selectedAccountId
+      ? accounts
+          .filter((a) => a.id === selectedAccountId)
+          .reduce((s, a) => s + convertMinor(a.balanceMinor, a.currency, cur, rateMap), 0)
+      : accounts
+          .filter((a) => a.isPrimaryRunway)
+          .reduce((s, a) => s + convertMinor(a.balanceMinor, a.currency, cur, rateMap), 0);
+
+    const unpaidBillsMinor = filteredObligations
       .filter((o) => o.metrics.isDueThisMonth && !o.isPaidThisMonth)
       .reduce((s, o) => s + o.dueDisplayMinor, 0);
 
-    const unpaidPrePaydayBillsMinor = enrichedObligations
+    const unpaidPrePaydayBillsMinor = filteredObligations
       .filter((o) => o.metrics.isDueThisMonth && !o.isPaidThisMonth && o.dueDay < primaryPaydayDay)
       .reduce((s, o) => s + o.dueDisplayMinor, 0);
 
     // Only count unticked incomes as future expected inflow AFTER their paydayDay
-    const remainingPaydaysIncomeMinor = activeIncomes
+    const remainingPaydaysIncomeMinor = filteredIncomes
       .filter((i) => !i.isReceivedThisMonth)
       .reduce((s, i) => s + i.monthlyDisplayMinor, 0);
 
-    const isPastMonth = ym < todayIso.slice(0, 7);
-    const unallocatedEnvelopeRemainingMinor = isPastMonth
-      ? 0
-      : potTree.reduce((s, n) => {
-          const sumEnv = (node: (typeof potTree)[number]): number =>
-            node.unallocatedEnvelopeDisplayMinor + node.children.reduce((acc, c) => acc + sumEnv(c), 0);
-          return s + sumEnv(n);
-        }, 0);
+    const unallocatedEnvelopeRemainingMinor =
+      isPastMonth || selectedAccountId
+        ? 0
+        : potTree.reduce((s, n) => {
+            const sumEnv = (node: (typeof potTree)[number]): number =>
+              node.unallocatedEnvelopeDisplayMinor + node.children.reduce((acc, c) => acc + sumEnv(c), 0);
+            return s + sumEnv(n);
+          }, 0);
 
-    const unpaidPreserveSliceMinor = enrichedObligations
+    const unpaidPreserveSliceMinor = filteredObligations
       .filter((o) => !o.metrics.isDueThisMonth && !o.isPaidThisMonth && o.preserveDisplayMinor > 0)
       .reduce((s, o) => s + o.preserveDisplayMinor, 0);
 
@@ -468,11 +725,27 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       runwayCashMinor + remainingPaydaysIncomeMinor - totalNeededTillMonthEndMinor;
     // True cycle buffer after ALSO reserving next month's pre-salary requirements from the new salary:
     const projectedAfterNextMonthReserveMinor =
-      projectedEndBalanceMinor - nextMonthPreSalaryMinor;
+      projectedEndBalanceMinor - (selectedAccountId ? 0 : nextMonthPreSalaryMinor);
     const shortfallMinor = Math.max(0, -prePaydayBufferMinor);
 
+    // 4. Month-End Savings Sweep Advisory (if sticking to budget leaves surplus at month end)
+    if (!isPastMonth && projectedAfterNextMonthReserveMinor > 0) {
+      const saverAcc =
+        accounts.find((a) => a.id === 'acc-standard-saver' || /saver|saving|oszcz/i.test(a.name)) ?? null;
+      advisories.push({
+        id: 'adv-savings-sweep',
+        kind: 'savings_sweep',
+        severity: 'good',
+        accountId: saverAcc?.id ?? null,
+        accountName: saverAcc?.name ?? 'Savings Account',
+        title: `Month-End Savings Sweep Opportunity`,
+        description: `If you stick to your current budget and envelopes, after salary arrives and next month's pre-payday bills are reserved, you are projected to have a net surplus that can be swept into ${saverAcc?.name ?? 'your Saver account'} by month-end to build real savings.`,
+        amountDisplayMinor: projectedAfterNextMonthReserveMinor,
+        secondaryDisplayMinor: projectedEndBalanceMinor,
+      });
+    }
+
     // Unified Chronological Ledger of all Month Expenses + Completed Checklist Payments (with Timestamps)
-    const potById = new Map(pots.map((p) => [p.id, p]));
     const timelineLedger: Array<{
       id: string;
       kind: 'expense' | 'paid_bill' | 'sinking_set_aside';
@@ -496,7 +769,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       displayAmountMinor: number;
     }> = [];
 
-    for (const exp of expenses) {
+    for (const exp of filteredExpenses) {
       const timePart =
         exp.createdAt && exp.createdAt.length >= 16 && /^\d{2}:\d{2}/.test(exp.createdAt.slice(11, 16))
           ? exp.createdAt.slice(11, 16)
@@ -527,9 +800,11 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       });
     }
 
-    for (const ob of enrichedObligations) {
+    for (const ob of filteredObligations) {
       if (!ob.isPaidThisMonth || !ob.occurrence) continue;
       const occ = ob.occurrence;
+      const effAccId = (occ.accountId ?? ob.accountId) || null;
+      if (selectedAccountId && effAccId !== selectedAccountId && ob.preserveAccountId !== selectedAccountId) continue;
       const fallbackDate = `${ym}-${String(Math.min(daysInMonth, Math.max(1, ob.dueDay || 1))).padStart(2, '0')}`;
       const eventDate =
         occ.paidAt && occ.paidAt.slice(0, 7) === ym
@@ -548,7 +823,6 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
         (ob.metrics.isDueThisMonth ? ob.amountMinor : ob.metrics.monthlyPreserveNativeMinor || ob.amountMinor);
       const displayAmountMinor = convertMinor(actualNativeMinor, ob.currency, cur, rateMap);
       const pot = ob.potId ? potById.get(ob.potId) : undefined;
-      const effAccId = (occ.accountId ?? ob.accountId) || null;
       timelineLedger.push({
         id: `led-occ-${occ.id}`,
         kind: ob.metrics.isDueThisMonth ? 'paid_bill' : 'sinking_set_aside',
@@ -580,7 +854,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       (s, e) => s + (e.flowDirection === 'inflow' ? -e.displayAmountMinor : e.displayAmountMinor),
       0
     );
-    const receivedIncomesThisMonthMinor = activeIncomes
+    const receivedIncomesThisMonthMinor = filteredIncomes
       .filter((i) => i.isReceivedThisMonth)
       .reduce((s, i) => s + i.monthlyDisplayMinor, 0);
 
@@ -612,7 +886,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       const dayEvents: (typeof dailyCurve)[number]['events'] = [];
 
       // 1. Income arrivals (received or expected on paydayDay)
-      for (const inc of activeIncomes) {
+      for (const inc of filteredIncomes) {
         const incDay =
           inc.isReceivedThisMonth && inc.receivedAt && inc.receivedAt.slice(0, 7) === ym
             ? Math.min(daysInMonth, Math.max(1, Number(inc.receivedAt.slice(8, 10)) || inc.paydayDay))
@@ -655,7 +929,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       }
 
       // 3. Remaining unpaid scheduled obligations & unpaid monthly sinking set-asides
-      for (const ob of enrichedObligations) {
+      for (const ob of filteredObligations) {
         if (ob.isPaidThisMonth) continue;
         const obDay = Math.min(daysInMonth, Math.max(1, ob.dueDay || 1));
         if (ob.metrics.isDueThisMonth && obDay === d) {
@@ -920,6 +1194,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
 
       // 1. Add all historical logged expenses in [startPeriodYm .. prevYm] to timelineLedger
       for (const exp of allHistoryExpenses) {
+        if (selectedAccountId && exp.accountId !== selectedAccountId) continue;
         const expYm = exp.spentDate.slice(0, 7);
         if (expYm >= ym || expYm < startPeriodYm) continue;
         const timePart =
@@ -981,6 +1256,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
             const dispMinor = convertMinor(actualNativeMinor, ob.currency, cur, rateMap);
             const pot = ob.potId ? potById.get(ob.potId) : undefined;
             const effAccId = (occ.accountId ?? ob.accountId) || null;
+            if (selectedAccountId && effAccId !== selectedAccountId) continue;
             timelineLedger.push({
               id: `led-occ-${occ.id}`,
               kind: 'paid_bill',
@@ -1010,6 +1286,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
             const dispMinor = convertMinor(ob.amountMinor, ob.currency, cur, rateMap);
             const pot = ob.potId ? potById.get(ob.potId) : undefined;
             const effAccId = ob.accountId || null;
+            if (selectedAccountId && effAccId !== selectedAccountId) continue;
             timelineLedger.push({
               id: `led-hist-${ob.id}-${mKey}`,
               kind: 'paid_bill',
@@ -1065,7 +1342,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
             }
           }
           if (isCurrentMo) {
-            for (const ob of enrichedObligations.filter((o) => !o.isPaidThisMonth && (o.dueDay || 1) <= 10)) {
+            for (const ob of filteredObligations.filter((o) => !o.isPaidThisMonth && (o.dueDay || 1) <= 10)) {
               const amt = ob.metrics.isDueThisMonth ? ob.dueDisplayMinor : ob.preserveDisplayMinor;
               if (amt > 0) {
                 earlyDelta -= amt;
@@ -1093,7 +1370,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
             }
           }
           if (isCurrentMo) {
-            for (const ob of enrichedObligations.filter((o) => !o.isPaidThisMonth && (o.dueDay || 1) >= 11 && (o.dueDay || 1) <= 25)) {
+            for (const ob of filteredObligations.filter((o) => !o.isPaidThisMonth && (o.dueDay || 1) >= 11 && (o.dueDay || 1) <= 25)) {
               const amt = ob.metrics.isDueThisMonth ? ob.dueDisplayMinor : ob.preserveDisplayMinor;
               if (amt > 0) {
                 midDelta -= amt;
@@ -1111,6 +1388,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
           const lateEvents: (typeof dailyCurve)[number]['events'] = [];
           let lateDelta = 0;
           for (const inc of incomes) {
+            if (selectedAccountId && inc.accountId !== selectedAccountId) continue;
             const incMinor = computeMonthlyIncomeMinor(inc, mKey, cur, rateMap);
             if (incMinor > 0) {
               lateDelta += incMinor;
@@ -1210,16 +1488,21 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     return {
       yearMonth: ym,
       scope,
+      selectedAccountId,
       displayCurrency: cur,
       accounts,
       allAccounts,
+      accountAnalytics,
+      advisories,
       allLiabilities,
-      incomes: activeIncomes,
+      incomes: filteredIncomes,
       allIncomes: incomes,
       pots,
       potTree,
-      obligations: enrichedObligations,
-      expenses,
+      obligations: filteredObligations,
+      allObligations: enrichedObligations,
+      expenses: filteredExpenses,
+      allExpenses: expenses,
       timelineLedger,
       kpis: {
         totalIncomeMinor,
@@ -1767,13 +2050,24 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     const wsId = String(b.workspaceId || user.personalWorkspaceId);
     if (!store.canWriteWorkspace(user.id, wsId)) return reply.code(403).send({ error: 'Write denied' });
     const id = b.id ? String(b.id) : `acc-${crypto.randomUUID().slice(0, 8)}`;
+    const existingAcc = b.id
+      ? (store.db.prepare(`SELECT pocket_money_target_minor FROM accounts WHERE id = ?`).get(id) as
+          | { pocket_money_target_minor: number }
+          | undefined)
+      : undefined;
+    const pocketTargetMinor =
+      b.pocketMoneyTargetMinor !== undefined
+        ? Math.max(0, Math.round(Number(b.pocketMoneyTargetMinor || 0)))
+        : existingAcc?.pocket_money_target_minor ?? 0;
+
     store.db
       .prepare(
-        `INSERT INTO accounts (id, workspace_id, name, institution, currency, balance_minor, is_primary_runway, portal_url, notes, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO accounts (id, workspace_id, name, institution, currency, balance_minor, pocket_money_target_minor, is_primary_runway, portal_url, notes, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            workspace_id=excluded.workspace_id, name=excluded.name, institution=excluded.institution, currency=excluded.currency,
-           balance_minor=excluded.balance_minor, is_primary_runway=excluded.is_primary_runway,
+           balance_minor=excluded.balance_minor, pocket_money_target_minor=excluded.pocket_money_target_minor,
+           is_primary_runway=excluded.is_primary_runway,
            portal_url=excluded.portal_url, notes=excluded.notes, updated_at=excluded.updated_at`
       )
       .run(
@@ -1783,6 +2077,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
         String(b.institution || ''),
         String(b.currency || user.defaultCurrency),
         Math.round(Number(b.balanceMinor ?? 0)),
+        pocketTargetMinor,
         b.isPrimaryRunway === false ? 0 : 1,
         b.portalUrl ? String(b.portalUrl) : null,
         b.notes ? String(b.notes) : null,
@@ -2268,8 +2563,8 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     const currency = String(b.currency || user.defaultCurrency) as CurrencyCode;
 
     const existingOb = b.id
-      ? (store.db.prepare(`SELECT account_id, liability_id FROM obligations WHERE id = ?`).get(id) as
-          | { account_id: string | null; liability_id: string | null }
+      ? (store.db.prepare(`SELECT account_id, preserve_account_id, liability_id FROM obligations WHERE id = ?`).get(id) as
+          | { account_id: string | null; preserve_account_id: string | null; liability_id: string | null }
           | undefined)
       : undefined;
     const accountId =
@@ -2280,6 +2575,14 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
         : existingOb !== undefined
         ? existingOb.account_id
         : defaultAccountForWorkspace(store, wsId, currency);
+    const preserveAccountId =
+      b.preserveAccountId !== undefined
+        ? b.preserveAccountId
+          ? String(b.preserveAccountId)
+          : null
+        : existingOb !== undefined
+        ? existingOb.preserve_account_id
+        : null;
     const liabilityId =
       b.liabilityId !== undefined
         ? b.liabilityId
@@ -2292,13 +2595,13 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     store.db
       .prepare(
         `INSERT INTO obligations (
-           id, workspace_id, pot_id, account_id, liability_id, name, amount_minor, currency, cadence, interval_months,
+           id, workspace_id, pot_id, account_id, preserve_account_id, liability_id, name, amount_minor, currency, cadence, interval_months,
            next_due_date, due_day, preserved_minor, auto_preserve, split_mode, wadera_split_bp,
            tags_json, manage_url, portal_url, reference_number, renewal_notice_days, notes, is_active
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            workspace_id=excluded.workspace_id, pot_id=excluded.pot_id, account_id=excluded.account_id,
-           liability_id=excluded.liability_id, name=excluded.name,
+           preserve_account_id=excluded.preserve_account_id, liability_id=excluded.liability_id, name=excluded.name,
            amount_minor=excluded.amount_minor, currency=excluded.currency, cadence=excluded.cadence,
            interval_months=excluded.interval_months, next_due_date=excluded.next_due_date, due_day=excluded.due_day,
            preserved_minor=excluded.preserved_minor, auto_preserve=excluded.auto_preserve,
@@ -2311,6 +2614,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
         wsId,
         b.potId ? String(b.potId) : null,
         accountId,
+        preserveAccountId,
         liabilityId,
         String(b.name || 'Scheduled Payment'),
         Math.round(Number(b.amountMinor ?? 0)),

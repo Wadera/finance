@@ -73,6 +73,7 @@ export interface BootstrapResponse {
 
 export interface EnrichedObligation extends ObligationRecord {
   accountName?: string | null;
+  preserveAccountName?: string | null;
   metrics: {
     obligationId: string;
     isDueThisMonth: boolean;
@@ -90,6 +91,71 @@ export interface EnrichedObligation extends ObligationRecord {
   targetDisplayMinor: number;
   preservedDisplayMinor: number;
   liabilityName?: string | null;
+}
+
+export interface AccountAnalyticsItem {
+  accountId: string;
+  workspaceId: string;
+  name: string;
+  institution: string;
+  currency: CurrencyCode;
+  isPrimaryRunway: boolean;
+  balanceMinor: number;
+  displayBalanceMinor: number;
+  lockedPreserveMinor: number;
+  lockedPreserveDisplayMinor: number;
+  trueAvailableMinor: number;
+  trueAvailableDisplayMinor: number;
+  unfundedPreserveShortfallMinor: number;
+  unfundedPreserveShortfallDisplayMinor: number;
+  lockedItems: Array<{
+    obligationId: string;
+    name: string;
+    potId: string | null;
+    potName: string | null;
+    cadence: string;
+    nextDueDate: string;
+    monthsUntilDue: number;
+    preservedMinor: number;
+    amountMinor: number;
+    preservedDisplayMinor: number;
+    targetDisplayMinor: number;
+    monthlySliceDisplayMinor: number;
+  }>;
+  unpaidPrePaydayNativeMinor: number;
+  unpaidPrePaydayDisplayMinor: number;
+  unpaidPrePaydayItems: Array<{
+    id: string;
+    name: string;
+    dueDay: number;
+    displayMinor: number;
+  }>;
+  unpaidMonthDisplayMinor: number;
+  expectedIncomeDisplayMinor: number;
+  spentThisMonthNativeMinor: number;
+  spentThisMonthDisplayMinor: number;
+  pocketMoneyTargetMinor: number;
+  pocketMoneyTargetDisplayMinor: number;
+  pocketMoneyRemainingMinor: number;
+  pocketMoneyRemainingDisplayMinor: number;
+  netPrePaydayNativeMinor: number;
+  netPrePaydayDisplayMinor: number;
+  isPrePaydaySufficient: boolean;
+}
+
+export interface FinancialAdvisoryItem {
+  id: string;
+  kind: 'transfer_warning' | 'locked_saver_warning' | 'pocket_money_tracker' | 'savings_sweep';
+  severity: 'critical' | 'warning' | 'info' | 'good';
+  accountId: string | null;
+  accountName: string | null;
+  sourceAccountId?: string | null;
+  sourceAccountName?: string | null;
+  title: string;
+  description: string;
+  amountDisplayMinor: number;
+  secondaryDisplayMinor?: number;
+  actionLabel?: string;
 }
 
 export type EnrichedExpense = ExpenseEntryRecord & {
@@ -195,16 +261,21 @@ export interface HorizonSummary {
 export interface BudgetMonthResponse {
   yearMonth: string;
   scope: string;
+  selectedAccountId?: string | null;
   displayCurrency: CurrencyCode;
   accounts: BankAccountRecord[];
   allAccounts?: BankAccountRecord[];
+  accountAnalytics?: AccountAnalyticsItem[];
+  advisories?: FinancialAdvisoryItem[];
   allLiabilities?: LiabilityRecord[];
   incomes: EnrichedIncome[];
   allIncomes: IncomeStreamRecord[];
   pots: PotRecord[];
   potTree: PotRollupNode[];
   obligations: EnrichedObligation[];
+  allObligations?: EnrichedObligation[];
   expenses: EnrichedExpense[];
+  allExpenses?: EnrichedExpense[];
   timelineLedger: TimelineLedgerEntry[];
   kpis: {
     totalIncomeMinor: number;
