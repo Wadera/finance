@@ -1767,15 +1767,18 @@ export const App: React.FC = () => {
                 {advisoryOpen && (
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5 pt-1">
                     {budget.advisories.map((adv) => {
-                      const isWarn = adv.severity === 'warning';
-                      const isSuccess = adv.severity === 'success';
+                      const isCritical = adv.severity === 'critical';
+                      const isWarn = adv.severity === 'warning' || isCritical;
+                      const isGood = adv.severity === 'good';
                       return (
                         <div
                           key={adv.id}
                           className={`rounded-lg border p-3 flex flex-col justify-between gap-2 ${
-                            isWarn
+                            isCritical
+                              ? 'bg-rose-50/70 border-rose-200 text-rose-950'
+                              : isWarn
                               ? 'bg-amber-50/70 border-amber-200 text-amber-950'
-                              : isSuccess
+                              : isGood
                               ? 'bg-emerald-50/60 border-emerald-200 text-emerald-950'
                               : 'bg-teal-50/50 border-teal-200 text-teal-950'
                           }`}
@@ -1784,33 +1787,37 @@ export const App: React.FC = () => {
                             <div className="flex items-start justify-between gap-2">
                               <div className="flex items-center gap-1.5 text-xs font-semibold">
                                 {isWarn ? (
-                                  <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
-                                ) : isSuccess ? (
+                                  <AlertTriangle
+                                    className={`w-4 h-4 shrink-0 ${isCritical ? 'text-rose-600' : 'text-amber-600'}`}
+                                  />
+                                ) : isGood ? (
                                   <PiggyBank className="w-4 h-4 text-emerald-600 shrink-0" />
                                 ) : (
                                   <Landmark className="w-4 h-4 text-teal-700 shrink-0" />
                                 )}
                                 <span>{adv.title}</span>
                               </div>
-                              {adv.recommendedAmountDisplayMinor && adv.recommendedAmountDisplayMinor > 0 ? (
+                              {adv.amountDisplayMinor > 0 ? (
                                 <span
                                   className={`font-mono-num text-xs font-bold px-2 py-0.5 rounded shrink-0 ${
-                                    isWarn
+                                    isCritical
+                                      ? 'bg-rose-200/80 text-rose-950'
+                                      : isWarn
                                       ? 'bg-amber-200/70 text-amber-950'
-                                      : isSuccess
+                                      : isGood
                                       ? 'bg-emerald-200/70 text-emerald-950'
                                       : 'bg-teal-200/70 text-teal-950'
                                   }`}
                                 >
-                                  {fmt(adv.recommendedAmountDisplayMinor)}
+                                  {fmt(adv.amountDisplayMinor)}
                                 </span>
                               ) : null}
                             </div>
-                            <p className="text-[11px] leading-relaxed opacity-90">{adv.message}</p>
+                            <p className="text-[11px] leading-relaxed opacity-90">{adv.description}</p>
                           </div>
 
                           <div className="flex flex-wrap items-center justify-between gap-2 pt-1.5 border-t border-black/5 text-[10px]">
-                            <div className="flex items-center gap-1.5 font-mono-num">
+                            <div className="flex flex-wrap items-center gap-1.5 font-mono-num">
                               {adv.accountName && (
                                 <button
                                   type="button"
@@ -1826,7 +1833,8 @@ export const App: React.FC = () => {
                                   onClick={() => adv.accountId && openEntityDrawer('account', adv.accountId)}
                                   className="px-2 py-0.5 rounded bg-white/80 border border-black/10 hover:bg-slate-900 hover:text-white transition"
                                 >
-                                  <Pencil className="w-2.5 h-2.5 inline mr-0.5" /> Configure Account / Pocket Money
+                                  <Pencil className="w-2.5 h-2.5 inline mr-0.5" />{' '}
+                                  {adv.actionLabel || 'Configure Account / Pocket Money'}
                                 </button>
                               )}
                             </div>
