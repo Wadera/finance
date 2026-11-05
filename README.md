@@ -13,34 +13,33 @@ An open-source personal, shared household, and company financial engine featurin
 [![MCP JSON-RPC 2.0](https://img.shields.io/badge/MCP-JSON--RPC%202.0-0D9488)](./src/server/mcp.ts)
 [![License: MIT](https://img.shields.io/badge/License-MIT-22C55E.svg)](./LICENSE)
 
-[**Watch Full Video Walkthrough (6m 33s MP4)**](./docs/skyday-finance-overview-v1.mp4) · [**Visual Tour**](#-visual-tour--capabilities) · [**AI / MCP Ingestion**](#6-turn-invoice-photos--bank-statements-into-reconciled-ledgers-mcp) · [**Quick Start**](#-quick-start) · [**Architecture**](#8-zero-lock-in-open-source-typescript-architecture)
+[**Visual Tour**](#-visual-tour--capabilities) · [**AI / MCP Ingestion**](#6-turn-invoice-photos--bank-statements-into-reconciled-ledgers-mcp) · [**Quick Start**](#-quick-start) · [**Architecture**](#9-zero-lock-in-open-source-typescript-architecture)
 
 </div>
 
 ---
 
-## 🎬 Video Overview & Chapters
+## 🎬 Walkthrough Preview & Overview
 
-[![Skyday Finance Video Walkthrough Preview](./docs/screenshots/00-video-preview.gif)](./docs/skyday-finance-overview-v1.mp4)
+![Skyday Finance Walkthrough Preview](./docs/screenshots/00-video-preview.gif)
 
-> **▶ [Click here to watch or download the full 1080p voiced video walkthrough (`docs/skyday-finance-overview-v1.mp4`, 6m 33s)](./docs/skyday-finance-overview-v1.mp4)**
-
-| Timestamp | Chapter | Focus |
-| :--- | :--- | :--- |
-| **`0:00`** | **1. One Calm Ledger** | Real bank balances, locked annual reserves, pre-payday buffer & interactive 3-tier cashflow Sankey |
-| **`0:55`** | **2. Multi-Workspace Collaboration** | Share with partners, family, friends & companies (`50/50`, income-proportional, or custom splits + privacy scopes) |
-| **`1:49`** | **3. Home Budget & Pre-Payday Runway** | Infinite nested pots, progressive envelopes without double-counting, receipt vault & monthly Preserve slices |
-| **`2:49`** | **4. Company Treasury & Runway** | Multi-currency operating accounts, VAT/tax reserves, GPU/cloud commitments & direct `Manage / Cancel` links |
-| **`3:36`** | **5. Wealth, Property & Depreciation** | `-10Y` historical reconstruction to `+20Y` compound growth, depreciating belongings & live loan amortization |
-| **`4:18`** | **6. AI Agent & MCP Ingestion** | One-click bootstrap prompt for local LLMs, Claude Code, Codex, or Antigravity to ingest receipt photos & 12M CSVs |
-| **`5:06`** | **7. Currencies, Languages & `% ONLY` Mode** | Live FX conversion (`GBP`, `EUR`, `PLN`, `USD`, `CHF`), instant `EN`/`PL` switch & Base-100 `% ONLY` privacy shield |
-| **`5:48`** | **8. Zero Lock-In Architecture** | Clean TypeScript monorepo, integer minor-unit engine, `node:sqlite` WAL, single Docker container & atomic backups |
+| Section | Focus |
+| :--- | :--- |
+| **[1. One Calm Ledger](#1-every-pound-euro-zloty--dollar-in-one-calm-ledger)** | Real bank balances, locked annual reserves, pre-payday buffer & interactive 3-tier cashflow Sankey |
+| **[2. Pre-Payday Runway & Advisory](#2-pre-payday-runway-locked-sinking-reserves--automated-financial-advisory)** | Automatic monthly Preserve sinking-fund slices, locked saver alerts, daily pocket money & runway curve |
+| **[3. Home Budget & Nested Pots](#3-infinite-pot-hierarchy-progressive-envelopes--attachment-vault)** | Infinite nested pots, progressive envelopes without double-counting & SHA-256 receipt/invoice vault |
+| **[4. Company Treasury & Runway](#4-run-your-company-runway-tax-reserves--cloud-commitments)** | Multi-currency operating accounts, VAT/tax reserves, GPU/cloud commitments & direct `Manage / Cancel` links |
+| **[5. Wealth, Property & Depreciation](#5-compound-investments-property-equity-depreciation--20-year-wealth-trajectory)** | `-10Y` historical reconstruction to `+20Y` compound growth, depreciating belongings & live loan amortization |
+| **[6. AI Agent & MCP Ingestion](#6-turn-invoice-photos--bank-statements-into-reconciled-ledgers-mcp)** | One-click bootstrap prompt for local LLMs, Claude Code, Codex, or Antigravity to ingest receipt photos & 12M CSVs |
+| **[7. Multi-Workspace Collaboration](#7-share-with-partners-family-friends--companies)** | Share with partners, family, friends & companies (`50/50`, income-proportional, or custom splits + privacy scopes) |
+| **[8. Currencies, Languages & `% ONLY` Mode](#8-switch-currencies-languages---only-privacy-mode-in-one-click)** | Live FX conversion (`GBP`, `EUR`, `PLN`, `USD`, `CHF`), instant `EN`/`PL` switch & Base-100 `% ONLY` privacy shield |
+| **[9. Zero Lock-In Architecture](#9-zero-lock-in-open-source-typescript-architecture)** | Clean TypeScript monorepo, integer minor-unit engine, `node:sqlite` WAL, single Docker container & atomic backups |
 
 <details>
-<summary><strong>🖼️ View Full 20-Frame Video Storyboard / Contact Sheet</strong></summary>
+<summary><strong>🖼️ View Full 20-Frame Feature Storyboard / Contact Sheet</strong></summary>
 <br />
 
-![Skyday Finance Video Contact Sheet](./docs/screenshots/contact-sheet-v1.jpg)
+![Skyday Finance Storyboard Contact Sheet](./docs/screenshots/contact-sheet-v1.jpg)
 
 </details>
 
