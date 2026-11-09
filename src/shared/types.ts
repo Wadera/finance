@@ -74,10 +74,18 @@ export interface BankAccountRecord {
   institution: string;
   currency: CurrencyCode;
   balanceMinor: number;
+  bookedBalanceMinor?: number | null;
+  pendingDebitMinor?: number | null;
+  pendingCreditMinor?: number | null;
   pocketMoneyTargetMinor?: number;
   isPrimaryRunway: boolean;
   portalUrl: string | null;
   notes: string | null;
+  observedAt?: string | null;
+  snapshotSource?: string | null;
+  snapshotEvidence?: string | null;
+  lastReconciledAt?: string | null;
+  version?: number;
   updatedAt: string;
 }
 
@@ -113,6 +121,10 @@ export interface PotRecord {
   sortOrder: number;
 }
 
+export type TransactionStatus = 'pending' | 'posted' | 'reversed' | 'refunded';
+
+export type TransactionKind = 'expense' | 'deposit' | 'transfer';
+
 export interface ObligationRecord {
   id: string;
   workspaceId: string;
@@ -122,10 +134,13 @@ export interface ObligationRecord {
   liabilityId?: string | null;
   name: string;
   amountMinor: number;
+  finalAmountMinor?: number | null;
   currency: CurrencyCode;
   cadence: CadenceKind;
   intervalMonths: number; // 1 for monthly, 3 for quarterly, 6 for biannual, 12 for annual, or custom N
   nextDueDate: string; // YYYY-MM-DD
+  endDate?: string | null; // YYYY-MM-DD (optional finite schedule end date)
+  remainingPayments?: number | null;
   dueDay: number; // 1..31
   /** Accumulated sinking-fund reserve ('Preserve') already set aside toward nextDueDate in obligation's native currency */
   preservedMinor: number;
@@ -153,8 +168,14 @@ export interface PaymentOccurrenceRecord {
   expectedMinor: number;
   actualPaidMinor: number | null;
   currency: CurrencyCode;
-  status: 'upcoming' | 'paid' | 'skipped';
+  status: 'upcoming' | 'paid' | 'skipped' | 'reversed';
   paidAt: string | null;
+  bankDate?: string | null;
+  recordedAt?: string | null;
+  linkedTransactionId?: string | null;
+  evidence?: string | null;
+  idempotencyKey?: string | null;
+  balanceApplied?: boolean;
   notes: string | null;
 }
 
@@ -171,17 +192,59 @@ export interface ExpenseEntryRecord {
   potId: string | null;
   accountId?: string | null;
   liabilityId?: string | null;
+  kind?: TransactionKind;
+  status?: TransactionStatus;
   flowDirection?: 'outflow' | 'inflow';
   merchant: string;
   description: string;
   amountMinor: number;
   currency: CurrencyCode;
+  originalAmountMinor?: number | null;
+  originalCurrency?: CurrencyCode | null;
+  fxRate?: number | null;
+  feeMinor?: number | null;
   spentDate: string; // YYYY-MM-DD
+  bankTimestamp?: string | null;
+  observedAt?: string | null;
+  reference?: string | null;
+  evidence?: string | null;
+  providerTxId?: string | null;
+  idempotencyKey?: string | null;
+  transferId?: string | null;
+  transferPeerId?: string | null;
+  transferPeerAccountId?: string | null;
+  availableApplied?: boolean;
+  bookedApplied?: boolean;
   tags: string[];
   portalUrl: string | null;
   source: 'manual' | 'mcp' | 'import';
   items: ExpenseSubItem[];
   createdAt: string;
+  updatedAt?: string;
+}
+
+export interface AccountTransferRecord {
+  id: string;
+  workspaceId: string;
+  fromAccountId: string;
+  toAccountId: string;
+  fromAmountMinor: number;
+  fromCurrency: CurrencyCode;
+  toAmountMinor: number;
+  toCurrency: CurrencyCode;
+  fxRate: number | null;
+  feeMinor: number;
+  transferDate: string;
+  bankTimestamp: string | null;
+  status: TransactionStatus;
+  description: string;
+  reference: string | null;
+  evidence: string | null;
+  idempotencyKey: string | null;
+  outflowTxId: string;
+  inflowTxId: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface AssetBelongingRecord {

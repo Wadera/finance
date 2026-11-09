@@ -33,6 +33,8 @@ export function buildRateMap(rates: FxRateRecord[]): Record<CurrencyCode, number
   return map;
 }
 
+export const rateMapFromList = buildRateMap;
+
 /**
  * Deterministically converts integer minor units (e.g. cents/pence/grosze)
  * from `fromCurrency` into `toCurrency` via GBP pivot.

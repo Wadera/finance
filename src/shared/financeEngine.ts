@@ -7,6 +7,7 @@ import type {
   IncomeStreamRecord,
   LiabilityRecord,
   ObligationRecord,
+  PaymentOccurrenceRecord,
   PotRecord,
   SplitMode,
 } from './types.js';
@@ -72,9 +73,51 @@ export interface ObligationMonthMetrics {
  */
 export function computeObligationMonthMetrics(
   ob: ObligationRecord,
-  yearMonth: string
+  yearMonth: string,
+  occurrenceForMonth?: PaymentOccurrenceRecord | null
 ): ObligationMonthMetrics {
-  if (!ob.isActive) {
+  // If an explicit occurrence was already paid in `yearMonth`, honor its historical paid amount
+  // even if the schedule was later updated or closed (`isActive === false` or `endDate` reached).
+  if (occurrenceForMonth && occurrenceForMonth.status === 'paid') {
+    const paidNative =
+      occurrenceForMonth.actualPaidMinor ??
+      (occurrenceForMonth.expectedMinor > 0 ? occurrenceForMonth.expectedMinor : ob.amountMinor);
+    return {
+      obligationId: ob.id,
+      isDueThisMonth: true,
+      monthsUntilDue: 0,
+      dueThisMonthNativeMinor: paidNative,
+      monthlyPreserveNativeMinor: 0,
+      effectiveMonthlyBurdenNativeMinor: paidNative,
+    };
+  }
+
+  if (occurrenceForMonth && occurrenceForMonth.status === 'skipped') {
+    return {
+      obligationId: ob.id,
+      isDueThisMonth: false,
+      monthsUntilDue: 0,
+      dueThisMonthNativeMinor: 0,
+      monthlyPreserveNativeMinor: 0,
+      effectiveMonthlyBurdenNativeMinor: 0,
+    };
+  }
+
+  const endYm = ob.endDate ? ob.endDate.slice(0, 7) : null;
+  if (endYm && yearMonth > endYm) {
+    return {
+      obligationId: ob.id,
+      isDueThisMonth: false,
+      monthsUntilDue: 0,
+      dueThisMonthNativeMinor: 0,
+      monthlyPreserveNativeMinor: 0,
+      effectiveMonthlyBurdenNativeMinor: 0,
+    };
+  }
+
+  // If the obligation is marked inactive (e.g. archived after its end date or final payment),
+  // keep it active when viewing historical months up to `endYm` so past months still show it.
+  if (!ob.isActive && (!endYm || yearMonth > endYm)) {
     return {
       obligationId: ob.id,
       isDueThisMonth: false,
@@ -88,9 +131,17 @@ export function computeObligationMonthMetrics(
   const dueYm = ob.nextDueDate.slice(0, 7);
   const monthsDiff = diffYearMonths(yearMonth, dueYm);
 
+  // Resolve effective native amount for this period (supporting per-month occurrence override or finalAmountMinor)
+  let effectiveAmountMinor = ob.amountMinor;
+  if (occurrenceForMonth && occurrenceForMonth.status === 'upcoming' && occurrenceForMonth.expectedMinor > 0) {
+    effectiveAmountMinor = occurrenceForMonth.expectedMinor;
+  } else if (endYm && (yearMonth === endYm || dueYm === endYm) && ob.finalAmountMinor != null && ob.finalAmountMinor > 0) {
+    effectiveAmountMinor = ob.finalAmountMinor;
+  }
+
   // Weekly cadence normalized to monthly (52 / 12 = 4.3333 weeks/month)
   if (ob.cadence === 'weekly') {
-    const monthlyEquiv = Math.round((ob.amountMinor * 52) / 12);
+    const monthlyEquiv = Math.round((effectiveAmountMinor * 52) / 12);
     return {
       obligationId: ob.id,
       isDueThisMonth: monthsDiff <= 0,
@@ -107,9 +158,9 @@ export function computeObligationMonthMetrics(
       obligationId: ob.id,
       isDueThisMonth: true,
       monthsUntilDue: 0,
-      dueThisMonthNativeMinor: ob.amountMinor,
+      dueThisMonthNativeMinor: effectiveAmountMinor,
       monthlyPreserveNativeMinor: 0,
-      effectiveMonthlyBurdenNativeMinor: ob.amountMinor,
+      effectiveMonthlyBurdenNativeMinor: effectiveAmountMinor,
     };
   }
 
@@ -127,19 +178,19 @@ export function computeObligationMonthMetrics(
       };
     }
     // Due right now in `yearMonth`: remaining unfunded gap is what hits this month's budget
-    const remainingGap = Math.max(0, ob.amountMinor - ob.preservedMinor);
+    const remainingGap = Math.max(0, effectiveAmountMinor - ob.preservedMinor);
     return {
       obligationId: ob.id,
       isDueThisMonth: monthsDiff === 0,
       monthsUntilDue: 0,
-      dueThisMonthNativeMinor: monthsDiff === 0 ? ob.amountMinor : 0,
+      dueThisMonthNativeMinor: monthsDiff === 0 ? effectiveAmountMinor : 0,
       monthlyPreserveNativeMinor: monthsDiff === 0 ? remainingGap : 0,
       effectiveMonthlyBurdenNativeMinor: monthsDiff === 0 ? remainingGap : 0,
     };
   }
 
   // Future due month (monthsDiff >= 1): Sinking-Fund 'Preserve' slice!
-  const remainingTarget = Math.max(0, ob.amountMinor - ob.preservedMinor);
+  const remainingTarget = Math.max(0, effectiveAmountMinor - ob.preservedMinor);
   const preserveSlice = ob.autoPreserve ? Math.round(remainingTarget / monthsDiff) : 0;
 
   return {
@@ -153,27 +204,79 @@ export function computeObligationMonthMetrics(
 }
 
 /**
+ * Determines whether an obligation should be visible in the active checklist / pot list for `yearMonth`.
+ * - If `endDate` is set and `yearMonth > endDate.slice(0, 7)` (and no payment was recorded in `yearMonth`),
+ *   the obligation has expired/archived and disappears from `yearMonth` and future months,
+ *   while remaining visible when viewing `yearMonth <= endDate.slice(0, 7)`.
+ */
+export function isObligationVisibleInMonth(
+  ob: ObligationRecord,
+  yearMonth: string,
+  metrics: ObligationMonthMetrics,
+  occurrenceForMonth?: PaymentOccurrenceRecord | null
+): boolean {
+  if (occurrenceForMonth?.status === 'paid') return true;
+  if (occurrenceForMonth?.status === 'skipped') return false;
+  const endYm = ob.endDate ? ob.endDate.slice(0, 7) : null;
+  if (endYm && yearMonth > endYm) return false;
+  if (!ob.isActive && (!endYm || yearMonth > endYm)) return false;
+  if (metrics.isDueThisMonth && metrics.dueThisMonthNativeMinor > 0) return true;
+  if (metrics.monthlyPreserveNativeMinor > 0) return true;
+  if (ob.cadence !== 'monthly' && ob.preservedMinor > 0 && ob.isActive) return true;
+  return false;
+}
+
+/**
  * Advances an obligation when the user ticks "[✓] Mark as Paid".
  * Resets `preservedMinor` to 0 and advances `nextDueDate` by the recurrence interval
- * (or marks `isActive = false` if `cadence === 'once'`).
+ * (or marks `isActive = false` if `cadence === 'once'`, `endDate` reached, or `remainingPayments <= 1`).
  */
-export function applyObligationPaymentReset(ob: ObligationRecord): {
+export function applyObligationPaymentReset(
+  ob: ObligationRecord,
+  paidYearMonth?: string
+): {
   nextDueDate: string;
   preservedMinor: number;
   isActive: boolean;
+  remainingPayments: number | null;
 } {
+  const nextRemaining =
+    ob.remainingPayments != null ? Math.max(0, ob.remainingPayments - 1) : null;
+
   if (ob.cadence === 'once') {
     return {
       nextDueDate: ob.nextDueDate,
       preservedMinor: 0,
       isActive: false,
+      remainingPayments: 0,
     };
   }
+
   const interval = cadenceIntervalMonths(ob.cadence, ob.intervalMonths);
+  const currentDueYm = ob.nextDueDate.slice(0, 7);
+  // Only advance nextDueDate if we aren't recording a backdated payment for an already-passed period
+  const shouldAdvance = !paidYearMonth || currentDueYm <= paidYearMonth;
+  const advancedDate = shouldAdvance ? addMonthsToDate(ob.nextDueDate, interval) : ob.nextDueDate;
+
+  const endYm = ob.endDate ? ob.endDate.slice(0, 7) : null;
+  const reachedEndByDate =
+    Boolean(ob.endDate && (advancedDate > ob.endDate || advancedDate.slice(0, 7) > endYm! || (paidYearMonth && paidYearMonth >= endYm!)));
+  const reachedEndByCount = nextRemaining !== null && nextRemaining <= 0;
+
+  if (reachedEndByDate || reachedEndByCount) {
+    return {
+      nextDueDate: ob.endDate && paidYearMonth && paidYearMonth >= endYm! ? ob.nextDueDate : advancedDate,
+      preservedMinor: 0,
+      isActive: false,
+      remainingPayments: nextRemaining !== null ? 0 : null,
+    };
+  }
+
   return {
-    nextDueDate: addMonthsToDate(ob.nextDueDate, interval),
+    nextDueDate: advancedDate,
     preservedMinor: 0,
     isActive: true,
+    remainingPayments: nextRemaining,
   };
 }
 
@@ -294,6 +397,8 @@ export interface PotRollupNode {
   pot: PotRecord;
   estimateDisplayMinor: number;
   itemizedSpendDisplayMinor: number;
+  postedSpendDisplayMinor: number;
+  pendingSpendDisplayMinor: number;
   scheduledDueDisplayMinor: number;
   preserveSliceDisplayMinor: number;
   /** Direct + children combined projected monthly budget impact (respecting envelopeMode without double counting) */
@@ -315,7 +420,8 @@ export function buildPotRollupTree(
   expenses: ExpenseEntryRecord[],
   yearMonth: string,
   displayCurrency: CurrencyCode,
-  rateMap: Record<CurrencyCode, number>
+  rateMap: Record<CurrencyCode, number>,
+  occurrencesByOb?: Map<string, PaymentOccurrenceRecord>
 ): PotRollupNode[] {
   const potIds = new Set(pots.map((p) => p.id));
   const byId = new Map(pots.map((p) => [p.id, p]));
@@ -346,7 +452,14 @@ export function buildPotRollupTree(
     arr.sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name));
   }
 
-  const monthExpenses = expenses.filter((e) => e.spentDate.slice(0, 7) === yearMonth);
+  const monthExpenses = expenses.filter(
+    (e) =>
+      e.spentDate.slice(0, 7) === yearMonth &&
+      (e.kind ?? 'expense') !== 'transfer' &&
+      (e.flowDirection ?? 'outflow') !== 'inflow' &&
+      (e.status ?? 'posted') !== 'reversed' &&
+      (e.status ?? 'posted') !== 'refunded'
+  );
   const visited = new Set<string>();
 
   const buildNode = (pot: PotRecord): PotRollupNode => {
@@ -354,14 +467,19 @@ export function buildPotRollupTree(
     const childPots = (byParent.get(pot.id) ?? []).filter((c) => !visited.has(c.id));
     const children = childPots.map(buildNode);
 
-    const directExpensesMinor = monthExpenses
-      .filter((e) => e.potId === pot.id)
+    const potExpenses = monthExpenses.filter((e) => e.potId === pot.id);
+    const directPostedMinor = potExpenses
+      .filter((e) => (e.status ?? 'posted') !== 'pending')
       .reduce((sum, e) => sum + convertMinor(e.amountMinor, e.currency, displayCurrency, rateMap), 0);
+    const directPendingMinor = potExpenses
+      .filter((e) => (e.status ?? 'posted') === 'pending')
+      .reduce((sum, e) => sum + convertMinor(e.amountMinor, e.currency, displayCurrency, rateMap), 0);
+    const directExpensesMinor = directPostedMinor + directPendingMinor;
 
     let directScheduledMinor = 0;
     let directPreserveMinor = 0;
     for (const ob of obligations.filter((o) => o.potId === pot.id)) {
-      const m = computeObligationMonthMetrics(ob, yearMonth);
+      const m = computeObligationMonthMetrics(ob, yearMonth, occurrencesByOb?.get(ob.id));
       if (m.isDueThisMonth && ob.cadence === 'monthly') {
         directScheduledMinor += convertMinor(m.dueThisMonthNativeMinor, ob.currency, displayCurrency, rateMap);
       } else if (m.isDueThisMonth) {
@@ -372,11 +490,15 @@ export function buildPotRollupTree(
     }
 
     const childItemized = children.reduce((s, c) => s + c.itemizedSpendDisplayMinor, 0);
+    const childPosted = children.reduce((s, c) => s + c.postedSpendDisplayMinor, 0);
+    const childPending = children.reduce((s, c) => s + c.pendingSpendDisplayMinor, 0);
     const childScheduled = children.reduce((s, c) => s + c.scheduledDueDisplayMinor, 0);
     const childPreserve = children.reduce((s, c) => s + c.preserveSliceDisplayMinor, 0);
     const childEffectiveSum = children.reduce((s, c) => s + c.effectiveTotalDisplayMinor, 0);
 
     const totalItemized = directExpensesMinor + childItemized;
+    const totalPosted = directPostedMinor + childPosted;
+    const totalPending = directPendingMinor + childPending;
     const totalScheduled = directScheduledMinor + childScheduled;
     const totalPreserve = directPreserveMinor + childPreserve;
 
@@ -390,6 +512,8 @@ export function buildPotRollupTree(
       pot,
       estimateDisplayMinor: estimateMinor,
       itemizedSpendDisplayMinor: totalItemized,
+      postedSpendDisplayMinor: totalPosted,
+      pendingSpendDisplayMinor: totalPending,
       scheduledDueDisplayMinor: totalScheduled,
       preserveSliceDisplayMinor: totalPreserve,
       effectiveTotalDisplayMinor: effectiveTotal,

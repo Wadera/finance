@@ -1,6 +1,8 @@
 import {
   AlertTriangle,
+  ArrowLeftRight,
   Building2,
+  Calendar,
   Check,
   CheckCircle2,
   ChevronDown,
@@ -45,6 +47,7 @@ import type {
   PartnerVisibility,
   PotRollupNode,
   SplitMode,
+  TransactionStatus,
   WorkspaceKind,
   WorkspaceRole,
 } from '../shared/types.js';
@@ -58,6 +61,9 @@ import {
   type QuickAddTarget,
   type WealthOverviewResponse,
   apiFetch,
+  createTransferApi,
+  createTransferBatchApi,
+  deleteTransferApi,
   listAttachmentsApi,
 } from './api.js';
 import {
@@ -80,6 +86,13 @@ type ModalKind =
   | { kind: 'pot'; defaultParentId?: string | null }
   | { kind: 'income' }
   | { kind: 'account' }
+  | {
+      kind: 'transfer';
+      mode?: 'single' | 'distribute';
+      defaultSourceAccountId?: string | null;
+      defaultDestAccountId?: string | null;
+      defaultAmountMajor?: number;
+    }
   | { kind: 'asset' }
   | { kind: 'liability' }
   | { kind: 'workspace' };
@@ -141,10 +154,12 @@ function buildAgentBootstrapPrompt(params: {
 \`\`\`
 
 ### 3. Available MCP Tools
-1. **\`list_pots\` / \`create_pot\`:** Inspect or create arbitrary-depth nested pots & sub-pots.
-2. **\`log_expense_receipt\`:** Categorize a receipt with itemized \`items: [{ name, subCategory, amountMajor }]\`.
-3. **\`attach_receipt_base64\`:** Upload receipt image or PDF to the vault.
-4. **\`get_monthly_budget\` / \`list_upcoming_obligations\` / \`mark_obligation_paid\`:** Query monthly budget, sinking-fund reserves, and mark bills paid.`;
+1. **\`list_accounts\` / \`get_account\` / \`set_account_balance_snapshot\`:** Inspect accounts, booked vs available balances, funded reserves, and record non-destructive balance snapshots.
+2. **\`list_transactions\` / \`get_transaction\` / \`upsert_transaction\` / \`delete_transaction\`:** Query ledger, import/correct transactions with \`pending\` / \`posted\` / \`reversed\` / \`refunded\` status, idempotency keys, and delta-only balance updates.
+3. **\`create_transfer\` / \`update_transfer\` / \`delete_transfer\` / \`list_transfers\`:** Atomic inter-account money movements and salary distributions with linked debit & credit legs.
+4. **\`list_upcoming_obligations\` / \`mark_obligation_paid\` / \`update_obligation_schedule\`:** Record obligation payments with bank dates & idempotency keys, or adjust future/final installments.
+5. **\`get_monthly_budget\` / \`reconcile_batch\` / \`reverse_reconciliation_batch\`:** Full budget, account sufficiency, funded vs planned reserves, and dry-run/atomic reconciliation batches.
+6. **\`list_pots\` / \`create_pot\` / \`log_expense_receipt\` / \`attach_receipt_base64\`:** Manage nested pots and attach receipt evidence.`;
 }
 
 export const App: React.FC = () => {
@@ -186,6 +201,15 @@ export const App: React.FC = () => {
   });
 
   const [modal, setModal] = useState<ModalKind>(null);
+  const [transferMode, setTransferMode] = useState<'single' | 'distribute'>('single');
+  const [transferSourceId, setTransferSourceId] = useState<string>('');
+  const [transferDestId, setTransferDestId] = useState<string>('');
+  const [transferAmountMajor, setTransferAmountMajor] = useState<string>('');
+  const [transferBatchMap, setTransferBatchMap] = useState<Record<string, string>>({});
+  const [transferDate, setTransferDate] = useState<string>(() => new Date().toISOString().slice(0, 10));
+  const [transferTime, setTransferTime] = useState<string>(() => new Date().toISOString().slice(11, 16) || '12:00');
+  const [transferDesc, setTransferDesc] = useState<string>('');
+  const [transferRef, setTransferRef] = useState<string>('');
   const [drawer, setDrawer] = useState<DrawerSubject | null>(null);
   const [drawerAttachments, setDrawerAttachments] = useState<AttachmentRecord[]>([]);
   const [drawerSavedMsg, setDrawerSavedMsg] = useState<string | null>(null);
@@ -198,6 +222,8 @@ export const App: React.FC = () => {
   const [checklistPaidFolded, setChecklistPaidFolded] = useState<boolean>(true);
   const [highlightedObId, setHighlightedObId] = useState<string | null>(null);
   const [horizonMenuOpen, setHorizonMenuOpen] = useState<boolean>(false);
+  const [calendarOpen, setCalendarOpen] = useState<boolean>(false);
+  const [calendarYear, setCalendarYear] = useState<number>(() => Number(new Date().toISOString().slice(0, 4)) || 2026);
 
   const scrollToChecklistObligation = useCallback((obId: string | null) => {
     const targetEl =
@@ -328,7 +354,8 @@ export const App: React.FC = () => {
     const sourceExps = budget.allExpenses ?? budget.expenses;
     const obsByPot = new Map<string, EnrichedObligation[]>();
     for (const ob of sourceObs) {
-      if (!ob.isActive || !ob.potId) continue;
+      if (!ob.potId) continue;
+      if (ob.effectiveDisplayMinor <= 0 && !ob.isPaidThisMonth && ob.preservedDisplayMinor <= 0) continue;
       const list = obsByPot.get(ob.potId) ?? [];
       list.push(ob);
       obsByPot.set(ob.potId, list);
@@ -336,10 +363,33 @@ export const App: React.FC = () => {
     const expsByPot = new Map<string, EnrichedExpense[]>();
     for (const exp of sourceExps) {
       if (!exp.potId) continue;
+      if (exp.flowDirection === 'inflow' || (exp.kind ?? 'expense') === 'transfer') continue;
+      if ((exp.status ?? 'posted') === 'reversed' || (exp.status ?? 'posted') === 'refunded') continue;
       const list = expsByPot.get(exp.potId) ?? [];
       list.push(exp);
       expsByPot.set(exp.potId, list);
     }
+
+    const sumPotSubtreeStatus = (
+      n: PotRollupNode
+    ): { spentPaidMinor: number; plannedUpcomingMinor: number } => {
+      let spentPaidMinor = 0;
+      let plannedUpcomingMinor = n.unallocatedEnvelopeDisplayMinor;
+      for (const exp of expsByPot.get(n.pot.id) ?? []) {
+        if ((exp.status ?? 'posted') === 'pending') plannedUpcomingMinor += exp.displayAmountMinor;
+        else spentPaidMinor += exp.displayAmountMinor;
+      }
+      for (const ob of obsByPot.get(n.pot.id) ?? []) {
+        if (ob.isPaidThisMonth) spentPaidMinor += ob.effectiveDisplayMinor;
+        else plannedUpcomingMinor += ob.effectiveDisplayMinor;
+      }
+      for (const ch of n.children) {
+        const sub = sumPotSubtreeStatus(ch);
+        spentPaidMinor += sub.spentPaidMinor;
+        plannedUpcomingMinor += sub.plannedUpcomingMinor;
+      }
+      return { spentPaidMinor, plannedUpcomingMinor };
+    };
 
     const out: Array<{
       node: PotRollupNode;
@@ -348,6 +398,8 @@ export const App: React.FC = () => {
       directExps: EnrichedExpense[];
       hasChildren: boolean;
       isCollapsed: boolean;
+      spentPaidMinor: number;
+      plannedUpcomingMinor: number;
     }> = [];
 
     const walk = (nodes: PotRollupNode[], depth: number) => {
@@ -356,7 +408,17 @@ export const App: React.FC = () => {
         const directExps = expsByPot.get(n.pot.id) ?? [];
         const hasChildren = n.children.length > 0 || directObs.length > 0 || directExps.length > 0;
         const isCollapsed = collapsedTreePots.has(n.pot.id);
-        out.push({ node: n, depth, directObs, directExps, hasChildren, isCollapsed });
+        const { spentPaidMinor, plannedUpcomingMinor } = sumPotSubtreeStatus(n);
+        out.push({
+          node: n,
+          depth,
+          directObs,
+          directExps,
+          hasChildren,
+          isCollapsed,
+          spentPaidMinor,
+          plannedUpcomingMinor,
+        });
         if (!isCollapsed) {
           walk(n.children, depth + 1);
         }
@@ -542,6 +604,43 @@ export const App: React.FC = () => {
     allAvailableAccounts[0]?.id ||
     '';
 
+  const openTransferModal = (opts?: {
+    mode?: 'single' | 'distribute';
+    defaultSourceAccountId?: string | null;
+    defaultDestAccountId?: string | null;
+    defaultAmountMajor?: number;
+    defaultDescription?: string;
+  }) => {
+    const salaryAccId =
+      opts?.defaultSourceAccountId ||
+      budget.allIncomes.find((i) => i.isActive && i.accountId)?.accountId ||
+      allAvailableAccounts.find((a) => a.name.toLowerCase().includes('salary') || a.name.toLowerCase().includes('classic'))?.id ||
+      allAvailableAccounts[0]?.id ||
+      '';
+    const destAccId =
+      opts?.defaultDestAccountId ||
+      allAvailableAccounts.find((a) => a.id !== salaryAccId)?.id ||
+      '';
+    setTransferMode(opts?.mode || 'single');
+    setTransferSourceId(salaryAccId);
+    setTransferDestId(destAccId);
+    setTransferAmountMajor(
+      opts?.defaultAmountMajor && opts.defaultAmountMajor > 0 ? opts.defaultAmountMajor.toFixed(2) : ''
+    );
+    setTransferBatchMap({});
+    setTransferDate(new Date().toISOString().slice(0, 10));
+    setTransferTime(new Date().toISOString().slice(11, 16) || '12:00');
+    setTransferDesc(opts?.defaultDescription || '');
+    setTransferRef('');
+    setModal({
+      kind: 'transfer',
+      mode: opts?.mode || 'single',
+      defaultSourceAccountId: salaryAccId,
+      defaultDestAccountId: destAccId,
+      defaultAmountMajor: opts?.defaultAmountMajor,
+    });
+  };
+
   const openEntityDrawer = (
     entityType: DrawerSubject['entityType'],
     entityId: string
@@ -708,7 +807,25 @@ export const App: React.FC = () => {
                   >
                     <ChevronLeft className="w-3.5 h-3.5" />
                   </button>
-                  <span className="px-1 font-medium text-slate-800 whitespace-nowrap">{yearMonth}</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const curY = Number(yearMonth.slice(0, 4)) || new Date().getFullYear();
+                      setCalendarYear(curY);
+                      setCalendarOpen((prev) => !prev);
+                      setHorizonMenuOpen(false);
+                      setQuickMenuOpen(false);
+                    }}
+                    className={`inline-flex items-center gap-1 px-1.5 py-1 rounded font-medium whitespace-nowrap transition ${
+                      calendarOpen
+                        ? 'bg-teal-50 text-teal-900 ring-1 ring-teal-600/30'
+                        : 'text-slate-800 hover:bg-slate-100'
+                    }`}
+                    title={locale === 'pl' ? 'Kliknij, aby wybrać miesiąc i rok' : 'Click to pick month & year'}
+                  >
+                    <Calendar className="w-3 h-3 text-teal-700 shrink-0" />
+                    <span>{yearMonth}</span>
+                  </button>
                   <button
                     type="button"
                     onClick={() => setYearMonth((ym) => shiftMonth(ym, 1))}
@@ -719,11 +836,125 @@ export const App: React.FC = () => {
                   </button>
                 </div>
 
+                {/* Month & Year Quick Calendar Popover */}
+                {calendarOpen && (
+                  <>
+                    <div
+                      className="fixed inset-0 z-20"
+                      onClick={() => setCalendarOpen(false)}
+                    />
+                    <div className="absolute left-0 sm:left-auto sm:right-0 top-full mt-1.5 z-30 w-64 bg-white border border-slate-200 rounded-xl shadow-xl p-3 space-y-2.5 text-xs">
+                      {/* Year Selector Bar */}
+                      <div className="flex items-center justify-between gap-1 pb-1.5 border-b border-slate-100">
+                        <button
+                          type="button"
+                          onClick={() => setCalendarYear((y) => y - 1)}
+                          className="p-1 rounded border border-slate-200 text-slate-600 hover:bg-slate-100 hover:text-slate-900 transition"
+                          title={locale === 'pl' ? 'Poprzedni rok' : 'Previous year'}
+                        >
+                          <ChevronLeft className="w-3.5 h-3.5" />
+                        </button>
+                        <div className="font-mono-num text-sm font-bold text-slate-900">
+                          {calendarYear}
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setCalendarYear((y) => y + 1)}
+                          className="p-1 rounded border border-slate-200 text-slate-600 hover:bg-slate-100 hover:text-slate-900 transition"
+                          title={locale === 'pl' ? 'Następny rok' : 'Next year'}
+                        >
+                          <ChevronRight className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+
+                      {/* Quick Year Pills */}
+                      <div className="grid grid-cols-5 gap-1">
+                        {[-2, -1, 0, 1, 2].map((offset) => {
+                          const yVal = calendarYear + offset;
+                          const isSelectedY = yVal === calendarYear;
+                          return (
+                            <button
+                              key={yVal}
+                              type="button"
+                              onClick={() => setCalendarYear(yVal)}
+                              className={`py-1 rounded text-[10.5px] font-mono-num transition ${
+                                isSelectedY
+                                  ? 'bg-slate-900 text-white font-semibold'
+                                  : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                              }`}
+                            >
+                              {yVal}
+                            </button>
+                          );
+                        })}
+                      </div>
+
+                      {/* 12-Month Grid (Jan - Dec) */}
+                      <div className="grid grid-cols-3 gap-1.5 pt-0.5">
+                        {(locale === 'pl'
+                          ? ['Sty', 'Lut', 'Mar', 'Kwi', 'Maj', 'Cze', 'Lip', 'Sie', 'Wrz', 'Paź', 'Lis', 'Gru']
+                          : ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+                        ).map((mLabel, idx) => {
+                          const mm = String(idx + 1).padStart(2, '0');
+                          const candidateYm = `${calendarYear}-${mm}`;
+                          const isSelectedYm = candidateYm === yearMonth;
+                          const todayYm = new Date().toISOString().slice(0, 7);
+                          const isTodayYm = candidateYm === todayYm;
+                          return (
+                            <button
+                              key={mm}
+                              type="button"
+                              onClick={() => {
+                                setYearMonth(candidateYm);
+                                setCalendarOpen(false);
+                              }}
+                              className={`relative py-2 px-2 rounded-md font-mono-num text-xs transition flex flex-col items-center justify-center ${
+                                isSelectedYm
+                                  ? 'bg-teal-700 text-white font-semibold shadow-xs'
+                                  : isTodayYm
+                                  ? 'bg-teal-50/80 text-teal-900 border border-teal-400 font-semibold hover:bg-teal-100'
+                                  : 'bg-[#FAF9F6] text-slate-700 border border-slate-200/70 hover:bg-slate-100 hover:border-slate-300'
+                              }`}
+                            >
+                              <span>{mLabel}</span>
+                              <span
+                                className={`text-[9px] ${
+                                  isSelectedYm ? 'text-teal-100' : 'text-slate-400'
+                                }`}
+                              >
+                                {mm}
+                              </span>
+                            </button>
+                          );
+                        })}
+                      </div>
+
+                      {/* Footer: Jump to Current Month */}
+                      <div className="pt-1.5 border-t border-slate-100 flex items-center justify-between gap-2">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const nowYm = new Date().toISOString().slice(0, 7);
+                            setYearMonth(nowYm);
+                            setCalendarYear(Number(nowYm.slice(0, 4)));
+                            setCalendarOpen(false);
+                          }}
+                          className="w-full py-1.5 px-2.5 rounded-md bg-teal-50 border border-teal-200 text-teal-900 font-medium hover:bg-teal-100 transition text-center"
+                        >
+                          {locale === 'pl' ? 'Dzisiaj / Bieżący miesiąc' : 'Jump to Current Month'} (
+                          {new Date().toISOString().slice(0, 7)})
+                        </button>
+                      </div>
+                    </div>
+                  </>
+                )}
+
                 {/* Foldable Period Selector Button (Unfolds 1M / 3M / 6M / 12M / 5Y / 10Y on click) */}
                 <button
                   type="button"
                   onClick={() => {
                     setHorizonMenuOpen((prev) => !prev);
+                    setCalendarOpen(false);
                     setQuickMenuOpen(false);
                   }}
                   title={t.zoomLabel}
@@ -1151,6 +1382,13 @@ export const App: React.FC = () => {
                   </button>
                   <button
                     type="button"
+                    onClick={() => openTransferModal({ mode: 'single' })}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded border border-teal-700 bg-teal-700 text-white text-[11px] font-medium hover:bg-teal-800 transition"
+                  >
+                    <ArrowLeftRight className="w-3 h-3" /> {t.moveMoneyBtn}
+                  </button>
+                  <button
+                    type="button"
                     onClick={() => setModal({ kind: 'account' })}
                     className="inline-flex items-center gap-1 px-2 py-1 rounded border border-slate-200 bg-white text-[11px] font-medium text-slate-700 hover:bg-slate-50"
                   >
@@ -1357,6 +1595,8 @@ export const App: React.FC = () => {
                 expandedExpenseIds={sankeyExpandedExps}
                 onTogglePot={handleToggleSankeyPot}
                 onToggleExpense={handleToggleSankeyExpense}
+                onSetExpandedPots={setSankeyExpandedPots}
+                onSetExpandedExpenses={setSankeyExpandedExps}
                 onQuickAdd={(target) => setQuickAddTarget(target)}
                 onInspectItem={(kind, id) => openEntityDrawer(kind, id)}
                 t={t}
@@ -1566,6 +1806,13 @@ export const App: React.FC = () => {
                     className="inline-flex items-center gap-1 px-2.5 py-1 rounded border border-slate-200 bg-[#FAF9F6] text-[11px] font-medium text-slate-700 hover:bg-slate-100"
                   >
                     {accountsFolded ? 'Open Accounts & Reserves' : 'Fold Accounts'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => openTransferModal({ mode: 'single' })}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded border border-teal-700 bg-teal-700 text-white text-[11px] font-medium hover:bg-teal-800 transition"
+                  >
+                    <ArrowLeftRight className="w-3 h-3" /> {t.moveMoneyBtn}
                   </button>
                   <button
                     type="button"
@@ -1847,21 +2094,38 @@ export const App: React.FC = () => {
                           <div className="flex flex-wrap items-center justify-between gap-2 pt-1.5 border-t border-black/5 text-[10px]">
                             <div className="flex flex-wrap items-center gap-1.5 font-mono-num">
                               {adv.kind === 'transfer_warning' && (
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    const firstShortfallOb = budget.obligations.find(
-                                      (o) =>
-                                        !o.isPaidThisMonth &&
-                                        o.metrics.isDueThisMonth &&
-                                        (!adv.accountId || o.accountId === adv.accountId)
-                                    );
-                                    scrollToChecklistObligation(firstShortfallOb?.id ?? null);
-                                  }}
-                                  className="px-2 py-0.5 rounded bg-rose-700 text-white font-semibold hover:bg-rose-800 transition"
-                                >
-                                  ↓ Scroll to Red Uncovered Payments
-                                </button>
+                                <>
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      openTransferModal({
+                                        mode: 'single',
+                                        defaultSourceAccountId: adv.sourceAccountId || undefined,
+                                        defaultDestAccountId: adv.accountId || undefined,
+                                        defaultAmountMajor: Math.ceil(adv.amountDisplayMinor) / 100,
+                                        defaultDescription: `Pre-payday top-up to ${adv.accountName || 'account'}`,
+                                      })
+                                    }
+                                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-teal-800 text-white font-semibold hover:bg-teal-900 transition"
+                                  >
+                                    <ArrowLeftRight className="w-2.5 h-2.5" /> Move Funds Now
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      const firstShortfallOb = budget.obligations.find(
+                                        (o) =>
+                                          !o.isPaidThisMonth &&
+                                          o.metrics.isDueThisMonth &&
+                                          (!adv.accountId || o.accountId === adv.accountId)
+                                      );
+                                      scrollToChecklistObligation(firstShortfallOb?.id ?? null);
+                                    }}
+                                    className="px-2 py-0.5 rounded bg-rose-700 text-white font-semibold hover:bg-rose-800 transition"
+                                  >
+                                    ↓ Scroll to Red Uncovered Payments
+                                  </button>
+                                </>
                               )}
                               {adv.accountName && (
                                 <button
@@ -2352,6 +2616,13 @@ export const App: React.FC = () => {
 
                     <DailyRunwayChart
                       curve={budget.runway.dailyCurve}
+                      openingBalanceMinor={budget.runway.openingBalanceMinor}
+                      unallocatedAfterNextMonthMinor={
+                        timelineAccountId === 'all' ? budget.runway.projectedAfterNextMonthReserveMinor : undefined
+                      }
+                      nextMonthReserveMinor={
+                        timelineAccountId === 'all' ? budget.cashflowBridge.nextMonthPreSalaryMinor : undefined
+                      }
                       currency={cur}
                       privacyMode={privacyMode}
                       t={t}
@@ -2886,7 +3157,7 @@ export const App: React.FC = () => {
                 </div>
 
                 <div className="divide-y divide-slate-100 max-h-[540px] overflow-y-auto">
-                  {visiblePotTreeRows.map(({ node, depth, directObs, directExps, hasChildren, isCollapsed }) => (
+                  {visiblePotTreeRows.map(({ node, depth, directObs, directExps, hasChildren, isCollapsed, spentPaidMinor, plannedUpcomingMinor }) => (
                     <React.Fragment key={node.pot.id}>
                       {/* Pot Row */}
                       <div
@@ -2955,6 +3226,19 @@ export const App: React.FC = () => {
 
                         <div className="text-right font-mono-num shrink-0 pl-2">
                           <div className="font-semibold text-slate-900">{fmt(node.effectiveTotalDisplayMinor)}</div>
+                          {(spentPaidMinor > 0 || plannedUpcomingMinor > 0) && (
+                            <div className="flex items-center justify-end gap-1.5 text-[10px] mt-0.5">
+                              {spentPaidMinor > 0 && (
+                                <span className="text-emerald-700 font-medium">✓ {fmt(spentPaidMinor)} spent</span>
+                              )}
+                              {spentPaidMinor > 0 && plannedUpcomingMinor > 0 && (
+                                <span className="text-slate-300">·</span>
+                              )}
+                              {plannedUpcomingMinor > 0 && (
+                                <span className="text-amber-700 font-medium">⏳ {fmt(plannedUpcomingMinor)} planned</span>
+                              )}
+                            </div>
+                          )}
                           {node.pot.envelopeMode && node.unallocatedEnvelopeDisplayMinor > 0 && (
                             <div className="text-[10px] text-slate-400">
                               {fmt(node.itemizedSpendDisplayMinor)} {t.loggedLabel} ·{' '}
@@ -2966,58 +3250,89 @@ export const App: React.FC = () => {
 
                       {/* Direct Leaf Obligations & Expenses inside this Pot (clicking '+' promotes item into a Pot!) */}
                       {!isCollapsed &&
-                        directObs.map((ob) => (
-                          <div
-                            key={ob.id}
-                            className="px-4 py-1.5 flex items-center justify-between text-[11px] bg-[#FAF9F6]/60 hover:bg-slate-50 group"
-                          >
+                        directObs.map((ob) => {
+                          const dueIso = ob.metrics.isDueThisMonth
+                            ? `${yearMonth}-${String(Math.max(1, Math.min(31, ob.dueDay || 1))).padStart(2, '0')}`
+                            : ob.nextDueDate;
+                          const paidDate = (ob.occurrence?.bankDate || ob.occurrence?.paidAt || '').slice(0, 10);
+                          return (
                             <div
-                              className="flex items-center gap-1.5 min-w-0"
-                              style={{ paddingLeft: `${(depth + 1) * 18 + 14}px` }}
+                              key={ob.id}
+                              className="px-4 py-1.5 flex items-center justify-between text-[11px] bg-[#FAF9F6]/60 hover:bg-slate-50 group"
                             >
-                              <span className="w-1.5 h-1.5 rounded-full bg-slate-400 shrink-0" />
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  setDrawer({
-                                    entityType: 'obligation',
-                                    entityId: ob.id,
-                                    workspaceId: ob.workspaceId,
-                                    title: ob.name,
-                                    subtitle: `${ob.cadence} · ${t.dueLabel} ${ob.nextDueDate}`,
-                                    manageUrl: ob.manageUrl,
-                                    portalUrl: ob.portalUrl,
-                                    referenceNumber: ob.referenceNumber,
-                                    notes: ob.notes,
-                                    currency: ob.currency,
-                                  })
-                                }
-                                className="text-slate-700 hover:underline truncate text-left"
+                              <div
+                                className="flex items-center gap-1.5 min-w-0"
+                                style={{ paddingLeft: `${(depth + 1) * 18 + 14}px` }}
                               >
-                                {ob.name}
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  setQuickAddTarget({
-                                    targetKind: 'obligation',
-                                    itemId: ob.id,
-                                    itemName: ob.name,
-                                    workspaceId: ob.workspaceId,
-                                    parentPotId: ob.potId,
-                                    amountMinor: ob.amountMinor,
-                                    currency: ob.currency,
-                                  })
-                                }
-                                title={t.qaTooltipPromote}
-                                className="inline-flex items-center justify-center w-4 h-4 rounded border border-slate-300 bg-white text-slate-500 hover:bg-teal-700 hover:text-white hover:border-teal-700 transition"
+                                <span
+                                  className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                                    ob.isPaidThisMonth ? 'bg-emerald-600' : 'bg-amber-500'
+                                  }`}
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setDrawer({
+                                      entityType: 'obligation',
+                                      entityId: ob.id,
+                                      workspaceId: ob.workspaceId,
+                                      title: ob.name,
+                                      subtitle: `${ob.cadence} · ${t.dueLabel} ${ob.nextDueDate}`,
+                                      manageUrl: ob.manageUrl,
+                                      portalUrl: ob.portalUrl,
+                                      referenceNumber: ob.referenceNumber,
+                                      notes: ob.notes,
+                                      currency: ob.currency,
+                                    })
+                                  }
+                                  className={`hover:underline truncate text-left ${
+                                    ob.isPaidThisMonth ? 'text-slate-600' : 'text-slate-900 font-medium'
+                                  }`}
+                                >
+                                  {ob.name}
+                                </button>
+                                <span
+                                  className={`text-[9.5px] font-mono-num px-1.5 py-0.2 rounded border shrink-0 ${
+                                    ob.isPaidThisMonth
+                                      ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                                      : 'bg-amber-50 text-amber-800 border-amber-300 font-medium'
+                                  }`}
+                                >
+                                  {ob.isPaidThisMonth
+                                    ? `✓ Paid${paidDate ? ` ${paidDate}` : ''}`
+                                    : ob.metrics.isDueThisMonth
+                                      ? `⏳ Due ${dueIso}`
+                                      : `⏳ Preserve · ${ob.nextDueDate}`}
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setQuickAddTarget({
+                                      targetKind: 'obligation',
+                                      itemId: ob.id,
+                                      itemName: ob.name,
+                                      workspaceId: ob.workspaceId,
+                                      parentPotId: ob.potId,
+                                      amountMinor: ob.amountMinor,
+                                      currency: ob.currency,
+                                    })
+                                  }
+                                  title={t.qaTooltipPromote}
+                                  className="inline-flex items-center justify-center w-4 h-4 rounded border border-slate-300 bg-white text-slate-500 hover:bg-teal-700 hover:text-white hover:border-teal-700 transition"
+                                >
+                                  <Plus className="w-2.5 h-2.5 stroke-[2.5]" />
+                                </button>
+                              </div>
+                              <span
+                                className={`font-mono-num ${
+                                  ob.isPaidThisMonth ? 'text-emerald-800 font-medium' : 'text-amber-900 font-semibold'
+                                }`}
                               >
-                                <Plus className="w-2.5 h-2.5 stroke-[2.5]" />
-                              </button>
+                                {fmt(ob.effectiveDisplayMinor)}
+                              </span>
                             </div>
-                            <span className="font-mono-num text-slate-600">{fmt(ob.effectiveDisplayMinor)}</span>
-                          </div>
-                        ))}
+                          );
+                        })}
 
                       {!isCollapsed &&
                         directExps.map((exp) => (
@@ -3146,43 +3461,89 @@ export const App: React.FC = () => {
 
                   {budget.obligations
                     .filter((o) => !activeSubtreePotIds || (o.potId && activeSubtreePotIds.has(o.potId)))
-                    .map((ob) => (
-                      <div
-                        key={ob.id}
-                        onClick={() =>
-                          setDrawer({
-                            entityType: 'obligation',
-                            entityId: ob.id,
-                            workspaceId: ob.workspaceId,
-                            title: ob.name,
-                            subtitle: `${ob.cadence} · ${t.dueLabel} ${ob.nextDueDate}`,
-                            manageUrl: ob.manageUrl,
-                            portalUrl: ob.portalUrl,
-                            referenceNumber: ob.referenceNumber,
-                            notes: ob.notes,
-                            currency: ob.currency,
-                          })
-                        }
-                        className="px-4 py-3 flex items-center justify-between hover:bg-slate-50 cursor-pointer"
-                      >
-                        <div>
-                          <div className="flex items-center gap-2 text-xs font-medium text-slate-900">
-                            <span>{ob.name}</span>
-                            {ob.manageUrl && (
-                              <span className="text-[10px] px-1.5 py-0.5 rounded bg-teal-50 text-teal-800 font-mono-num">
-                                {t.portalLinkBadge}
-                              </span>
-                            )}
+                    .map((ob) => {
+                      const dueIso = ob.metrics.isDueThisMonth
+                        ? `${yearMonth}-${String(Math.max(1, Math.min(31, ob.dueDay || 1))).padStart(2, '0')}`
+                        : ob.nextDueDate;
+                      const paidDate = (ob.occurrence?.bankDate || ob.occurrence?.paidAt || '').slice(0, 10);
+                      return (
+                        <div
+                          key={ob.id}
+                          onClick={() =>
+                            setDrawer({
+                              entityType: 'obligation',
+                              entityId: ob.id,
+                              workspaceId: ob.workspaceId,
+                              title: ob.name,
+                              subtitle: `${ob.cadence} · ${t.dueLabel} ${ob.nextDueDate}`,
+                              manageUrl: ob.manageUrl,
+                              portalUrl: ob.portalUrl,
+                              referenceNumber: ob.referenceNumber,
+                              notes: ob.notes,
+                              currency: ob.currency,
+                            })
+                          }
+                          className={`px-4 py-3 flex items-center justify-between hover:bg-slate-50 cursor-pointer ${
+                            ob.isPaidThisMonth ? 'bg-emerald-50/15' : ''
+                          }`}
+                        >
+                          <div className="flex items-start gap-2.5 min-w-0">
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void handleTogglePaid(ob);
+                              }}
+                              className="mt-0.5 text-slate-400 hover:text-teal-700 shrink-0"
+                              title={ob.isPaidThisMonth ? t.markUnpaid : t.markPaid}
+                            >
+                              {ob.isPaidThisMonth ? (
+                                <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                              ) : (
+                                <Circle className="w-4 h-4 text-amber-600" />
+                              )}
+                            </button>
+                            <div className="min-w-0">
+                              <div className="flex flex-wrap items-center gap-1.5 text-xs font-medium text-slate-900">
+                                <span className={ob.isPaidThisMonth ? 'line-through text-slate-500' : ''}>
+                                  {ob.name}
+                                </span>
+                                <span
+                                  className={`text-[10px] px-1.5 py-0.5 rounded border font-mono-num ${
+                                    ob.isPaidThisMonth
+                                      ? 'bg-emerald-50 text-emerald-800 border-emerald-200 font-semibold'
+                                      : 'bg-amber-50 text-amber-800 border-amber-300 font-semibold'
+                                  }`}
+                                >
+                                  {ob.isPaidThisMonth
+                                    ? `✓ Paid${paidDate ? ` ${paidDate}` : ''}`
+                                    : ob.metrics.isDueThisMonth
+                                      ? `⏳ Planned · Due ${dueIso}`
+                                      : `⏳ Preserve · Due ${ob.nextDueDate}`}
+                                </span>
+                                {ob.manageUrl && (
+                                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-teal-50 text-teal-800 font-mono-num">
+                                    {t.portalLinkBadge}
+                                  </span>
+                                )}
+                              </div>
+                              <div className="text-[11px] text-slate-500 font-mono-num mt-0.5">
+                                {ob.cadence} · {t.dueLabel} {dueIso}
+                                {ob.accountName ? ` · 🏦 ${ob.accountName}` : ''}
+                              </div>
+                            </div>
                           </div>
-                          <div className="text-[11px] text-slate-500 font-mono-num">
-                            {ob.cadence} · {t.dueLabel} {ob.nextDueDate}
+                          <div
+                            className={`font-mono-num text-xs font-semibold shrink-0 pl-2 ${
+                              ob.isPaidThisMonth ? 'text-emerald-800' : 'text-amber-900'
+                            }`}
+                          >
+                            {fmt(ob.effectiveDisplayMinor)}/mo
                           </div>
                         </div>
-                        <div className="font-mono-num text-xs font-semibold text-slate-700">
-                          {fmt(ob.effectiveDisplayMinor)}/mo
-                        </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                 </div>
               </section>
             </div>
@@ -4252,6 +4613,11 @@ export const App: React.FC = () => {
                           portalUrl: nextPortalUrl,
                           referenceNumber: nextRef,
                           notes: nextNotes,
+                          endDate: String(fd.get('endDate') || '').trim() || null,
+                          finalAmountMinor:
+                            fd.get('finalAmountMajor') && String(fd.get('finalAmountMajor')).trim() !== ''
+                              ? Math.round(Number(fd.get('finalAmountMajor')) * 100)
+                              : null,
                           isActive: true,
                           ...(ob.isPaidThisMonth && occDt
                             ? {
@@ -4431,6 +4797,28 @@ export const App: React.FC = () => {
                         />
                       </label>
                     </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Final / End Date (optional)</span>
+                        <input
+                          type="date"
+                          name="endDate"
+                          defaultValue={ob.endDate || ''}
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
+                        />
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-slate-600">Final Payment Amount (optional)</span>
+                        <input
+                          type="number"
+                          step="0.01"
+                          name="finalAmountMajor"
+                          defaultValue={ob.finalAmountMinor != null ? (ob.finalAmountMinor / 100).toFixed(2) : ''}
+                          placeholder="e.g. 75.25"
+                          className="w-full border border-slate-200 bg-white rounded px-2 py-1.5 font-mono-num"
+                        />
+                      </label>
+                    </div>
                     {ob.isPaidThisMonth && (
                       <label className="block space-y-1">
                         <span className="text-emerald-800 font-medium">{t.completedTimestampLabel}</span>
@@ -4525,6 +4913,7 @@ export const App: React.FC = () => {
                           accountId: fd.get('accountId') || null,
                           liabilityId: fd.get('liabilityId') || null,
                           flowDirection: fd.get('flowDirection') || 'outflow',
+                          status: (fd.get('status') || exp.status || 'posted') as TransactionStatus,
                           merchant: nextMerchant,
                           description: nextDesc,
                           amountMinor: Math.round(Number(fd.get('amountMajor') || 0) * 100),
@@ -4622,6 +5011,19 @@ export const App: React.FC = () => {
                         </select>
                       </label>
                     </div>
+                    <label className="block space-y-1">
+                      <span className="text-slate-600">{t.txStatusLabel}</span>
+                      <select
+                        name="status"
+                        defaultValue={exp.status || 'posted'}
+                        className="w-full border border-slate-200 bg-white rounded px-2 py-1.5"
+                      >
+                        <option value="posted">{t.txStatusPosted}</option>
+                        <option value="pending">{t.txStatusPending}</option>
+                        <option value="reversed">{t.txStatusReversed}</option>
+                        <option value="refunded">{t.txStatusRefunded}</option>
+                      </select>
+                    </label>
                     <label className="block space-y-1">
                       <span className="text-slate-600">{t.linkedLiabilityLabel}</span>
                       <select
@@ -5029,30 +5431,87 @@ export const App: React.FC = () => {
                 const acc = allAvailableAccounts.find((a) => a.id === drawer.entityId);
                 if (!acc) return null;
                 const analytics = (budget.accountAnalytics || []).find((a) => a.accountId === acc.id);
+                const accountTransfers = (budget.transfers || []).filter(
+                  (tr) => tr.fromAccountId === acc.id || tr.toAccountId === acc.id
+                );
 
                 return (
                   <div className="space-y-3">
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setDrawer(null);
+                          openTransferModal({ mode: 'single', defaultSourceAccountId: acc.id });
+                        }}
+                        className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded bg-teal-700 text-white text-xs font-medium hover:bg-teal-800 transition"
+                      >
+                        <ArrowLeftRight className="w-3.5 h-3.5" /> Transfer From Here
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setDrawer(null);
+                          openTransferModal({ mode: 'single', defaultDestAccountId: acc.id });
+                        }}
+                        className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded border border-teal-700 bg-teal-50 text-teal-900 text-xs font-medium hover:bg-teal-100 transition"
+                      >
+                        <ArrowLeftRight className="w-3.5 h-3.5" /> Top Up This Account
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setDrawer(null);
+                          openTransferModal({ mode: 'distribute', defaultSourceAccountId: acc.id });
+                        }}
+                        className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded border border-slate-300 bg-white text-slate-800 text-xs font-medium hover:bg-slate-100 transition"
+                      >
+                        {t.salaryDistTab}
+                      </button>
+                    </div>
+
                     {analytics &&
                       (analytics.lockedPreserveDisplayMinor > 0 ||
                         analytics.unpaidPrePaydayDisplayMinor > 0 ||
-                        analytics.pocketMoneyTargetMinor > 0) && (
+                        analytics.pocketMoneyTargetMinor > 0 ||
+                        (analytics.pendingDebitMinor ?? 0) > 0) && (
                         <div className="p-3 rounded-lg border border-amber-200 bg-amber-50/60 space-y-2 text-xs font-mono-num">
                           <div className="text-[11px] uppercase tracking-wider font-semibold text-amber-950 flex items-center gap-1.5">
                             <PiggyBank className="w-3.5 h-3.5 text-amber-700" /> Account Balance & Earmarked Reserves Breakdown
                           </div>
                           <div className="space-y-1">
                             <div className="flex justify-between text-slate-700">
-                              <span>Total Sitting on Account:</span>
+                              <span>Available Balance on Account:</span>
                               <span className="font-semibold">
                                 {formatDisplayValue(acc.balanceMinor, { currency: acc.currency, privacyMode })}
                               </span>
                             </div>
+                            {analytics.bookedBalanceMinor != null && analytics.bookedBalanceMinor !== acc.balanceMinor && (
+                              <div className="flex justify-between text-slate-500">
+                                <span>Booked (Ledger) Balance:</span>
+                                <span>
+                                  {formatDisplayValue(analytics.bookedBalanceMinor, { currency: acc.currency, privacyMode })}
+                                </span>
+                              </div>
+                            )}
                             {analytics.lockedPreserveDisplayMinor > 0 && (
                               <>
                                 <div className="flex justify-between text-amber-900">
-                                  <span>🔒 Earmarked for Upcoming Annual Payments:</span>
+                                  <span>🔒 Planned Annual Reserves:</span>
                                   <span className="font-semibold">-{fmt(analytics.lockedPreserveDisplayMinor)}</span>
                                 </div>
+                                {analytics.fundedPreserveDisplayMinor != null && (
+                                  <div className="flex justify-between text-teal-900">
+                                    <span>✓ Actually Funded Reserves:</span>
+                                    <span className="font-semibold">{fmt(analytics.fundedPreserveDisplayMinor)}</span>
+                                  </div>
+                                )}
+                                {analytics.unfundedPreserveShortfallDisplayMinor > 0 && (
+                                  <div className="flex justify-between text-rose-700 font-semibold">
+                                    <span>⚠ Reserve Shortfall (Underfunded):</span>
+                                    <span>-{fmt(analytics.unfundedPreserveShortfallDisplayMinor)}</span>
+                                  </div>
+                                )}
                                 <div className="pl-2.5 border-l-2 border-amber-300 space-y-1 text-[10.5px] text-slate-600 my-1">
                                   {analytics.lockedItems.map((li) => (
                                     <div key={li.obligationId} className="flex justify-between gap-2">
@@ -5071,6 +5530,24 @@ export const App: React.FC = () => {
                               <span className="font-semibold">✓ Real Free / Available Money:</span>
                               <span className="font-bold text-sm">{fmt(analytics.trueAvailableDisplayMinor)}</span>
                             </div>
+                            {analytics.pocketMoneyTargetMinor > 0 && (
+                              <div className="flex justify-between text-teal-900 pt-1">
+                                <span>🎯 Spendable Pocket Money (Capped by Cash):</span>
+                                <span className="font-semibold">
+                                  {formatDisplayValue(
+                                    analytics.spendablePocketMoneyMinor ??
+                                      Math.min(analytics.pocketMoneyRemainingMinor, analytics.trueAvailableMinor),
+                                    { currency: acc.currency, privacyMode }
+                                  )}{' '}
+                                  (Allowance left:{' '}
+                                  {formatDisplayValue(analytics.pocketMoneyRemainingMinor, {
+                                    currency: acc.currency,
+                                    privacyMode,
+                                  })}
+                                  )
+                                </span>
+                              </div>
+                            )}
                             {analytics.unpaidPrePaydayDisplayMinor > 0 && (
                               <div className="flex justify-between text-slate-600 pt-1">
                                 <span>Scheduled Bills Before Payday:</span>
@@ -5213,6 +5690,15 @@ export const App: React.FC = () => {
                           className="w-full border border-slate-200 bg-white rounded px-2.5 py-1.5"
                         />
                       </label>
+                      <label className="block space-y-1">
+                        <span className="text-slate-600">{t.notesInputLabel}</span>
+                        <input
+                          name="notes"
+                          defaultValue={acc.notes || ''}
+                          placeholder="Account owners, routing notes, historical transfers..."
+                          className="w-full border border-slate-200 bg-white rounded px-2.5 py-1.5"
+                        />
+                      </label>
                       <button
                         type="submit"
                         className="w-full py-2 rounded bg-slate-900 text-white font-medium hover:bg-slate-800 transition"
@@ -5220,6 +5706,59 @@ export const App: React.FC = () => {
                         {t.saveChangesBtn}
                       </button>
                     </form>
+
+                    {accountTransfers.length > 0 && (
+                      <div className="p-3 rounded-lg border border-slate-200 bg-white space-y-2 text-xs">
+                        <div className="text-[11px] font-mono-num uppercase tracking-wider text-slate-500 font-semibold">
+                          Internal Transfers This Month ({accountTransfers.length})
+                        </div>
+                        <div className="divide-y divide-slate-100">
+                          {accountTransfers.map((tr) => {
+                            const isSource = tr.fromAccountId === acc.id;
+                            const otherAcc = allAvailableAccounts.find(
+                              (a) => a.id === (isSource ? tr.toAccountId : tr.fromAccountId)
+                            );
+                            return (
+                              <div key={tr.id} className="py-1.5 flex items-center justify-between gap-2">
+                                <div className="min-w-0">
+                                  <div className="font-medium text-slate-800 truncate">
+                                    {isSource ? `→ To ${otherAcc?.name || tr.toAccountId}` : `← From ${otherAcc?.name || tr.fromAccountId}`}
+                                  </div>
+                                  <div className="text-[10.5px] text-slate-400 font-mono-num">
+                                    {tr.transferDate} · {tr.description || 'Internal transfer'}
+                                  </div>
+                                </div>
+                                <div className="flex items-center gap-2 shrink-0">
+                                  <span
+                                    className={`font-mono-num font-semibold ${
+                                      isSource ? 'text-rose-700' : 'text-emerald-700'
+                                    }`}
+                                  >
+                                    {isSource ? '-' : '+'}
+                                    {formatDisplayValue(
+                                      isSource ? tr.fromAmountMinor : tr.toAmountMinor,
+                                      { currency: isSource ? tr.fromCurrency : tr.toCurrency, privacyMode }
+                                    )}
+                                  </span>
+                                  <button
+                                    type="button"
+                                    onClick={async () => {
+                                      if (!confirm('Reverse & delete this internal transfer?')) return;
+                                      await deleteTransferApi(tr.id);
+                                      await reloadAll();
+                                    }}
+                                    className="text-slate-400 hover:text-rose-600"
+                                    title="Reverse transfer"
+                                  >
+                                    <Trash2 className="w-3.5 h-3.5" />
+                                  </button>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 );
               }
@@ -5727,7 +6266,11 @@ export const App: React.FC = () => {
           >
             <div className="flex items-center justify-between">
               <h3 className="text-sm font-semibold text-slate-900 capitalize">
-                {modal.kind === 'workspace' ? t.createWorkspaceBtn : `+ ${modal.kind}`}
+                {modal.kind === 'workspace'
+                  ? t.createWorkspaceBtn
+                  : modal.kind === 'transfer'
+                  ? t.moveMoneyTitle
+                  : `+ ${modal.kind}`}
               </h3>
               <button type="button" onClick={() => setModal(null)}>
                 <X className="w-4 h-4 text-slate-400" />
@@ -5995,6 +6538,7 @@ export const App: React.FC = () => {
                       accountId: fd.get('accountId') || null,
                       liabilityId: fd.get('liabilityId') || null,
                       flowDirection: fd.get('flowDirection') || 'outflow',
+                      status: (fd.get('status') || 'posted') as TransactionStatus,
                       merchant: fd.get('merchant'),
                       description: fd.get('description'),
                       amountMinor: Math.round(Number(fd.get('amountMajor') || 0) * 100),
@@ -6066,6 +6610,17 @@ export const App: React.FC = () => {
                       </select>
                     </label>
                   </div>
+                  <label className="block space-y-1">
+                    <span className="font-semibold text-teal-950">{t.txStatusLabel}</span>
+                    <select
+                      name="status"
+                      defaultValue="posted"
+                      className="w-full border border-teal-300 bg-white rounded px-2 py-1.5 font-medium"
+                    >
+                      <option value="posted">{t.txStatusPosted}</option>
+                      <option value="pending">{t.txStatusPending}</option>
+                    </select>
+                  </label>
                   <label className="block space-y-1">
                     <span className="font-medium text-slate-700">{t.linkedLiabilityLabel}</span>
                     <select
@@ -6580,6 +7135,7 @@ export const App: React.FC = () => {
                       currency: fd.get('currency'),
                       isPrimaryRunway: fd.get('isPrimaryRunway') === 'on',
                       pocketMoneyTargetMinor: Math.round(Number(fd.get('pocketMoneyTargetMajor') || 0) * 100),
+                      notes: String(fd.get('notes') || '').trim() || null,
                     }),
                   });
                   setModal(null);
@@ -6655,6 +7211,14 @@ export const App: React.FC = () => {
                     className="w-full border border-slate-200 rounded px-2.5 py-1.5 font-mono-num"
                   />
                 </label>
+                <label className="block space-y-1">
+                  <span>{t.notesInputLabel}</span>
+                  <input
+                    name="notes"
+                    placeholder="Account owners, routing notes..."
+                    className="w-full border border-slate-200 rounded px-2.5 py-1.5"
+                  />
+                </label>
                 <label className="flex items-center gap-2">
                   <input type="checkbox" name="isPrimaryRunway" defaultChecked />
                   <span>Include in monthly sufficiency runway check</span>
@@ -6664,6 +7228,367 @@ export const App: React.FC = () => {
                 </button>
               </form>
             )}
+
+            {modal.kind === 'transfer' &&
+              (() => {
+                const srcAcc = allAvailableAccounts.find((a) => a.id === transferSourceId);
+                const dstAcc = allAvailableAccounts.find((a) => a.id === transferDestId);
+                const singleAmountMinor = Math.max(0, Math.round(Number(transferAmountMajor || 0) * 100));
+                const otherAccounts = allAvailableAccounts.filter((a) => a.id !== transferSourceId);
+                const totalBatchMinor = otherAccounts.reduce((sum, acc) => {
+                  const val = Math.max(0, Math.round(Number(transferBatchMap[acc.id] || 0) * 100));
+                  return sum + val;
+                }, 0);
+
+                return (
+                  <div className="space-y-3 text-xs">
+                    {/* Mode Switcher: Single Transfer vs Salary Distribution */}
+                    <div className="grid grid-cols-2 gap-1 p-1 rounded-lg bg-slate-100 border border-slate-200">
+                      <button
+                        type="button"
+                        onClick={() => setTransferMode('single')}
+                        className={`py-1.5 px-2 rounded-md font-medium transition ${
+                          transferMode === 'single'
+                            ? 'bg-white text-slate-900 shadow-xs'
+                            : 'text-slate-600 hover:text-slate-900'
+                        }`}
+                      >
+                        {t.singleTransferTab}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setTransferMode('distribute')}
+                        className={`py-1.5 px-2 rounded-md font-medium transition ${
+                          transferMode === 'distribute'
+                            ? 'bg-white text-slate-900 shadow-xs'
+                            : 'text-slate-600 hover:text-slate-900'
+                        }`}
+                      >
+                        {t.salaryDistTab}
+                      </button>
+                    </div>
+
+                    {transferMode === 'single' ? (
+                      <form
+                        className="space-y-3"
+                        onSubmit={async (e) => {
+                          e.preventDefault();
+                          if (!transferSourceId || !transferDestId || transferSourceId === transferDestId) return;
+                          if (singleAmountMinor <= 0) return;
+                          setBusy(true);
+                          try {
+                            await createTransferApi({
+                              sourceAccountId: transferSourceId,
+                              destinationAccountId: transferDestId,
+                              amountMinor: singleAmountMinor,
+                              currency: srcAcc?.currency || cur,
+                              transferDate,
+                              transferTime,
+                              description: transferDesc,
+                              referenceNumber: transferRef || null,
+                            });
+                            setModal(null);
+                            await reloadAll();
+                          } finally {
+                            setBusy(false);
+                          }
+                        }}
+                      >
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                          <label className="space-y-1">
+                            <span className="font-semibold text-rose-900">{t.fromAccountLabel}</span>
+                            <select
+                              required
+                              value={transferSourceId}
+                              onChange={(e) => {
+                                const nextSrc = e.target.value;
+                                setTransferSourceId(nextSrc);
+                                if (nextSrc === transferDestId) {
+                                  const alt = allAvailableAccounts.find((a) => a.id !== nextSrc)?.id || '';
+                                  setTransferDestId(alt);
+                                }
+                              }}
+                              className="w-full border border-rose-200 bg-rose-50/40 rounded px-2 py-1.5 font-medium"
+                            >
+                              {allAvailableAccounts.map((acc) => (
+                                <option key={acc.id} value={acc.id}>
+                                  🏦 {acc.name} ({formatDisplayValue(acc.balanceMinor, { currency: acc.currency, privacyMode })})
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+
+                          <label className="space-y-1">
+                            <span className="font-semibold text-emerald-900">{t.toAccountLabel}</span>
+                            <select
+                              required
+                              value={transferDestId}
+                              onChange={(e) => setTransferDestId(e.target.value)}
+                              className="w-full border border-emerald-200 bg-emerald-50/40 rounded px-2 py-1.5 font-medium"
+                            >
+                              {allAvailableAccounts
+                                .filter((acc) => acc.id !== transferSourceId)
+                                .map((acc) => (
+                                  <option key={acc.id} value={acc.id}>
+                                    🏦 {acc.name} ({formatDisplayValue(acc.balanceMinor, { currency: acc.currency, privacyMode })})
+                                  </option>
+                                ))}
+                            </select>
+                          </label>
+                        </div>
+
+                        <div className="grid grid-cols-3 gap-2">
+                          <label className="space-y-1">
+                            <span className="font-medium">{t.amountValueLabel}</span>
+                            <input
+                              required
+                              type="number"
+                              step="0.01"
+                              min="0.01"
+                              value={transferAmountMajor}
+                              onChange={(e) => setTransferAmountMajor(e.target.value)}
+                              placeholder="120.00"
+                              className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num"
+                            />
+                          </label>
+                          <label className="space-y-1">
+                            <span>Date</span>
+                            <input
+                              required
+                              type="date"
+                              value={transferDate}
+                              onChange={(e) => setTransferDate(e.target.value)}
+                              className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num"
+                            />
+                          </label>
+                          <label className="space-y-1">
+                            <span>Time</span>
+                            <input
+                              type="time"
+                              value={transferTime}
+                              onChange={(e) => setTransferTime(e.target.value)}
+                              className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num"
+                            />
+                          </label>
+                        </div>
+
+                        {srcAcc && dstAcc && singleAmountMinor > 0 && (
+                          <div className="p-2.5 rounded-md bg-slate-50 border border-slate-200 font-mono-num text-[11px] space-y-1">
+                            <div className="flex justify-between text-rose-800">
+                              <span>{srcAcc.name} after transfer:</span>
+                              <span className="font-semibold">
+                                {formatDisplayValue(srcAcc.balanceMinor, { currency: srcAcc.currency, privacyMode })} →{' '}
+                                {formatDisplayValue(srcAcc.balanceMinor - singleAmountMinor, {
+                                  currency: srcAcc.currency,
+                                  privacyMode,
+                                })}
+                              </span>
+                            </div>
+                            <div className="flex justify-between text-emerald-800">
+                              <span>{dstAcc.name} after transfer:</span>
+                              <span className="font-semibold">
+                                {formatDisplayValue(dstAcc.balanceMinor, { currency: dstAcc.currency, privacyMode })} →{' '}
+                                {formatDisplayValue(dstAcc.balanceMinor + singleAmountMinor, {
+                                  currency: dstAcc.currency,
+                                  privacyMode,
+                                })}
+                              </span>
+                            </div>
+                          </div>
+                        )}
+
+                        <div className="grid grid-cols-2 gap-2">
+                          <label className="space-y-1">
+                            <span>{t.notesInputLabel}</span>
+                            <input
+                              value={transferDesc}
+                              onChange={(e) => setTransferDesc(e.target.value)}
+                              placeholder="e.g. Monthly bills transfer"
+                              className="w-full border border-slate-200 rounded px-2.5 py-1.5"
+                            />
+                          </label>
+                          <label className="space-y-1">
+                            <span>{t.refPolicyInputLabel}</span>
+                            <input
+                              value={transferRef}
+                              onChange={(e) => setTransferRef(e.target.value)}
+                              placeholder="Optional reference"
+                              className="w-full border border-slate-200 rounded px-2.5 py-1.5 font-mono-num"
+                            />
+                          </label>
+                        </div>
+
+                        <button
+                          type="submit"
+                          disabled={busy || singleAmountMinor <= 0 || !transferSourceId || !transferDestId}
+                          className="w-full py-2 rounded bg-teal-700 text-white font-medium hover:bg-teal-800 disabled:opacity-50 transition"
+                        >
+                          {t.executeTransferBtn}
+                        </button>
+                      </form>
+                    ) : (
+                      <form
+                        className="space-y-3"
+                        onSubmit={async (e) => {
+                          e.preventDefault();
+                          const allocations = otherAccounts
+                            .map((acc) => ({
+                              destinationAccountId: acc.id,
+                              amountMinor: Math.max(0, Math.round(Number(transferBatchMap[acc.id] || 0) * 100)),
+                              description: transferDesc || `Salary distribution to ${acc.name}`,
+                            }))
+                            .filter((a) => a.amountMinor > 0);
+                          if (!transferSourceId || allocations.length === 0) return;
+                          setBusy(true);
+                          try {
+                            await createTransferBatchApi({
+                              sourceAccountId: transferSourceId,
+                              transferDate,
+                              transferTime,
+                              description: transferDesc || 'Salary distribution',
+                              allocations,
+                            });
+                            setModal(null);
+                            await reloadAll();
+                          } finally {
+                            setBusy(false);
+                          }
+                        }}
+                      >
+                        <div className="flex flex-wrap items-end justify-between gap-2">
+                          <label className="flex-1 min-w-[200px] space-y-1">
+                            <span className="font-semibold text-rose-900">{t.fromAccountLabel} (Salary Source)</span>
+                            <select
+                              value={transferSourceId}
+                              onChange={(e) => setTransferSourceId(e.target.value)}
+                              className="w-full border border-rose-200 bg-rose-50/40 rounded px-2 py-1.5 font-medium"
+                            >
+                              {allAvailableAccounts.map((acc) => (
+                                <option key={acc.id} value={acc.id}>
+                                  🏦 {acc.name} ({formatDisplayValue(acc.balanceMinor, { currency: acc.currency, privacyMode })})
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const nextMap: Record<string, string> = { ...transferBatchMap };
+                              for (const acc of otherAccounts) {
+                                const stat = (budget.accountAnalytics || []).find((s) => s.accountId === acc.id);
+                                if (stat && !stat.isPrePaydaySufficient && stat.netPrePaydayNativeMinor < 0) {
+                                  nextMap[acc.id] = (Math.abs(stat.netPrePaydayNativeMinor) / 100).toFixed(2);
+                                }
+                              }
+                              setTransferBatchMap(nextMap);
+                            }}
+                            className="px-2.5 py-1.5 rounded border border-teal-300 bg-teal-50 text-teal-900 text-[11px] font-medium hover:bg-teal-100 transition"
+                          >
+                            ⚡ {t.autoFillShortfallsBtn}
+                          </button>
+                        </div>
+
+                        <div className="border border-slate-200 rounded-lg divide-y divide-slate-100 max-h-[240px] overflow-y-auto">
+                          {otherAccounts.map((acc) => {
+                            const stat = (budget.accountAnalytics || []).find((s) => s.accountId === acc.id);
+                            const addMinor = Math.max(0, Math.round(Number(transferBatchMap[acc.id] || 0) * 100));
+                            const shortfallMinor =
+                              stat && !stat.isPrePaydaySufficient && stat.netPrePaydayNativeMinor < 0
+                                ? Math.abs(stat.netPrePaydayNativeMinor)
+                                : 0;
+                            return (
+                              <div key={acc.id} className="p-2.5 flex items-center justify-between gap-2">
+                                <div className="min-w-0">
+                                  <div className="font-medium text-slate-800 truncate">{acc.name}</div>
+                                  <div className="text-[10.5px] font-mono-num text-slate-500">
+                                    Now: {formatDisplayValue(acc.balanceMinor, { currency: acc.currency, privacyMode })}
+                                    {addMinor > 0 && (
+                                      <span className="text-emerald-700 font-semibold">
+                                        {' '}
+                                        → {formatDisplayValue(acc.balanceMinor + addMinor, { currency: acc.currency, privacyMode })}
+                                      </span>
+                                    )}
+                                    {shortfallMinor > 0 && (
+                                      <span className="text-amber-700">
+                                        {' '}
+                                        · Shortfall:{' '}
+                                        {formatDisplayValue(shortfallMinor, { currency: acc.currency, privacyMode })}
+                                      </span>
+                                    )}
+                                  </div>
+                                </div>
+                                <div className="w-28 shrink-0">
+                                  <input
+                                    type="number"
+                                    step="0.01"
+                                    min="0"
+                                    value={transferBatchMap[acc.id] || ''}
+                                    onChange={(e) =>
+                                      setTransferBatchMap((prev) => ({ ...prev, [acc.id]: e.target.value }))
+                                    }
+                                    placeholder="0.00"
+                                    className="w-full border border-slate-200 rounded px-2 py-1 text-right font-mono-num"
+                                  />
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+
+                        {srcAcc && (
+                          <div className="p-2.5 rounded-md bg-slate-50 border border-slate-200 font-mono-num text-[11px] flex items-center justify-between">
+                            <span>
+                              Total Distributed:{' '}
+                              <strong className="text-slate-900">
+                                {formatDisplayValue(totalBatchMinor, { currency: srcAcc.currency, privacyMode })}
+                              </strong>
+                            </span>
+                            <span className={srcAcc.balanceMinor - totalBatchMinor < 0 ? 'text-rose-700 font-semibold' : 'text-teal-900'}>
+                              Remaining on {srcAcc.name.split('—')[0].trim()}:{' '}
+                              <strong>
+                                {formatDisplayValue(srcAcc.balanceMinor - totalBatchMinor, {
+                                  currency: srcAcc.currency,
+                                  privacyMode,
+                                })}
+                              </strong>
+                            </span>
+                          </div>
+                        )}
+
+                        <div className="grid grid-cols-2 gap-2">
+                          <label className="space-y-1">
+                            <span>Date</span>
+                            <input
+                              required
+                              type="date"
+                              value={transferDate}
+                              onChange={(e) => setTransferDate(e.target.value)}
+                              className="w-full border border-slate-200 rounded px-2 py-1.5 font-mono-num"
+                            />
+                          </label>
+                          <label className="space-y-1">
+                            <span>{t.notesInputLabel}</span>
+                            <input
+                              value={transferDesc}
+                              onChange={(e) => setTransferDesc(e.target.value)}
+                              placeholder="Salary distribution"
+                              className="w-full border border-slate-200 rounded px-2.5 py-1.5"
+                            />
+                          </label>
+                        </div>
+
+                        <button
+                          type="submit"
+                          disabled={busy || totalBatchMinor <= 0}
+                          className="w-full py-2 rounded bg-teal-700 text-white font-medium hover:bg-teal-800 disabled:opacity-50 transition"
+                        >
+                          {t.executeDistributionBtn}
+                        </button>
+                      </form>
+                    )}
+                  </div>
+                );
+              })()}
           </div>
         </div>
       )}

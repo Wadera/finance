@@ -248,4 +248,498 @@ describe('Skyday Finance API, Partner Privacy Scope & MCP Connector', () => {
     // Still keeps overflowInMinor (£5,950) separate from upcomingSalary (£5,950) so there is never a fake £11.9k pool!
     expect(b2.cashflowBridge.overflowInMinor).toBe(595000);
   });
+
+  it('satisfies all MCP reconciliation & internal transfer acceptance scenarios', async () => {
+    const callMcp = async (toolName: string, args: Record<string, unknown>) => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/mcp',
+        headers: { 'x-dev-user': 'wadera' },
+        payload: {
+          jsonrpc: '2.0',
+          id: Math.floor(Math.random() * 100000),
+          method: 'tools/call',
+          params: {
+            name: toolName,
+            arguments: args,
+          },
+        },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.result?.isError).not.toBe(true);
+      return JSON.parse(body.result.content[0].text);
+    };
+
+    // 0. Verify tools/list exposes all required MCP tools
+    const listToolsRes = await app.inject({
+      method: 'POST',
+      url: '/api/mcp',
+      headers: { 'x-dev-user': 'wadera' },
+      payload: { jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} },
+    });
+    const toolNames = (listToolsRes.json().result.tools as Array<{ name: string }>).map((t) => t.name);
+    for (const requiredTool of [
+      'list_accounts',
+      'get_account',
+      'set_account_balance_snapshot',
+      'list_transactions',
+      'get_transaction',
+      'upsert_transaction',
+      'delete_transaction',
+      'create_transfer',
+      'update_transfer',
+      'delete_transfer',
+      'list_transfers',
+      'list_upcoming_obligations',
+      'mark_obligation_paid',
+      'update_obligation_schedule',
+      'get_monthly_budget',
+      'reconcile_batch',
+      'reverse_reconciliation_batch',
+    ]) {
+      expect(toolNames).toContain(requiredTool);
+    }
+
+    // Seed the 5 UK bank accounts & Klarna MTB obligation + Saver reserves from the reconciliation report
+    for (const accPayload of [
+      {
+        id: 'acc-revolut-joint',
+        workspaceId: 'ws-home',
+        name: 'Revolut Joint',
+        institution: 'Revolut',
+        currency: 'GBP',
+        balanceMinor: 19789,
+        portalUrl: 'https://app.revolut.com',
+        notes:
+          'Joint household account belonging to Wadera and Walter. £120 was transferred to Club Lloyds on 5 November, leaving £199.38 at that point.',
+      },
+      {
+        id: 'acc-lloyds-club',
+        workspaceId: 'ws-wadera',
+        name: 'Club Lloyds',
+        institution: 'Lloyds Bank',
+        currency: 'GBP',
+        balanceMinor: 21811,
+      },
+      {
+        id: 'acc-lloyds-classic',
+        workspaceId: 'ws-wadera',
+        name: 'Lloyds Classic',
+        institution: 'Lloyds Bank',
+        currency: 'GBP',
+        balanceMinor: 24015,
+      },
+      {
+        id: 'acc-lloyds-saver',
+        workspaceId: 'ws-wadera',
+        name: 'Lloyds Standard Saver',
+        institution: 'Lloyds Bank',
+        currency: 'GBP',
+        balanceMinor: 20000,
+      },
+      {
+        id: 'acc-revolut-personal',
+        workspaceId: 'ws-wadera',
+        name: 'Revolut Personal',
+        institution: 'Revolut',
+        currency: 'GBP',
+        balanceMinor: 8914,
+        pocketMoneyTargetMinor: 14920,
+      },
+    ]) {
+      const r = await app.inject({
+        method: 'POST',
+        url: '/api/accounts',
+        headers: { 'x-dev-user': 'wadera' },
+        payload: accPayload,
+      });
+      expect(r.statusCode).toBe(200);
+    }
+
+    // Seed £486.72 of annual reserves parked on acc-lloyds-saver and Klarna MTB £75.45 monthly obligation
+    await app.inject({
+      method: 'POST',
+      url: '/api/obligations',
+      headers: { 'x-dev-user': 'wadera' },
+      payload: {
+        id: 'ob-saver-reserve-test',
+        workspaceId: 'ws-wadera',
+        potId: 'pot-veh-maint',
+        accountId: 'acc-lloyds-classic',
+        preserveAccountId: 'acc-lloyds-saver',
+        name: 'Annual Car & Home Reserves',
+        amountMinor: 60000,
+        currency: 'GBP',
+        cadence: 'annual',
+        intervalMonths: 12,
+        nextDueDate: '2027-06-01',
+        preservedMinor: 48672,
+        autoPreserve: true,
+      },
+    });
+    await app.inject({
+      method: 'POST',
+      url: '/api/obligations',
+      headers: { 'x-dev-user': 'wadera' },
+      payload: {
+        id: 'ob-emtb-klarna',
+        workspaceId: 'ws-wadera',
+        potId: 'pot-ai-hobbies',
+        accountId: 'acc-lloyds-classic',
+        name: 'Klarna MTB',
+        amountMinor: 7545,
+        currency: 'GBP',
+        cadence: 'monthly',
+        intervalMonths: 1,
+        nextDueDate: '2026-11-05',
+        preservedMinor: 0,
+        autoPreserve: false,
+      },
+    });
+
+    // Acceptance Scenario 4: Changing only an account balance preserves its notes, owner/workspace, currency, portalUrl & metadata
+    const jointBefore = await callMcp('get_account', { accountId: 'acc-revolut-joint' });
+    expect(jointBefore.account.notes).toContain('Wadera and Walter');
+    const originalPortalUrl = jointBefore.account.portalUrl;
+    const originalWorkspaceId = jointBefore.account.workspaceId;
+
+    // Update balance via REST POST /api/accounts without supplying notes or portalUrl
+    const restAccPatch = await app.inject({
+      method: 'POST',
+      url: '/api/accounts',
+      headers: { 'x-dev-user': 'wadera' },
+      payload: {
+        id: 'acc-revolut-joint',
+        balanceMinor: 31938,
+      },
+    });
+    expect(restAccPatch.statusCode).toBe(200);
+    const jointAfterRest = await callMcp('get_account', { accountId: 'acc-revolut-joint' });
+    expect(jointAfterRest.account.balanceMinor).toBe(31938);
+    expect(jointAfterRest.account.notes).toContain('Wadera and Walter');
+    expect(jointAfterRest.account.portalUrl).toBe(originalPortalUrl);
+    expect(jointAfterRest.account.workspaceId).toBe(originalWorkspaceId);
+
+    // Acceptance Scenario 1: Reconcile Joint's £319.38 statement to £133.44 available after:
+    // - £120.00 transfer to Club Lloyds (leaving £199.38)
+    // - £23.49 Amazon (posted)
+    // - £1.49 Nevison (posted)
+    // - £40.96 Nevison pending authorization
+    // Promoting that pending authorization to posted later must NOT debit available cash or budget twice.
+    await callMcp('set_account_balance_snapshot', {
+      accountId: 'acc-revolut-joint',
+      availableBalanceMajor: 319.38,
+      bookedBalanceMajor: 319.38,
+      pendingDebitMajor: 0,
+      observedAt: '2026-11-05T08:00:00Z',
+      source: 'statement',
+    });
+
+    const clubBeforeTransfer = (await callMcp('get_account', { accountId: 'acc-lloyds-club' })).account.balanceMinor;
+
+    // Execute £120 internal transfer from Revolut Joint -> Club Lloyds
+    const trfRes = await callMcp('create_transfer', {
+      fromAccountId: 'acc-revolut-joint',
+      toAccountId: 'acc-lloyds-club',
+      amountMajor: 120.0,
+      transferDate: '2026-11-05',
+      description: 'Joint to Club Lloyds transfer',
+      idempotencyKey: 'trf-joint-club-2026-11-05',
+    });
+    expect(trfRes.fromAccountAfterMinor).toBe(19938); // £199.38
+    expect(trfRes.toAccountAfterMinor).toBe(clubBeforeTransfer + 12000);
+
+    // Retrying the same transfer with the same idempotencyKey is a no-op
+    const trfRetry = await callMcp('create_transfer', {
+      fromAccountId: 'acc-revolut-joint',
+      toAccountId: 'acc-lloyds-club',
+      amountMajor: 120.0,
+      transferDate: '2026-11-05',
+      idempotencyKey: 'trf-joint-club-2026-11-05',
+    });
+    expect(trfRetry.idempotentReplay).toBe(true);
+    expect(trfRetry.fromAccountAfterMinor).toBe(19938);
+
+    // Import £23.49 Amazon (posted), £1.49 Nevison (posted), and £40.96 Nevison (pending)
+    await callMcp('upsert_transaction', {
+      accountId: 'acc-revolut-joint',
+      potId: null,
+      merchant: 'Amazon',
+      description: 'Uncategorized pending receipt',
+      amountMajor: 23.49,
+      status: 'posted',
+      bankTimestamp: '2026-11-05T13:21:00Z',
+      idempotencyKey: 'tx-joint-amazon-2349',
+    });
+    await callMcp('upsert_transaction', {
+      accountId: 'acc-revolut-joint',
+      potId: 'pot-food',
+      merchant: 'Nevison',
+      amountMajor: 1.49,
+      status: 'posted',
+      bankTimestamp: '2026-11-05T20:29:00Z',
+      idempotencyKey: 'tx-joint-nevison-149',
+    });
+    const pendingRes = await callMcp('upsert_transaction', {
+      accountId: 'acc-revolut-joint',
+      potId: 'pot-food',
+      merchant: 'Nevison',
+      description: 'Pending card authorization',
+      amountMajor: 40.96,
+      status: 'pending',
+      bankTimestamp: '2026-11-07T11:15:00Z',
+      idempotencyKey: 'tx-joint-nevison-4096',
+    });
+
+    // Verify Revolut Joint available balance is now £133.44 (13344 minor) and booked is £174.40 (17440 minor)
+    const jointAfterSpend = await callMcp('get_account', { accountId: 'acc-revolut-joint', yearMonth: '2026-11' });
+    expect(jointAfterSpend.account.availableBalanceMinor).toBe(13344);
+    expect(jointAfterSpend.account.bookedBalanceMinor).toBe(17440);
+    expect(jointAfterSpend.account.pendingDebitMinor).toBe(4096);
+
+    // Check monthly budget before promoting pending -> posted
+    const budgetWithPending = await callMcp('get_monthly_budget', { yearMonth: '2026-11', scope: 'all' });
+    const foodPotBeforePromote = budgetWithPending.potRollups.find((p: { id: string }) => p.id === 'pot-food');
+    expect(foodPotBeforePromote.pendingSpendMajor).toBeCloseTo(40.96, 2);
+    const totalFoodItemizedBefore = foodPotBeforePromote.itemizedSpendMajor;
+
+    // Now promote the £40.96 pending authorization to 'posted'
+    const promoteRes = await callMcp('upsert_transaction', {
+      id: pendingRes.transaction.id,
+      status: 'posted',
+      bankTimestamp: '2026-11-08T09:00:00Z',
+    });
+    expect(promoteRes.availableDeltaMinor).toBe(0); // Must NOT debit available cash a second time!
+    expect(promoteRes.bookedDeltaMinor).toBe(-4096); // Booked balance catches up to available
+
+    const jointAfterPost = await callMcp('get_account', { accountId: 'acc-revolut-joint', yearMonth: '2026-11' });
+    expect(jointAfterPost.account.availableBalanceMinor).toBe(13344);
+    expect(jointAfterPost.account.bookedBalanceMinor).toBe(13344);
+
+    const budgetAfterPost = await callMcp('get_monthly_budget', { yearMonth: '2026-11', scope: 'all' });
+    const foodPotAfterPromote = budgetAfterPost.potRollups.find((p: { id: string }) => p.id === 'pot-food');
+    expect(foodPotAfterPromote.pendingSpendMajor).toBe(0);
+    expect(foodPotAfterPromote.itemizedSpendMajor).toBeCloseTo(totalFoodItemizedBefore, 2); // Not debited twice in budget!
+
+    // Acceptance Scenario 3: Moving MiPermit £0.80 from 1 November to 31 October changes monthly spend totals and preserves account balance
+    const classicBeforeMiPermit = (await callMcp('get_account', { accountId: 'acc-lloyds-classic' })).account.balanceMinor;
+    const miPermitCreate = await callMcp('upsert_transaction', {
+      accountId: 'acc-lloyds-classic',
+      potId: 'pot-car',
+      merchant: 'MiPermit',
+      amountMajor: 0.8,
+      status: 'posted',
+      spentDate: '2026-11-01',
+      idempotencyKey: 'tx-mipermit-080',
+    });
+    const classicAfterCreate = (await callMcp('get_account', { accountId: 'acc-lloyds-classic' })).account.balanceMinor;
+    expect(classicAfterCreate).toBe(classicBeforeMiPermit - 80);
+
+    const novSpendBeforeMove = (await callMcp('get_monthly_budget', { yearMonth: '2026-11', scope: 'all' })).postedSpendMajor;
+    const octSpendBeforeMove = (await callMcp('get_monthly_budget', { yearMonth: '2026-10', scope: 'all' })).postedSpendMajor;
+
+    // Move MiPermit from 2026-11-01 to 2026-10-31T13:09:00Z
+    const miPermitMove = await callMcp('upsert_transaction', {
+      id: miPermitCreate.transaction.id,
+      bankTimestamp: '2026-10-31T13:09:00Z',
+    });
+    expect(miPermitMove.availableDeltaMinor).toBe(0);
+    expect(miPermitMove.accountAfterBalanceMinor).toBe(classicAfterCreate);
+
+    const novSpendAfterMove = (await callMcp('get_monthly_budget', { yearMonth: '2026-11', scope: 'all' })).postedSpendMajor;
+    const octSpendAfterMove = (await callMcp('get_monthly_budget', { yearMonth: '2026-10', scope: 'all' })).postedSpendMajor;
+    expect(novSpendAfterMove).toBeCloseTo(novSpendBeforeMove - 0.8, 2);
+    expect(octSpendAfterMove).toBeCloseTo(octSpendBeforeMove + 0.8, 2);
+
+    // Acceptance Scenario 5: A £200 saver with £486.72 reserved reports £0 free cash, £200 funded reserves, and £286.72 underfunding.
+    // And Revolut Personal's £149.20 pocket allowance is capped at its £89.14 account balance.
+    await callMcp('set_account_balance_snapshot', {
+      accountId: 'acc-lloyds-saver',
+      availableBalanceMajor: 200.0,
+      observedAt: '2026-11-07T12:00:00Z',
+    });
+    await callMcp('set_account_balance_snapshot', {
+      accountId: 'acc-revolut-personal',
+      availableBalanceMajor: 89.14,
+      observedAt: '2026-11-07T12:00:00Z',
+    });
+
+    const budgetCheck = await callMcp('get_monthly_budget', { yearMonth: '2026-11', scope: 'all' });
+    const saverStats = budgetCheck.accounts.find((a: { id: string }) => a.id === 'acc-lloyds-saver');
+    expect(saverStats.availableBalanceMajor).toBe(200);
+    expect(saverStats.plannedReservesMajor).toBeCloseTo(486.72, 2);
+    expect(saverStats.fundedReservesMajor).toBe(200);
+    expect(saverStats.freeCashMajor).toBe(0);
+    expect(saverStats.reserveShortfallMajor).toBeCloseTo(286.72, 2);
+
+    const revPersonalStats = budgetCheck.accounts.find((a: { id: string }) => a.id === 'acc-revolut-personal');
+    expect(revPersonalStats.availableBalanceMajor).toBeCloseTo(89.14, 2);
+    expect(revPersonalStats.pocketMoneyAllowanceRemainingMajor).toBeGreaterThan(89.14);
+    expect(revPersonalStats.spendablePocketMoneyMajor).toBeCloseTo(89.14, 2);
+
+    // Acceptance Scenario 6: Finite & variable schedules (November Klarna MTB £75.45 paid, December £75.25 due 2026-12-05, no January recurrence)
+    // and payment recording dates remain auditable while bank dates are supplied independently.
+    const paidNov = await callMcp('mark_obligation_paid', {
+      obligationId: 'ob-emtb-klarna',
+      yearMonth: '2026-11',
+      paid: true,
+      amountMajor: 75.45,
+      bankDate: '2026-11-05',
+      accountId: 'acc-lloyds-classic',
+      idempotencyKey: 'pay-klarna-2026-11',
+      balanceEffect: 'none',
+    });
+    expect(paidNov.occurrence.actualPaidMinor).toBe(7545);
+    expect(paidNov.occurrence.bankDate).toBe('2026-11-05');
+    expect(typeof paidNov.occurrence.recordedAt).toBe('string');
+    expect(paidNov.obligation.nextDueDate).toBe('2026-12-05');
+
+    // Retrying mark_obligation_paid with same parameters does not advance schedule twice or duplicate expenses
+    const paidNovRetry = await callMcp('mark_obligation_paid', {
+      obligationId: 'ob-emtb-klarna',
+      yearMonth: '2026-11',
+      paid: true,
+      amountMajor: 75.45,
+      bankDate: '2026-11-05',
+      accountId: 'acc-lloyds-classic',
+      idempotencyKey: 'pay-klarna-2026-11',
+      balanceEffect: 'none',
+    });
+    expect(paidNovRetry.idempotentReplay).toBe(true);
+    expect(paidNovRetry.obligation.nextDueDate).toBe('2026-12-05');
+
+    // Update schedule so December 2026 has final £75.25 payment on 2026-12-05 and ends after December
+    const schedRes = await callMcp('update_obligation_schedule', {
+      obligationId: 'ob-emtb-klarna',
+      endDate: '2026-12-05',
+      finalAmountMajor: 75.25,
+    });
+    expect(schedRes.obligation.finalAmountMinor).toBe(7525);
+    expect(schedRes.obligation.endDate).toBe('2026-12-05');
+
+    // Verify November still reports £75.45 paid, December reports £75.25 due, and January reports £0 (closed after final payment)
+    const novObs = await callMcp('list_upcoming_obligations', { yearMonth: '2026-11', scope: 'all' });
+    const novKlarna = novObs.obligations.find((o: { id: string }) => o.id === 'ob-emtb-klarna');
+    expect(novKlarna.isPaidThisMonth).toBe(true);
+    expect(novKlarna.dueThisMonthMajor).toBeCloseTo(75.45, 2);
+
+    const decObs = await callMcp('list_upcoming_obligations', { yearMonth: '2026-12', scope: 'all' });
+    const decKlarna = decObs.obligations.find((o: { id: string }) => o.id === 'ob-emtb-klarna');
+    expect(decKlarna.isPaidThisMonth).toBe(false);
+    expect(decKlarna.dueThisMonthMajor).toBeCloseTo(75.25, 2);
+
+    const janObs = await callMcp('list_upcoming_obligations', { yearMonth: '2027-01', scope: 'all' });
+    const janKlarna = janObs.obligations.find((o: { id: string }) => o.id === 'ob-emtb-klarna');
+    expect(janKlarna).toBeUndefined(); // Disappears from active obligations after endDate
+    const janKlarnaArchived = janObs.archivedObligations.find((o: { id: string }) => o.id === 'ob-emtb-klarna');
+    expect(janKlarnaArchived.dueThisMonthMajor).toBe(0);
+
+    // Safe reconciliation batch: dry-run preview does not persist changes, atomic apply persists and is idempotent & reversible
+    const dryBatch = await callMcp('reconcile_batch', {
+      dryRun: true,
+      snapshotMode: 'already_reflected_in_snapshot',
+      transactions: [
+        {
+          accountId: 'acc-revolut-joint',
+          merchant: 'Dry Run Coffee',
+          amountMajor: 4.5,
+          spentDate: '2026-11-06',
+        },
+      ],
+    });
+    expect(dryBatch.dryRun).toBe(true);
+    expect(dryBatch.proposedChanges).toHaveLength(1);
+    const txCheckAfterDry = await callMcp('list_transactions', {
+      accountId: 'acc-revolut-joint',
+      merchantQuery: 'Dry Run Coffee',
+    });
+    expect(txCheckAfterDry.total).toBe(0);
+
+    // Apply batch for real, then reverse it
+    const liveBatch = await callMcp('reconcile_batch', {
+      dryRun: false,
+      idempotencyKey: 'batch-test-1',
+      snapshotMode: 'already_reflected_in_snapshot',
+      transactions: [
+        {
+          accountId: 'acc-revolut-joint',
+          merchant: 'Batch Bakery',
+          amountMajor: 6.25,
+          spentDate: '2026-11-06',
+          idempotencyKey: 'tx-batch-bakery',
+        },
+      ],
+    });
+    expect(liveBatch.dryRun).toBe(false);
+    expect(liveBatch.batchId).toBeTruthy();
+
+    // Idempotent replay of the same batch
+    const liveBatchReplay = await callMcp('reconcile_batch', {
+      dryRun: false,
+      idempotencyKey: 'batch-test-1',
+      snapshotMode: 'already_reflected_in_snapshot',
+      transactions: [
+        {
+          accountId: 'acc-revolut-joint',
+          merchant: 'Batch Bakery',
+          amountMajor: 6.25,
+          spentDate: '2026-11-06',
+          idempotencyKey: 'tx-batch-bakery',
+        },
+      ],
+    });
+    expect(liveBatchReplay.idempotentReplay).toBe(true);
+    expect(liveBatchReplay.batchId).toBe(liveBatch.batchId);
+
+    // Reverse the reconciliation batch
+    const revRes = await callMcp('reverse_reconciliation_batch', { batchId: liveBatch.batchId });
+    expect(revRes.reversed).toBe(true);
+    const txCheckAfterRev = await callMcp('list_transactions', {
+      accountId: 'acc-revolut-joint',
+      merchantQuery: 'Batch Bakery',
+    });
+    expect(txCheckAfterRev.total).toBe(0);
+  });
+
+  it('supports multi-account salary distribution via POST /api/transfers/batch', async () => {
+    const classicBefore = (
+      await app.inject({ method: 'GET', url: '/api/accounts/acc-lloyds-classic', headers: { 'x-dev-user': 'wadera' } })
+    ).json().account.balanceMinor as number;
+    const clubBefore = (
+      await app.inject({ method: 'GET', url: '/api/accounts/acc-lloyds-club', headers: { 'x-dev-user': 'wadera' } })
+    ).json().account.balanceMinor as number;
+    const saverBefore = (
+      await app.inject({ method: 'GET', url: '/api/accounts/acc-lloyds-saver', headers: { 'x-dev-user': 'wadera' } })
+    ).json().account.balanceMinor as number;
+
+    const batchRes = await app.inject({
+      method: 'POST',
+      url: '/api/transfers/batch',
+      headers: { 'x-dev-user': 'wadera' },
+      payload: {
+        sourceAccountId: 'acc-lloyds-classic',
+        transferDate: '2026-11-07',
+        description: 'Monthly salary distribution',
+        allocations: [
+          { destinationAccountId: 'acc-lloyds-club', amountMajor: 100.0 },
+          { destinationAccountId: 'acc-lloyds-saver', amountMajor: 50.0 },
+        ],
+      },
+    });
+    expect(batchRes.statusCode).toBe(200);
+    const data = batchRes.json();
+    expect(data.ok).toBe(true);
+    expect(data.totalDeductedMinor).toBe(15000);
+    expect(data.fromAccountAfterMinor).toBe(classicBefore - 15000);
+
+    const clubAfter = (
+      await app.inject({ method: 'GET', url: '/api/accounts/acc-lloyds-club', headers: { 'x-dev-user': 'wadera' } })
+    ).json().account.balanceMinor as number;
+    const saverAfter = (
+      await app.inject({ method: 'GET', url: '/api/accounts/acc-lloyds-saver', headers: { 'x-dev-user': 'wadera' } })
+    ).json().account.balanceMinor as number;
+    expect(clubAfter).toBe(clubBefore + 10000);
+    expect(saverAfter).toBe(saverBefore + 5000);
+  });
 });

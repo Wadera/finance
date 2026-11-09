@@ -92,25 +92,35 @@ export function mapIdentityToUser(
   const wadera = users.find((u) => u.handle === 'wadera') ?? null;
   const walter = users.find((u) => u.handle === 'walter') ?? null;
 
-  // Explicit named account mapping for Wadera & Walter
+  // Explicit named account mapping for Wadera & Walter (using SHA-256 claim hashes so no personal emails/surnames are stored in source code)
+  const unameHash = uname ? base64UrlSha256(uname) : '';
+  const emailHash = email ? base64UrlSha256(email) : '';
+  const ownerClaimHashes = new Set([
+    '6JYVeCwYYI2R5km6Xr0f6QPkqiykL5_hrdtmYcF1MLM',
+    'OrJYqMIBr6ALgjbeoteT7GvQB7uciHOsDglalNl56A8',
+    'fdvi52PNLKF-JulxUHiF_MdOOJlyETQt09LSHX4R338',
+  ]);
+  const partnerClaimHashes = new Set([
+    'Glmv0qSapWGlc7nKiIc2RoUrsY0C-MV-o6rPIdei5js',
+    'rSJLvKRne-itv8Awog2xoMv_elmR1xI7HLfV9h1xemc',
+    'ELWWR3XrhHdWuvlavLlRyswOQbtFW6AJUVj7z4EFl6A',
+    'ozHggRX57Qm3engn4L3W7yAo7OXSqSohR9N9HjlYbKw',
+  ]);
+
   if (
     uname === 'wadera' ||
-    uname === 'paulina' ||
-    uname === 'pstopa' ||
-    email === 'pstopa@skyday.eu' ||
-    email === 'wadera@skyday.eu'
+    email === 'wadera@skyday.eu' ||
+    ownerClaimHashes.has(unameHash) ||
+    ownerClaimHashes.has(emailHash)
   ) {
     return wadera;
   }
 
   if (
     uname === 'walter' ||
-    uname === 'wojciech' ||
-    uname === 'wpoznanski' ||
-    uname === 'poznanski.wojciech@gmail.com' ||
-    email === 'poznanski.wojciech@gmail.com' ||
-    email === 'wpoznanski@skyday.eu' ||
-    email === 'walter@skyday.eu'
+    email === 'walter@skyday.eu' ||
+    partnerClaimHashes.has(unameHash) ||
+    partnerClaimHashes.has(emailHash)
   ) {
     return walter;
   }

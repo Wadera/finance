@@ -10,13 +10,16 @@ import {
   cadenceIntervalMonths,
   computeMonthlyIncomeMinor,
   computeObligationMonthMetrics,
+  isObligationVisibleInMonth,
   projectWealthHorizon,
   reconstructWealthHistory,
   resolveWaderaShareBp,
 } from '../shared/financeEngine.js';
 import type {
   CurrencyCode,
+  ExpenseEntryRecord,
   LocaleCode,
+  ObligationRecord,
   PartnerVisibility,
   SplitMode,
   WorkspaceKind,
@@ -227,7 +230,19 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
         flowDirection: e.flowDirection === 'inflow' ? ('inflow' as const) : ('outflow' as const),
         displayAmountMinor: convertMinor(e.amountMinor, e.currency, cur, rateMap),
       }));
-    const outflowExpenses = expenses.filter((e) => e.flowDirection !== 'inflow');
+    const outflowExpenses = expenses.filter(
+      (e) =>
+        e.flowDirection !== 'inflow' &&
+        (e.kind ?? 'expense') !== 'transfer' &&
+        (e.status ?? 'posted') !== 'reversed' &&
+        (e.status ?? 'posted') !== 'refunded'
+    );
+    const postedSpendMinor = outflowExpenses
+      .filter((e) => (e.status ?? 'posted') !== 'pending')
+      .reduce((s, e) => s + e.displayAmountMinor, 0);
+    const pendingSpendMinor = outflowExpenses
+      .filter((e) => (e.status ?? 'posted') === 'pending')
+      .reduce((s, e) => s + e.displayAmountMinor, 0);
 
     // Compute Wadera & Walter monthly incomes for proportional split calculations
     const waderaIncs = store.listIncomes(['ws-wadera']);
@@ -235,65 +250,67 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     const waderaIncGbp = waderaIncs.reduce((s, i) => s + computeMonthlyIncomeMinor(i, ym, 'GBP', rateMap), 0);
     const walterIncGbp = walterIncs.reduce((s, i) => s + computeMonthlyIncomeMinor(i, ym, 'GBP', rateMap), 0);
 
-    const enrichedObligations = obligations.map((ob) => {
-      const metrics = computeObligationMonthMetrics(ob, ym);
-      const occ = occByOb.get(ob.id) ?? null;
-      const isPaidThisMonth = occ?.status === 'paid';
-      const waderaBp =
-        ob.workspaceId === 'ws-home'
-          ? resolveWaderaShareBp(ob.splitMode, ob.waderaSplitBp, waderaIncGbp, walterIncGbp)
-          : ob.workspaceId === 'ws-wadera'
-          ? 10000
-          : 0;
-      const userShareBp = user.handle === 'wadera' ? waderaBp : 10000 - waderaBp;
+    const enrichedObligations = obligations
+      .map((ob) => {
+        const occ = occByOb.get(ob.id) ?? null;
+        const metrics = computeObligationMonthMetrics(ob, ym, occ);
+        const isPaidThisMonth = occ?.status === 'paid';
+        const waderaBp =
+          ob.workspaceId === 'ws-home'
+            ? resolveWaderaShareBp(ob.splitMode, ob.waderaSplitBp, waderaIncGbp, walterIncGbp)
+            : ob.workspaceId === 'ws-wadera'
+            ? 10000
+            : 0;
+        const userShareBp = user.handle === 'wadera' ? waderaBp : 10000 - waderaBp;
 
-      const dueDisplayMinor = convertMinor(metrics.dueThisMonthNativeMinor, ob.currency, cur, rateMap);
-      const effectivePreserveNativeMinor =
-        !metrics.isDueThisMonth && isPaidThisMonth && occ?.actualPaidMinor != null
-          ? occ.actualPaidMinor
-          : metrics.monthlyPreserveNativeMinor;
-      const effectiveBurdenNativeMinor =
-        !metrics.isDueThisMonth && isPaidThisMonth && occ?.actualPaidMinor != null
-          ? occ.actualPaidMinor
-          : metrics.effectiveMonthlyBurdenNativeMinor;
-      const preserveDisplayMinor = convertMinor(effectivePreserveNativeMinor, ob.currency, cur, rateMap);
-      const effectiveDisplayMinor = convertMinor(effectiveBurdenNativeMinor, ob.currency, cur, rateMap);
-      const targetDisplayMinor = convertMinor(ob.amountMinor, ob.currency, cur, rateMap);
-      const preservedDisplayMinor = convertMinor(ob.preservedMinor, ob.currency, cur, rateMap);
-      const resolvedAccId = (occ?.accountId ?? ob.accountId) || null;
-      const saverDefaultAcc =
-        allAccounts.find((a) => a.id === 'acc-standard-saver' || /saver|saving|oszcz/i.test(a.name)) ?? null;
-      const resolvedPreserveAccId =
-        ob.preserveAccountId ||
-        (!metrics.isDueThisMonth && ob.cadence !== 'monthly' && saverDefaultAcc ? saverDefaultAcc.id : resolvedAccId) ||
-        null;
-      const resolvedLiabId = (occ?.liabilityId ?? ob.liabilityId) || null;
+        const dueDisplayMinor = convertMinor(metrics.dueThisMonthNativeMinor, ob.currency, cur, rateMap);
+        const effectivePreserveNativeMinor =
+          !metrics.isDueThisMonth && isPaidThisMonth && occ?.actualPaidMinor != null
+            ? occ.actualPaidMinor
+            : metrics.monthlyPreserveNativeMinor;
+        const effectiveBurdenNativeMinor =
+          !metrics.isDueThisMonth && isPaidThisMonth && occ?.actualPaidMinor != null
+            ? occ.actualPaidMinor
+            : metrics.effectiveMonthlyBurdenNativeMinor;
+        const preserveDisplayMinor = convertMinor(effectivePreserveNativeMinor, ob.currency, cur, rateMap);
+        const effectiveDisplayMinor = convertMinor(effectiveBurdenNativeMinor, ob.currency, cur, rateMap);
+        const targetDisplayMinor = convertMinor(ob.amountMinor, ob.currency, cur, rateMap);
+        const preservedDisplayMinor = convertMinor(ob.preservedMinor, ob.currency, cur, rateMap);
+        const resolvedAccId = (occ?.accountId ?? ob.accountId) || null;
+        const saverDefaultAcc =
+          allAccounts.find((a) => a.id === 'acc-standard-saver' || /saver|saving|oszcz/i.test(a.name)) ?? null;
+        const resolvedPreserveAccId =
+          ob.preserveAccountId ||
+          (!metrics.isDueThisMonth && ob.cadence !== 'monthly' && saverDefaultAcc ? saverDefaultAcc.id : resolvedAccId) ||
+          null;
+        const resolvedLiabId = (occ?.liabilityId ?? ob.liabilityId) || null;
 
-      return {
-        ...ob,
-        accountId: ob.accountId ?? null,
-        accountName: resolvedAccId ? (accById.get(resolvedAccId)?.name ?? null) : null,
-        preserveAccountId: resolvedPreserveAccId,
-        preserveAccountName: resolvedPreserveAccId ? (accById.get(resolvedPreserveAccId)?.name ?? null) : null,
-        liabilityId: ob.liabilityId ?? null,
-        liabilityName: resolvedLiabId ? (liabById.get(resolvedLiabId)?.name ?? null) : null,
-        metrics: {
-          ...metrics,
-          monthlyPreserveNativeMinor: effectivePreserveNativeMinor,
-          effectiveMonthlyBurdenNativeMinor: effectiveBurdenNativeMinor,
-        },
-        occurrence: occ,
-        isPaidThisMonth,
-        userShareBp,
-        dueDisplayMinor,
-        preserveDisplayMinor,
-        effectiveDisplayMinor,
-        targetDisplayMinor,
-        preservedDisplayMinor,
-      };
-    });
+        return {
+          ...ob,
+          accountId: ob.accountId ?? null,
+          accountName: resolvedAccId ? (accById.get(resolvedAccId)?.name ?? null) : null,
+          preserveAccountId: resolvedPreserveAccId,
+          preserveAccountName: resolvedPreserveAccId ? (accById.get(resolvedPreserveAccId)?.name ?? null) : null,
+          liabilityId: ob.liabilityId ?? null,
+          liabilityName: resolvedLiabId ? (liabById.get(resolvedLiabId)?.name ?? null) : null,
+          metrics: {
+            ...metrics,
+            monthlyPreserveNativeMinor: effectivePreserveNativeMinor,
+            effectiveMonthlyBurdenNativeMinor: effectiveBurdenNativeMinor,
+          },
+          occurrence: occ,
+          isPaidThisMonth,
+          userShareBp,
+          dueDisplayMinor,
+          preserveDisplayMinor,
+          effectiveDisplayMinor,
+          targetDisplayMinor,
+          preservedDisplayMinor,
+        };
+      })
+      .filter((ob) => isObligationVisibleInMonth(ob, ym, ob.metrics, ob.occurrence));
 
-    const potTree = buildPotRollupTree(pots, obligations, outflowExpenses, ym, cur, rateMap);
+    const potTree = buildPotRollupTree(pots, obligations, outflowExpenses, ym, cur, rateMap, occByOb);
 
     // Monthly Income streams + explicit arrival tracking (income_occurrences)
     const incomeOccurrences = store.listIncomeOccurrences(
@@ -343,6 +360,15 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     // - Most bills are scheduled around the 1st–25th, while salary arrives around the 27th.
     // - Therefore this month's spending (1st–26th) is funded by Previous Month Overflow (from last month's 27th salary),
     //   while this month's 27th salary (dotted until ticked received on Timeline) is bridged to fund Next Month's pre-salary bills!
+    const [yrNum, moNum] = ym.split('-').map(Number);
+    const daysInMonth = new Date(yrNum, moNum, 0).getDate();
+    const todayIso = new Date().toISOString().slice(0, 10);
+    const currentYm = todayIso.slice(0, 7);
+    const currentDay = currentYm === ym ? Number(todayIso.slice(8, 10)) : 1;
+    const isPastMonth = ym < currentYm;
+    const isCurrentMonth = ym === currentYm;
+    const isFutureMonth = ym > currentYm;
+
     const prevYm = shiftYearMonth(ym, -1);
     const nextYm = shiftYearMonth(ym, 1);
     const primaryPaydayDay =
@@ -363,8 +389,39 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
         return sum + convertMinor(m.effectiveMonthlyBurdenNativeMinor, ob.currency, cur, rateMap);
       }, 0);
 
+    const todayAllRunwayCashMinor = accounts
+      .filter((a) => a.isPrimaryRunway)
+      .reduce((s, a) => s + convertMinor(a.balanceMinor, a.currency, cur, rateMap), 0);
+
+    const paidObligationsThisMonthMinor = enrichedObligations
+      .filter((ob) => ob.isPaidThisMonth && ob.occurrence)
+      .reduce((s, ob) => {
+        const occ = ob.occurrence!;
+        const actualNativeMinor =
+          occ.actualPaidMinor ??
+          (ob.metrics.isDueThisMonth ? ob.amountMinor : ob.metrics.monthlyPreserveNativeMinor || ob.amountMinor);
+        return s + convertMinor(actualNativeMinor, ob.currency, cur, rateMap);
+      }, 0);
+
+    const nonTransferInflowsMinor = expenses
+      .filter(
+        (e) =>
+          e.flowDirection === 'inflow' &&
+          (e.kind ?? 'expense') !== 'transfer' &&
+          (e.status ?? 'posted') !== 'reversed' &&
+          (e.status ?? 'posted') !== 'refunded'
+      )
+      .reduce((s, e) => s + e.displayAmountMinor, 0);
+
+    const completedOutflowsAllMinor =
+      paidObligationsThisMonthMinor + postedSpendMinor + pendingSpendMinor - nonTransferInflowsMinor;
+
     const earlyMonthReceivedMinor = activeIncomes
       .filter((i) => i.paydayDay < 12 && i.isReceivedThisMonth)
+      .reduce((s, i) => s + i.monthlyDisplayMinor, 0);
+
+    const earlyMonthAllMinor = activeIncomes
+      .filter((i) => i.paydayDay < 12)
       .reduce((s, i) => s + i.monthlyDisplayMinor, 0);
 
     const overflowInMinor = Math.max(
@@ -372,8 +429,13 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       (prevCycleSalaryMinor > 0 ? prevCycleSalaryMinor - prevPostPaydayObMinor : 0) + earlyMonthReceivedMinor
     );
 
-    const thisMonthBufferMinor = Math.max(0, overflowInMinor - potPlannedTotalMinor);
-    const thisMonthShortfallMinor = Math.max(0, potPlannedTotalMinor - overflowInMinor);
+    // Actual pre-salary cash available to fund this month's pots (avoids double-counting last month's already-swept surplus on Sankey)
+    const activeOverflowInMinor = isCurrentMonth
+      ? Math.min(overflowInMinor, Math.max(0, todayAllRunwayCashMinor + completedOutflowsAllMinor))
+      : Math.max(0, potPlannedTotalMinor - earlyMonthAllMinor + earlyMonthReceivedMinor);
+
+    const thisMonthBufferMinor = Math.max(0, activeOverflowInMinor - potPlannedTotalMinor);
+    const thisMonthShortfallMinor = Math.max(0, potPlannedTotalMinor - activeOverflowInMinor);
 
     // 2. Next Month Needed Before Next Salary (1st .. primaryPaydayDay - 1 of nextYm)
     const nextMonthPreSalaryObligations = obligations.filter(
@@ -426,14 +488,12 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       .filter((i) => i.isReceivedThisMonth)
       .reduce((s, i) => s + i.monthlyDisplayMinor, 0);
     const upcomingSalaryPendingMinor = upcomingSalaryTotalMinor - upcomingSalaryReceivedMinor;
-    const projectedFreeFromUpcomingMinor = Math.max(0, upcomingSalaryTotalMinor - nextMonthPreSalaryMinor);
+    const projectedFreeFromUpcomingMinor = Math.max(
+      0,
+      activeOverflowInMinor + upcomingSalaryTotalMinor - potPlannedTotalMinor - nextMonthPreSalaryMinor
+    );
 
     // --- Per-Account Diagnostics, Locked Sinking Reserves & Automated Smart Financial Advisory ---
-    const [yrNum, moNum] = ym.split('-').map(Number);
-    const daysInMonth = new Date(yrNum, moNum, 0).getDate();
-    const todayIso = new Date().toISOString().slice(0, 10);
-    const currentDay = todayIso.slice(0, 7) === ym ? Number(todayIso.slice(8, 10)) : 1;
-    const isPastMonth = ym < todayIso.slice(0, 7);
 
     const potById = new Map(pots.map((p) => [p.id, p]));
     const accountAnalytics = accounts.map((acc) => {
@@ -468,15 +528,36 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
 
       const lockedPreserveMinor = lockedItems.reduce((s, x) => s + x.preservedMinor, 0);
       const lockedPreserveDisplayMinor = lockedItems.reduce((s, x) => s + x.preservedDisplayMinor, 0);
+      const positiveCashMinor = Math.max(0, acc.balanceMinor);
+      const fundedPreserveMinor = Math.min(positiveCashMinor, lockedPreserveMinor);
+      const fundedPreserveDisplayMinor = convertMinor(fundedPreserveMinor, acc.currency, cur, rateMap);
       const trueAvailableMinor = Math.max(0, acc.balanceMinor - lockedPreserveMinor);
       const trueAvailableDisplayMinor = convertMinor(trueAvailableMinor, acc.currency, cur, rateMap);
-      const unfundedPreserveShortfallMinor = Math.max(0, lockedPreserveMinor - Math.max(0, acc.balanceMinor));
+      const unfundedPreserveShortfallMinor = Math.max(0, lockedPreserveMinor - positiveCashMinor);
       const unfundedPreserveShortfallDisplayMinor = convertMinor(
         unfundedPreserveShortfallMinor,
         acc.currency,
         cur,
         rateMap
       );
+
+      const accPendingDebitNativeMinor =
+        acc.pendingDebitMinor != null
+          ? acc.pendingDebitMinor
+          : expenses
+              .filter((e) => e.accountId === acc.id && e.status === 'pending' && e.flowDirection === 'outflow')
+              .reduce((s, e) => s + convertMinor(e.amountMinor, e.currency, acc.currency, rateMap), 0);
+      const accPendingCreditNativeMinor =
+        acc.pendingCreditMinor != null
+          ? acc.pendingCreditMinor
+          : expenses
+              .filter((e) => e.accountId === acc.id && e.status === 'pending' && e.flowDirection === 'inflow')
+              .reduce((s, e) => s + convertMinor(e.amountMinor, e.currency, acc.currency, rateMap), 0);
+      const bookedBalanceMinor =
+        acc.bookedBalanceMinor != null
+          ? acc.bookedBalanceMinor
+          : acc.balanceMinor + accPendingDebitNativeMinor - accPendingCreditNativeMinor;
+      const displayBookedBalanceMinor = convertMinor(bookedBalanceMinor, acc.currency, cur, rateMap);
 
       // 2. Unpaid obligations scheduled on this account (before payday vs full month)
       const accUnpaidPrePaydayObs = isPastMonth
@@ -516,10 +597,18 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       const pocketTargetDisplayMinor = convertMinor(pocketTargetNativeMinor, acc.currency, cur, rateMap);
       const pocketRemainingNativeMinor = Math.max(0, pocketTargetNativeMinor - spentThisMonthNativeMinor);
       const pocketRemainingDisplayMinor = convertMinor(pocketRemainingNativeMinor, acc.currency, cur, rateMap);
+      // Cap spendable pocket money by actual available cash on the account
+      const spendablePocketMoneyMinor = Math.min(pocketRemainingNativeMinor, trueAvailableMinor);
+      const spendablePocketMoneyDisplayMinor = convertMinor(spendablePocketMoneyMinor, acc.currency, cur, rateMap);
 
       // 5. Pre-payday net sufficiency on this specific account (True Available Cash minus Pre-Payday Unpaid Bills)
-      const netPrePaydayNativeMinor = trueAvailableMinor - unpaidPrePaydayNativeMinor;
-      const netPrePaydayDisplayMinor = trueAvailableDisplayMinor - unpaidPrePaydayDisplayMinor;
+      // In future months, accounts are funded by the prior month's salary distribution before the 1st of the month.
+      const netPrePaydayNativeMinor = isFutureMonth
+        ? Math.max(0, trueAvailableMinor - unpaidPrePaydayNativeMinor)
+        : trueAvailableMinor - unpaidPrePaydayNativeMinor;
+      const netPrePaydayDisplayMinor = isFutureMonth
+        ? Math.max(0, trueAvailableDisplayMinor - unpaidPrePaydayDisplayMinor)
+        : trueAvailableDisplayMinor - unpaidPrePaydayDisplayMinor;
 
       return {
         accountId: acc.id,
@@ -530,8 +619,16 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
         isPrimaryRunway: acc.isPrimaryRunway,
         balanceMinor: acc.balanceMinor,
         displayBalanceMinor,
+        bookedBalanceMinor,
+        displayBookedBalanceMinor,
+        pendingDebitMinor: accPendingDebitNativeMinor,
+        pendingCreditMinor: accPendingCreditNativeMinor,
+        observedAt: acc.observedAt ?? null,
+        lastReconciledAt: acc.lastReconciledAt ?? null,
         lockedPreserveMinor,
         lockedPreserveDisplayMinor,
+        fundedPreserveMinor,
+        fundedPreserveDisplayMinor,
         trueAvailableMinor,
         trueAvailableDisplayMinor,
         unfundedPreserveShortfallMinor,
@@ -553,9 +650,11 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
         pocketMoneyTargetDisplayMinor: pocketTargetDisplayMinor,
         pocketMoneyRemainingMinor: pocketRemainingNativeMinor,
         pocketMoneyRemainingDisplayMinor: pocketRemainingDisplayMinor,
+        spendablePocketMoneyMinor,
+        spendablePocketMoneyDisplayMinor,
         netPrePaydayNativeMinor,
         netPrePaydayDisplayMinor,
-        isPrePaydaySufficient: netPrePaydayDisplayMinor >= 0,
+        isPrePaydaySufficient: isFutureMonth ? true : netPrePaydayDisplayMinor >= 0,
       };
     });
 
@@ -575,7 +674,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       actionLabel?: string;
     }> = [];
 
-    if (!isPastMonth) {
+    if (isCurrentMonth) {
       const surplusAccounts = accountAnalytics
         .filter((a) => a.isPrimaryRunway && a.netPrePaydayDisplayMinor > 2500)
         .sort((a, b) => b.netPrePaydayDisplayMinor - a.netPrePaydayDisplayMinor);
@@ -622,15 +721,22 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
           accountId: accStat.accountId,
           accountName: accStat.name,
           title:
-            accStat.trueAvailableDisplayMinor === 0
-              ? `100% of ${accStat.name} is Committed to Upcoming Annual Bills`
-              : `Earmarked Sinking Reserves on ${accStat.name}`,
+            accStat.unfundedPreserveShortfallDisplayMinor > 0
+              ? `Reserve Underfunding Shortfall on ${accStat.name}`
+              : accStat.trueAvailableDisplayMinor === 0
+                ? `100% of ${accStat.name} is Committed to Upcoming Annual Bills`
+                : `Earmarked Sinking Reserves on ${accStat.name}`,
           description:
-            accStat.trueAvailableDisplayMinor === 0
-              ? `Funds sitting on ${accStat.name} are already reserved for planned annual renewals (${itemNames}). Real free savings available to spend: 0.00. Avoid withdrawing these funds.`
-              : `Part of ${accStat.name} is locked for upcoming annual renewals (${itemNames}). Only the remaining unlocked balance is true free savings.`,
+            accStat.unfundedPreserveShortfallDisplayMinor > 0
+              ? `${accStat.name} holds ${(accStat.fundedPreserveDisplayMinor / 100).toFixed(2)} against ${(accStat.lockedPreserveDisplayMinor / 100).toFixed(2)} of recorded annual reserves (${itemNames}) — an underfunded shortfall of ${(accStat.unfundedPreserveShortfallDisplayMinor / 100).toFixed(2)}. Free cash: 0.00.`
+              : accStat.trueAvailableDisplayMinor === 0
+                ? `Funds sitting on ${accStat.name} are already reserved for planned annual renewals (${itemNames}). Real free savings available to spend: 0.00. Avoid withdrawing these funds.`
+                : `Part of ${accStat.name} is locked for upcoming annual renewals (${itemNames}). Only the remaining unlocked balance is true free savings.`,
           amountDisplayMinor: accStat.lockedPreserveDisplayMinor,
-          secondaryDisplayMinor: accStat.trueAvailableDisplayMinor,
+          secondaryDisplayMinor:
+            accStat.unfundedPreserveShortfallDisplayMinor > 0
+              ? accStat.unfundedPreserveShortfallDisplayMinor
+              : accStat.trueAvailableDisplayMinor,
         });
       }
     }
@@ -644,22 +750,25 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
           ? convertMinor(15000, 'GBP', cur, rateMap)
           : 0;
       if (effectiveTargetMinor > 0) {
-        const remainingMinor = Math.max(0, effectiveTargetMinor - accStat.spentThisMonthDisplayMinor);
+        const allowanceRemainingMinor = Math.max(0, effectiveTargetMinor - accStat.spentThisMonthDisplayMinor);
+        const spendableMinor = Math.min(allowanceRemainingMinor, accStat.trueAvailableDisplayMinor);
         const overBudgetMinor = Math.max(0, accStat.spentThisMonthDisplayMinor - effectiveTargetMinor);
         const daysLeftToPayday = Math.max(1, primaryPaydayDay - currentDay);
         advisories.push({
           id: `adv-pocket-${accStat.accountId}`,
           kind: 'pocket_money_tracker',
-          severity: overBudgetMinor > 0 ? 'warning' : 'good',
+          severity: overBudgetMinor > 0 || spendableMinor < allowanceRemainingMinor ? 'warning' : 'good',
           accountId: accStat.accountId,
           accountName: accStat.name,
           title: `Pocket Money Fund · ${accStat.name}`,
           description:
             overBudgetMinor > 0
               ? `Small spending on ${accStat.name} has exceeded your monthly pocket-money allowance by ${(overBudgetMinor / 100).toFixed(2)}.`
-              : `You have ${(remainingMinor / 100).toFixed(2)} remaining in your monthly small-spending allowance (~${(remainingMinor / daysLeftToPayday / 100).toFixed(2)}/day until payday). Sticking to this target protects your month-end savings sweep!`,
-          amountDisplayMinor: remainingMinor,
-          secondaryDisplayMinor: effectiveTargetMinor,
+              : spendableMinor < allowanceRemainingMinor
+                ? `Pocket allowance remaining is ${(allowanceRemainingMinor / 100).toFixed(2)}, but actual available cash on ${accStat.name} caps spendable funds at ${(spendableMinor / 100).toFixed(2)} (~${(spendableMinor / daysLeftToPayday / 100).toFixed(2)}/day until payday).`
+                : `You have ${(allowanceRemainingMinor / 100).toFixed(2)} remaining in your monthly small-spending allowance (~${(allowanceRemainingMinor / daysLeftToPayday / 100).toFixed(2)}/day until payday). Sticking to this target protects your month-end savings sweep!`,
+          amountDisplayMinor: spendableMinor,
+          secondaryDisplayMinor: allowanceRemainingMinor,
         });
       }
     }
@@ -679,13 +788,83 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       ? expenses.filter((e) => e.accountId === selectedAccountId)
       : expenses;
 
-    const runwayCashMinor = selectedAccountId
+    const baseTodayRunwayCashMinor = selectedAccountId
       ? accounts
           .filter((a) => a.id === selectedAccountId)
           .reduce((s, a) => s + convertMinor(a.balanceMinor, a.currency, cur, rateMap), 0)
       : accounts
           .filter((a) => a.isPrimaryRunway)
           .reduce((s, a) => s + convertMinor(a.balanceMinor, a.currency, cur, rateMap), 0);
+
+    // For future months (ym > currentYm), chain the projected month-end balance forward from currentYm
+    // so next month's opening balance equals this month's projected ending balance to the exact penny!
+    let projectedOpeningRunwayCashMinor = baseTodayRunwayCashMinor;
+    if (isFutureMonth) {
+      let cursorYm = currentYm;
+      let guard = 0;
+      while (cursorYm < ym && guard < 120) {
+        guard++;
+        const isStepCur = cursorYm === currentYm;
+        const stepOccs = store.listPaymentOccurrences(
+          cursorYm,
+          obligations.map((o) => o.id)
+        );
+        const stepOccByOb = new Map(stepOccs.map((o) => [o.obligationId, o]));
+        const stepIncOccs = store.listIncomeOccurrences(
+          cursorYm,
+          incomes.map((i) => i.id)
+        );
+        const stepIncOccById = new Map(stepIncOccs.map((io) => [io.incomeId, io]));
+        const stepExps = store
+          .listExpenses(wsIds, cursorYm, cursorYm)
+          .filter(
+            (e) =>
+              e.spentDate.slice(0, 7) === cursorYm &&
+              e.flowDirection !== 'inflow' &&
+              (e.kind ?? 'expense') !== 'transfer' &&
+              (e.status ?? 'posted') !== 'reversed' &&
+              (e.status ?? 'posted') !== 'refunded'
+          );
+        const stepPotTree = buildPotRollupTree(pots, obligations, stepExps, cursorYm, cur, rateMap, stepOccByOb);
+        const sumStepEnv = (node: (typeof stepPotTree)[number]): number =>
+          node.unallocatedEnvelopeDisplayMinor + node.children.reduce((acc, c) => acc + sumStepEnv(c), 0);
+        const stepEnvRemMinor = selectedAccountId ? 0 : stepPotTree.reduce((s, n) => s + sumStepEnv(n), 0);
+
+        const stepRemIncomesMinor = incomes
+          .filter((inc) => !selectedAccountId || inc.accountId === selectedAccountId)
+          .reduce((s, inc) => {
+            const mMinor = computeMonthlyIncomeMinor(inc, cursorYm, cur, rateMap);
+            if (mMinor <= 0) return s;
+            const isRec = isStepCur && stepIncOccById.get(inc.id)?.status === 'received';
+            return isRec ? s : s + mMinor;
+          }, 0);
+
+        let stepUnpaidObMinor = 0;
+        for (const ob of obligations) {
+          const occ = stepOccByOb.get(ob.id) ?? null;
+          const m = computeObligationMonthMetrics(ob, cursorYm, occ);
+          if (!isObligationVisibleInMonth(ob, cursorYm, m, occ)) continue;
+          if (occ?.status === 'paid') continue;
+          if (
+            selectedAccountId &&
+            ob.accountId !== selectedAccountId &&
+            !(!m.isDueThisMonth && ob.preserveAccountId === selectedAccountId)
+          ) {
+            continue;
+          }
+          const amtNative = m.isDueThisMonth ? m.dueThisMonthNativeMinor : m.monthlyPreserveNativeMinor;
+          if (amtNative > 0) {
+            stepUnpaidObMinor += convertMinor(amtNative, ob.currency, cur, rateMap);
+          }
+        }
+
+        projectedOpeningRunwayCashMinor =
+          projectedOpeningRunwayCashMinor + stepRemIncomesMinor - (stepUnpaidObMinor + stepEnvRemMinor);
+        cursorYm = shiftYearMonth(cursorYm, 1);
+      }
+    }
+
+    const runwayCashMinor = isFutureMonth ? projectedOpeningRunwayCashMinor : baseTodayRunwayCashMinor;
 
     const unpaidBillsMinor = filteredObligations
       .filter((o) => o.metrics.isDueThisMonth && !o.isPaidThisMonth)
@@ -770,13 +949,20 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     }> = [];
 
     for (const exp of filteredExpenses) {
+      if ((exp.status ?? 'posted') === 'reversed' || (exp.status ?? 'posted') === 'refunded') continue;
+      const bankTs = exp.bankTimestamp || (exp.spentDate.includes('T') ? exp.spentDate : null);
       const timePart =
-        exp.createdAt && exp.createdAt.length >= 16 && /^\d{2}:\d{2}/.test(exp.createdAt.slice(11, 16))
-          ? exp.createdAt.slice(11, 16)
-          : '12:00';
-      const timestamp = `${exp.spentDate}T${timePart}:00Z`;
-      const day = Math.min(daysInMonth, Math.max(1, Number(exp.spentDate.slice(8, 10)) || 1));
+        bankTs && bankTs.length >= 16 && /^\d{2}:\d{2}/.test(bankTs.slice(11, 16))
+          ? bankTs.slice(11, 16)
+          : exp.createdAt && exp.createdAt.length >= 16 && /^\d{2}:\d{2}/.test(exp.createdAt.slice(11, 16))
+            ? exp.createdAt.slice(11, 16)
+            : '12:00';
+      const dateOnly = exp.spentDate.slice(0, 10);
+      const timestamp = `${dateOnly}T${timePart}:00Z`;
+      const day = Math.min(daysInMonth, Math.max(1, Number(dateOnly.slice(8, 10)) || 1));
       const pot = exp.potId ? potById.get(exp.potId) : undefined;
+      const isTransfer = (exp.kind ?? 'expense') === 'transfer';
+      const statusLabel = (exp.status ?? 'posted') === 'pending' ? ' [Pending]' : '';
       timelineLedger.push({
         id: `led-exp-${exp.id}`,
         kind: 'expense',
@@ -787,11 +973,13 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
         accountId: exp.accountId ?? null,
         accountName: exp.accountName ?? null,
         potId: exp.potId,
-        potName: pot?.name ?? null,
-        potColor: pot?.color ?? (exp.flowDirection === 'inflow' ? '#10B981' : '#E11D48'),
-        title: exp.merchant,
+        potName: isTransfer ? 'Internal Transfer' : (pot?.name ?? null),
+        potColor: isTransfer
+          ? '#6366F1'
+          : (pot?.color ?? (exp.flowDirection === 'inflow' ? '#10B981' : '#E11D48')),
+        title: `${exp.merchant}${statusLabel}`,
         subtitle: exp.description || '',
-        date: exp.spentDate,
+        date: dateOnly,
         timestamp,
         day,
         amountMinor: exp.amountMinor,
@@ -951,6 +1139,21 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
         }
       }
 
+      // 4. Remaining unallocated pot envelopes (Groceries & Discretionary) before late-month salary
+      const envelopeReserveDay = Math.min(
+        daysInMonth,
+        Math.max(isCurrentMonth ? currentDay + 1 : 15, primaryPaydayDay - 3)
+      );
+      if (!isPastMonth && unallocatedEnvelopeRemainingMinor > 0 && d === envelopeReserveDay) {
+        cumDelta -= unallocatedEnvelopeRemainingMinor;
+        dayEvents.push({
+          id: `env-rem-${ym}`,
+          kind: 'unpaid_bill',
+          title: 'Remaining Pot Envelopes (Groceries & Discretionary)',
+          displayMinor: unallocatedEnvelopeRemainingMinor,
+        });
+      }
+
       const labels = dayEvents.map((ev) => `${ev.kind === 'income' ? '+' : '-'}${ev.title}`);
       rawDailySteps.push({
         day: d,
@@ -1054,6 +1257,8 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     const expsByYm = new Map<string, typeof allHistoryExpenses>();
     for (const e of allHistoryExpenses) {
       if (e.flowDirection === 'inflow') continue;
+      if ((e.kind ?? 'expense') === 'transfer') continue;
+      if ((e.status ?? 'posted') === 'reversed' || (e.status ?? 'posted') === 'refunded') continue;
       const k = e.spentDate.slice(0, 7);
       const arr = expsByYm.get(k);
       if (arr) arr.push(e);
@@ -1485,6 +1690,14 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       }
     }
 
+    const transfers = store.listTransfers(allReadableWsIds, { yearMonth: ym });
+    const totalLockedPreserveMinor = accountAnalytics.reduce((s, a) => s + a.lockedPreserveDisplayMinor, 0);
+    const totalFundedPreserveMinor = accountAnalytics.reduce((s, a) => s + a.fundedPreserveDisplayMinor, 0);
+    const totalUnfundedPreserveShortfallMinor = accountAnalytics.reduce(
+      (s, a) => s + a.unfundedPreserveShortfallDisplayMinor,
+      0
+    );
+
     return {
       yearMonth: ym,
       scope,
@@ -1503,20 +1716,30 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       allObligations: enrichedObligations,
       expenses: filteredExpenses,
       allExpenses: expenses,
+      transfers,
       timelineLedger,
       kpis: {
         totalIncomeMinor,
         potPlannedTotalMinor,
+        postedSpendMinor,
+        pendingSpendMinor,
         totalPreserveSliceMinor,
+        totalLockedPreserveMinor,
+        totalFundedPreserveMinor,
+        totalUnfundedPreserveShortfallMinor,
         netMonthlySurplusMinor,
         savingsRatePct: totalIncomeMinor > 0 ? Math.round((netMonthlySurplusMinor / totalIncomeMinor) * 1000) / 10 : 0,
       },
       runway: {
+        openingBalanceMinor: startOfMonthCashMinor,
         runwayCashMinor,
         remainingPaydaysIncomeMinor,
         unpaidBillsMinor,
         unpaidPrePaydayBillsMinor,
         totalPreserveSliceMinor,
+        totalLockedPreserveMinor,
+        totalFundedPreserveMinor,
+        totalUnfundedPreserveShortfallMinor,
         unallocatedEnvelopeRemainingMinor,
         totalNeededBeforePaydayMinor,
         prePaydayBufferMinor,
@@ -1533,6 +1756,7 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
         nextYearMonth: nextYm,
         primaryPaydayDay,
         overflowInMinor,
+        activeOverflowInMinor,
         thisMonthSpendingMinor: potPlannedTotalMinor,
         thisMonthBufferMinor,
         thisMonthShortfallMinor,
@@ -2042,48 +2266,201 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     return fs.createReadStream(snapPath);
   });
 
-  // --- CRUD: Bank Accounts ---
+  // --- CRUD: Bank Accounts & Balance Snapshots ---
+  app.get('/api/accounts', async (req, reply) => {
+    const user = requireUser(req, reply, store, cfg);
+    if (!user) return;
+    const q = (req.query || {}) as { scope?: string; yearMonth?: string };
+    const wsIds = store.readableWorkspaceIds(user.id, q.scope || 'all');
+    return { accounts: store.listAccountsEnriched(wsIds, q.yearMonth) };
+  });
+
+  app.get('/api/accounts/:id', async (req, reply) => {
+    const user = requireUser(req, reply, store, cfg);
+    if (!user) return;
+    const { id } = req.params as { id: string };
+    const q = (req.query || {}) as { yearMonth?: string };
+    const acc = store.getAccountEnriched(id, q.yearMonth);
+    if (!acc || !store.canReadWorkspaceItems(user.id, acc.workspaceId)) {
+      return reply.code(404).send({ error: 'Account not found' });
+    }
+    return { account: acc };
+  });
+
   app.post('/api/accounts', async (req, reply) => {
     const user = requireUser(req, reply, store, cfg);
     if (!user) return;
     const b = (req.body || {}) as Record<string, unknown>;
-    const wsId = String(b.workspaceId || user.personalWorkspaceId);
+    const existing = b.id ? store.getAccountById(String(b.id)) : null;
+    const wsId = String(b.workspaceId || existing?.workspaceId || user.personalWorkspaceId);
     if (!store.canWriteWorkspace(user.id, wsId)) return reply.code(403).send({ error: 'Write denied' });
-    const id = b.id ? String(b.id) : `acc-${crypto.randomUUID().slice(0, 8)}`;
-    const existingAcc = b.id
-      ? (store.db.prepare(`SELECT pocket_money_target_minor FROM accounts WHERE id = ?`).get(id) as
-          | { pocket_money_target_minor: number }
-          | undefined)
-      : undefined;
-    const pocketTargetMinor =
-      b.pocketMoneyTargetMinor !== undefined
-        ? Math.max(0, Math.round(Number(b.pocketMoneyTargetMinor || 0)))
-        : existingAcc?.pocket_money_target_minor ?? 0;
 
-    store.db
-      .prepare(
-        `INSERT INTO accounts (id, workspace_id, name, institution, currency, balance_minor, pocket_money_target_minor, is_primary_runway, portal_url, notes, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET
-           workspace_id=excluded.workspace_id, name=excluded.name, institution=excluded.institution, currency=excluded.currency,
-           balance_minor=excluded.balance_minor, pocket_money_target_minor=excluded.pocket_money_target_minor,
-           is_primary_runway=excluded.is_primary_runway,
-           portal_url=excluded.portal_url, notes=excluded.notes, updated_at=excluded.updated_at`
-      )
-      .run(
-        id,
-        wsId,
-        String(b.name || 'Account'),
-        String(b.institution || ''),
-        String(b.currency || user.defaultCurrency),
-        Math.round(Number(b.balanceMinor ?? 0)),
-        pocketTargetMinor,
-        b.isPrimaryRunway === false ? 0 : 1,
-        b.portalUrl ? String(b.portalUrl) : null,
-        b.notes ? String(b.notes) : null,
-        new Date().toISOString()
-      );
-    return { ok: true, id };
+    const notesPatch =
+      typeof b.notes === 'string'
+        ? b.notes.trim()
+          ? b.notes
+          : b.clearNotes
+            ? null
+            : existing?.notes ?? null
+        : b.clearNotes
+          ? null
+          : undefined;
+
+    const saved = store.upsertAccount({
+      id: b.id ? String(b.id) : undefined,
+      workspaceId: b.workspaceId !== undefined ? String(b.workspaceId) : existing ? undefined : wsId,
+      name: b.name !== undefined ? String(b.name) : undefined,
+      institution: b.institution !== undefined ? String(b.institution) : undefined,
+      currency: b.currency !== undefined ? (String(b.currency) as CurrencyCode) : existing ? undefined : user.defaultCurrency,
+      balanceMinor:
+        b.balanceMinor !== undefined
+          ? Math.round(Number(b.balanceMinor))
+          : b.availableBalanceMinor !== undefined
+            ? Math.round(Number(b.availableBalanceMinor))
+            : undefined,
+      bookedBalanceMinor:
+        b.bookedBalanceMinor !== undefined
+          ? b.bookedBalanceMinor != null
+            ? Math.round(Number(b.bookedBalanceMinor))
+            : null
+          : undefined,
+      pendingDebitMinor:
+        b.pendingDebitMinor !== undefined
+          ? b.pendingDebitMinor != null
+            ? Math.round(Number(b.pendingDebitMinor))
+            : null
+          : undefined,
+      pendingCreditMinor:
+        b.pendingCreditMinor !== undefined
+          ? b.pendingCreditMinor != null
+            ? Math.round(Number(b.pendingCreditMinor))
+            : null
+          : undefined,
+      observedAt: b.observedAt !== undefined ? (b.observedAt ? String(b.observedAt) : null) : undefined,
+      snapshotSource: b.snapshotSource !== undefined ? (b.snapshotSource ? String(b.snapshotSource) : null) : undefined,
+      snapshotEvidence:
+        b.snapshotEvidence !== undefined ? (b.snapshotEvidence ? String(b.snapshotEvidence) : null) : undefined,
+      lastReconciledAt:
+        b.lastReconciledAt !== undefined ? (b.lastReconciledAt ? String(b.lastReconciledAt) : null) : undefined,
+      pocketMoneyTargetMinor:
+        b.pocketMoneyTargetMinor !== undefined
+          ? Math.max(0, Math.round(Number(b.pocketMoneyTargetMinor || 0)))
+          : undefined,
+      isPrimaryRunway: b.isPrimaryRunway !== undefined ? Boolean(b.isPrimaryRunway) : undefined,
+      portalUrl:
+        typeof b.portalUrl === 'string'
+          ? b.portalUrl.trim() || null
+          : b.portalUrl === null && !existing
+            ? null
+            : undefined,
+      notes: notesPatch,
+    });
+    return { ok: true, id: saved.id, account: store.getAccountEnriched(saved.id) };
+  });
+
+  app.patch('/api/accounts/:id', async (req, reply) => {
+    const user = requireUser(req, reply, store, cfg);
+    if (!user) return;
+    const { id } = req.params as { id: string };
+    const existing = store.getAccountById(id);
+    if (!existing || !store.canWriteWorkspace(user.id, existing.workspaceId)) {
+      return reply.code(403).send({ error: 'Account not found or write denied' });
+    }
+    const b = (req.body || {}) as Record<string, unknown>;
+    const saved = store.upsertAccount({
+      id,
+      workspaceId: b.workspaceId !== undefined ? String(b.workspaceId) : undefined,
+      name: b.name !== undefined ? String(b.name) : undefined,
+      institution: b.institution !== undefined ? String(b.institution) : undefined,
+      currency: b.currency !== undefined ? (String(b.currency) as CurrencyCode) : undefined,
+      balanceMinor:
+        b.balanceMinor !== undefined
+          ? Math.round(Number(b.balanceMinor))
+          : b.availableBalanceMinor !== undefined
+            ? Math.round(Number(b.availableBalanceMinor))
+            : undefined,
+      bookedBalanceMinor:
+        b.bookedBalanceMinor !== undefined
+          ? b.bookedBalanceMinor != null
+            ? Math.round(Number(b.bookedBalanceMinor))
+            : null
+          : undefined,
+      pendingDebitMinor:
+        b.pendingDebitMinor !== undefined
+          ? b.pendingDebitMinor != null
+            ? Math.round(Number(b.pendingDebitMinor))
+            : null
+          : undefined,
+      pendingCreditMinor:
+        b.pendingCreditMinor !== undefined
+          ? b.pendingCreditMinor != null
+            ? Math.round(Number(b.pendingCreditMinor))
+            : null
+          : undefined,
+      observedAt: b.observedAt !== undefined ? (b.observedAt ? String(b.observedAt) : null) : undefined,
+      snapshotSource: b.snapshotSource !== undefined ? (b.snapshotSource ? String(b.snapshotSource) : null) : undefined,
+      snapshotEvidence:
+        b.snapshotEvidence !== undefined ? (b.snapshotEvidence ? String(b.snapshotEvidence) : null) : undefined,
+      lastReconciledAt:
+        b.lastReconciledAt !== undefined ? (b.lastReconciledAt ? String(b.lastReconciledAt) : null) : undefined,
+      pocketMoneyTargetMinor:
+        b.pocketMoneyTargetMinor !== undefined ? Math.max(0, Math.round(Number(b.pocketMoneyTargetMinor))) : undefined,
+      isPrimaryRunway: b.isPrimaryRunway !== undefined ? Boolean(b.isPrimaryRunway) : undefined,
+      portalUrl: b.portalUrl !== undefined ? (b.portalUrl ? String(b.portalUrl) : null) : undefined,
+      notes: b.notes !== undefined ? (b.notes !== null ? String(b.notes) : null) : undefined,
+    });
+    return { ok: true, id: saved.id, account: store.getAccountEnriched(saved.id) };
+  });
+
+  app.post('/api/accounts/:id/snapshot', async (req, reply) => {
+    const user = requireUser(req, reply, store, cfg);
+    if (!user) return;
+    const { id } = req.params as { id: string };
+    const existing = store.getAccountById(id);
+    if (!existing || !store.canWriteWorkspace(user.id, existing.workspaceId)) {
+      return reply.code(403).send({ error: 'Account not found or write denied' });
+    }
+    const b = (req.body || {}) as Record<string, unknown>;
+    try {
+      const res = store.setAccountBalanceSnapshot({
+        accountId: id,
+        availableBalanceMinor:
+          b.availableBalanceMinor !== undefined ? Number(b.availableBalanceMinor) : undefined,
+        balanceMinor: b.balanceMinor !== undefined ? Number(b.balanceMinor) : undefined,
+        bookedBalanceMinor:
+          b.bookedBalanceMinor !== undefined
+            ? b.bookedBalanceMinor != null
+              ? Number(b.bookedBalanceMinor)
+              : null
+            : undefined,
+        pendingDebitMinor:
+          b.pendingDebitMinor !== undefined
+            ? b.pendingDebitMinor != null
+              ? Number(b.pendingDebitMinor)
+              : null
+            : undefined,
+        pendingCreditMinor:
+          b.pendingCreditMinor !== undefined
+            ? b.pendingCreditMinor != null
+              ? Number(b.pendingCreditMinor)
+              : null
+            : undefined,
+        observedAt: b.observedAt ? String(b.observedAt) : undefined,
+        source: b.source ? String(b.source) : undefined,
+        evidence: b.evidence ? String(b.evidence) : undefined,
+        reconciled: b.reconciled !== undefined ? Boolean(b.reconciled) : true,
+        notes: typeof b.notes === 'string' ? b.notes : undefined,
+        expectedVersion: b.expectedVersion !== undefined ? Number(b.expectedVersion) : undefined,
+      });
+      return {
+        ok: true,
+        before: res.before,
+        after: res.after,
+        account: store.getAccountEnriched(id),
+      };
+    } catch (err) {
+      return reply.code(400).send({ error: err instanceof Error ? err.message : 'Snapshot failed' });
+    }
   });
 
   app.delete('/api/accounts/:id', async (req, reply) => {
@@ -2553,58 +2930,76 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     const user = requireUser(req, reply, store, cfg);
     if (!user) return;
     const b = (req.body || {}) as Record<string, unknown>;
-    const wsId = String(b.workspaceId || 'ws-home');
+    const existingOb = b.id ? store.getObligationById(String(b.id)) : null;
+    const wsId = String(b.workspaceId || existingOb?.workspaceId || 'ws-home');
     if (!store.canWriteWorkspace(user.id, wsId)) return reply.code(403).send({ error: 'Write denied' });
     const id = b.id ? String(b.id) : `ob-${crypto.randomUUID().slice(0, 8)}`;
-    const cadence = (b.cadence as ObligationRecord['cadence']) || 'monthly';
-    const nextDueDate = String(b.nextDueDate || new Date().toISOString().slice(0, 10));
-    const dueDay = Number(nextDueDate.slice(8, 10)) || 1;
-    const intervalMonths = cadenceIntervalMonths(cadence, Number(b.intervalMonths || 1));
-    const currency = String(b.currency || user.defaultCurrency) as CurrencyCode;
+    const cadence = (b.cadence as ObligationRecord['cadence']) || existingOb?.cadence || 'monthly';
+    const nextDueDate = String(b.nextDueDate || existingOb?.nextDueDate || new Date().toISOString().slice(0, 10));
+    const dueDay = b.dueDay !== undefined ? Number(b.dueDay) : Number(nextDueDate.slice(8, 10)) || 1;
+    const intervalMonths = cadenceIntervalMonths(cadence, Number(b.intervalMonths ?? existingOb?.intervalMonths ?? 1));
+    const currency = String(b.currency || existingOb?.currency || user.defaultCurrency) as CurrencyCode;
 
-    const existingOb = b.id
-      ? (store.db.prepare(`SELECT account_id, preserve_account_id, liability_id FROM obligations WHERE id = ?`).get(id) as
-          | { account_id: string | null; preserve_account_id: string | null; liability_id: string | null }
-          | undefined)
-      : undefined;
     const accountId =
       b.accountId !== undefined
         ? b.accountId
           ? String(b.accountId)
           : null
-        : existingOb !== undefined
-        ? existingOb.account_id
-        : defaultAccountForWorkspace(store, wsId, currency);
+        : existingOb !== null
+          ? existingOb.accountId
+          : defaultAccountForWorkspace(store, wsId, currency);
     const preserveAccountId =
       b.preserveAccountId !== undefined
         ? b.preserveAccountId
           ? String(b.preserveAccountId)
           : null
-        : existingOb !== undefined
-        ? existingOb.preserve_account_id
-        : null;
+        : existingOb !== null
+          ? existingOb.preserveAccountId
+          : null;
     const liabilityId =
       b.liabilityId !== undefined
         ? b.liabilityId
           ? String(b.liabilityId)
           : null
-        : existingOb !== undefined
-        ? existingOb.liability_id
-        : null;
+        : existingOb !== null
+          ? existingOb.liabilityId
+          : null;
+    const finalAmountMinor =
+      b.finalAmountMinor !== undefined
+        ? b.finalAmountMinor != null && b.finalAmountMinor !== ''
+          ? Math.round(Number(b.finalAmountMinor))
+          : null
+        : (existingOb?.finalAmountMinor ?? null);
+    const endDate =
+      b.endDate !== undefined
+        ? b.endDate
+          ? String(b.endDate)
+          : null
+        : (existingOb?.endDate ?? null);
+    const remainingPayments =
+      b.remainingPayments !== undefined
+        ? b.remainingPayments != null && b.remainingPayments !== ''
+          ? Number(b.remainingPayments)
+          : null
+        : (existingOb?.remainingPayments ?? null);
 
     store.db
       .prepare(
         `INSERT INTO obligations (
-           id, workspace_id, pot_id, account_id, preserve_account_id, liability_id, name, amount_minor, currency, cadence, interval_months,
-           next_due_date, due_day, preserved_minor, auto_preserve, split_mode, wadera_split_bp,
-           tags_json, manage_url, portal_url, reference_number, renewal_notice_days, notes, is_active
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           id, workspace_id, pot_id, account_id, preserve_account_id, liability_id, name,
+           amount_minor, final_amount_minor, currency, cadence, interval_months,
+           next_due_date, end_date, remaining_payments, due_day, preserved_minor, auto_preserve,
+           split_mode, wadera_split_bp, tags_json, manage_url, portal_url, reference_number,
+           renewal_notice_days, notes, is_active
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            workspace_id=excluded.workspace_id, pot_id=excluded.pot_id, account_id=excluded.account_id,
            preserve_account_id=excluded.preserve_account_id, liability_id=excluded.liability_id, name=excluded.name,
-           amount_minor=excluded.amount_minor, currency=excluded.currency, cadence=excluded.cadence,
-           interval_months=excluded.interval_months, next_due_date=excluded.next_due_date, due_day=excluded.due_day,
-           preserved_minor=excluded.preserved_minor, auto_preserve=excluded.auto_preserve,
+           amount_minor=excluded.amount_minor, final_amount_minor=excluded.final_amount_minor,
+           currency=excluded.currency, cadence=excluded.cadence,
+           interval_months=excluded.interval_months, next_due_date=excluded.next_due_date,
+           end_date=excluded.end_date, remaining_payments=excluded.remaining_payments,
+           due_day=excluded.due_day, preserved_minor=excluded.preserved_minor, auto_preserve=excluded.auto_preserve,
            split_mode=excluded.split_mode, wadera_split_bp=excluded.wadera_split_bp, tags_json=excluded.tags_json,
            manage_url=excluded.manage_url, portal_url=excluded.portal_url, reference_number=excluded.reference_number,
            renewal_notice_days=excluded.renewal_notice_days, notes=excluded.notes, is_active=excluded.is_active`
@@ -2612,71 +3007,98 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       .run(
         id,
         wsId,
-        b.potId ? String(b.potId) : null,
-        accountId,
-        preserveAccountId,
-        liabilityId,
-        String(b.name || 'Scheduled Payment'),
-        Math.round(Number(b.amountMinor ?? 0)),
+        b.potId !== undefined ? (b.potId ? String(b.potId) : null) : (existingOb?.potId ?? null),
+        accountId ?? null,
+        preserveAccountId ?? null,
+        liabilityId ?? null,
+        String(b.name || existingOb?.name || 'Scheduled Payment'),
+        Math.round(Number(b.amountMinor ?? existingOb?.amountMinor ?? 0)),
+        finalAmountMinor ?? null,
         currency,
         cadence,
         intervalMonths,
         nextDueDate,
+        endDate ?? null,
+        remainingPayments ?? null,
         dueDay,
-        Math.round(Number(b.preservedMinor ?? 0)),
-        b.autoPreserve === false ? 0 : 1,
-        String(b.splitMode || (wsId === 'ws-home' ? 'equal_50_50' : 'owner_only')),
-        Number(b.waderaSplitBp ?? (wsId === 'ws-home' ? 5000 : 10000)),
-        JSON.stringify(Array.isArray(b.tags) ? b.tags : []),
-        b.manageUrl ? String(b.manageUrl) : null,
-        b.portalUrl ? String(b.portalUrl) : null,
-        b.referenceNumber ? String(b.referenceNumber) : null,
-        b.renewalNoticeDays != null && b.renewalNoticeDays !== '' ? Number(b.renewalNoticeDays) : null,
-        b.notes ? String(b.notes) : null,
-        b.isActive === false ? 0 : 1
+        Math.round(Number(b.preservedMinor ?? existingOb?.preservedMinor ?? 0)),
+        b.autoPreserve !== undefined ? (b.autoPreserve === false ? 0 : 1) : existingOb?.autoPreserve === false ? 0 : 1,
+        String(b.splitMode || existingOb?.splitMode || (wsId === 'ws-home' ? 'equal_50_50' : 'owner_only')),
+        Number(b.waderaSplitBp ?? existingOb?.waderaSplitBp ?? (wsId === 'ws-home' ? 5000 : 10000)),
+        JSON.stringify(Array.isArray(b.tags) ? b.tags : (existingOb?.tags ?? [])),
+        b.manageUrl !== undefined ? (b.manageUrl ? String(b.manageUrl) : null) : (existingOb?.manageUrl ?? null),
+        b.portalUrl !== undefined ? (b.portalUrl ? String(b.portalUrl) : null) : (existingOb?.portalUrl ?? null),
+        b.referenceNumber !== undefined
+          ? b.referenceNumber
+            ? String(b.referenceNumber)
+            : null
+          : (existingOb?.referenceNumber ?? null),
+        b.renewalNoticeDays !== undefined
+          ? b.renewalNoticeDays != null && b.renewalNoticeDays !== ''
+            ? Number(b.renewalNoticeDays)
+            : null
+          : (existingOb?.renewalNoticeDays ?? null),
+        b.notes !== undefined ? (b.notes ? String(b.notes) : null) : (existingOb?.notes ?? null),
+        b.isActive !== undefined ? (b.isActive === false ? 0 : 1) : existingOb?.isActive === false ? 0 : 1
       );
 
     // If caller also edited the completed occurrence timestamp, amount, or account for a specific yearMonth
     if (b.occurrenceYearMonth && (b.occurrencePaidAt || b.occurrenceActualPaidMinor != null || b.accountId !== undefined)) {
       const occYm = String(b.occurrenceYearMonth);
-      const existingOcc = store.db
-        .prepare(
-          `SELECT id, paid_at, actual_paid_minor, currency, account_id, status FROM payment_occurrences WHERE obligation_id = ? AND year_month = ?`
-        )
-        .get(id, occYm) as
-        | {
-            id: string;
-            paid_at: string | null;
-            actual_paid_minor: number | null;
-            currency: CurrencyCode;
-            account_id: string | null;
-            status: string;
-          }
-        | undefined;
-      if (existingOcc) {
-        const nextPaidAt = b.occurrencePaidAt ? String(b.occurrencePaidAt) : existingOcc.paid_at;
-        const nextActual =
-          b.occurrenceActualPaidMinor != null
-            ? Math.round(Number(b.occurrenceActualPaidMinor))
-            : existingOcc.actual_paid_minor;
-        const nextAccId = b.accountId !== undefined ? accountId : existingOcc.account_id;
-
-        if (existingOcc.status === 'paid') {
-          if (existingOcc.account_id && existingOcc.actual_paid_minor) {
-            adjustAccountBalance(store, existingOcc.account_id, +existingOcc.actual_paid_minor, existingOcc.currency);
-          }
-          if (nextAccId && nextActual) {
-            adjustAccountBalance(store, nextAccId, -nextActual, currency);
-          }
-        }
-
-        store.db
-          .prepare(`UPDATE payment_occurrences SET paid_at = ?, actual_paid_minor = ?, account_id = ?, currency = ? WHERE id = ?`)
-          .run(nextPaidAt, nextActual, nextAccId, currency, existingOcc.id);
-      }
+      store.recordObligationPayment({
+        obligationId: id,
+        yearMonth: occYm,
+        paid: true,
+        amountMinor:
+          b.occurrenceActualPaidMinor != null ? Math.round(Number(b.occurrenceActualPaidMinor)) : undefined,
+        bankDate: b.occurrencePaidAt ? String(b.occurrencePaidAt) : undefined,
+        accountId: b.accountId !== undefined ? accountId : undefined,
+      });
     }
 
-    return { ok: true, id };
+    return { ok: true, id, obligation: store.getObligationById(id) };
+  });
+
+  app.patch('/api/obligations/:id/schedule', async (req, reply) => {
+    const user = requireUser(req, reply, store, cfg);
+    if (!user) return;
+    const { id } = req.params as { id: string };
+    const ob = store.getObligationById(id);
+    if (!ob || !store.canWriteWorkspace(user.id, ob.workspaceId)) {
+      return reply.code(403).send({ error: 'Obligation not found or write denied' });
+    }
+    const b = (req.body || {}) as Record<string, unknown>;
+    try {
+      const res = store.updateObligationSchedule({
+        obligationId: id,
+        amountMinor: b.amountMinor !== undefined ? Number(b.amountMinor) : undefined,
+        finalAmountMinor:
+          b.finalAmountMinor !== undefined
+            ? b.finalAmountMinor != null
+              ? Number(b.finalAmountMinor)
+              : null
+            : undefined,
+        endDate: b.endDate !== undefined ? (b.endDate ? String(b.endDate) : null) : undefined,
+        remainingPayments:
+          b.remainingPayments !== undefined
+            ? b.remainingPayments != null
+              ? Number(b.remainingPayments)
+              : null
+            : undefined,
+        nextDueDate: b.nextDueDate ? String(b.nextDueDate) : undefined,
+        dueDay: b.dueDay !== undefined ? Number(b.dueDay) : undefined,
+        cadence: b.cadence ? (String(b.cadence) as ObligationRecord['cadence']) : undefined,
+        intervalMonths: b.intervalMonths !== undefined ? Number(b.intervalMonths) : undefined,
+        isActive: b.isActive !== undefined ? Boolean(b.isActive) : undefined,
+        notes: b.notes !== undefined ? (b.notes != null ? String(b.notes) : null) : undefined,
+        futureInstances: Array.isArray(b.futureInstances)
+          ? (b.futureInstances as Parameters<typeof store.updateObligationSchedule>[0]['futureInstances'])
+          : undefined,
+      });
+      return { ok: true, ...res };
+    } catch (err) {
+      return reply.code(400).send({ error: err instanceof Error ? err.message : 'Schedule update failed' });
+    }
   });
 
   // Tick / Untick "[✓] Mark as Paid / Set Aside" (logs timestamped occurrence; deducts/refunds linked Bank Account live)
@@ -2688,8 +3110,15 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
       yearMonth?: string;
       paid?: boolean;
       preserveDepositMinor?: number;
+      amountMinor?: number;
       paidAt?: string;
+      bankDate?: string;
       accountId?: string | null;
+      linkedTransactionId?: string | null;
+      evidence?: string | null;
+      notes?: string | null;
+      idempotencyKey?: string | null;
+      balanceEffect?: 'auto' | 'apply' | 'none';
     };
     const ym = body.yearMonth || new Date().toISOString().slice(0, 7);
 
@@ -2700,69 +3129,56 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     }
 
     const metrics = computeObligationMonthMetrics(ob, ym);
-    const existingOcc = store.db
-      .prepare(
-        `SELECT id, status, actual_paid_minor, currency, account_id, liability_id, liability_delta_minor, paid_at FROM payment_occurrences WHERE obligation_id = ? AND year_month = ?`
-      )
-      .get(ob.id, ym) as
-      | {
-          id: string;
-          status: string;
-          actual_paid_minor: number | null;
-          currency: CurrencyCode;
-          account_id: string | null;
-          liability_id: string | null;
-          liability_delta_minor: number;
-          paid_at: string | null;
-        }
-      | undefined;
-
     const targetAccountId =
       body.accountId !== undefined
         ? body.accountId || null
         : ob.accountId ?? defaultAccountForWorkspace(store, ob.workspaceId, ob.currency);
-    const targetLiabilityId = ob.liabilityId ?? null;
 
     const markPaid = body.preserveDepositMinor && body.preserveDepositMinor > 0 ? true : body.paid !== false;
-    const nowIso = new Date().toISOString();
-    const defaultDay = String(Math.min(28, Math.max(1, ob.dueDay || 1))).padStart(2, '0');
-    const dueInYm = `${ym}-${defaultDay}`;
-    const defaultTimestampInYm = nowIso.slice(0, 7) === ym ? nowIso : `${dueInYm}T${nowIso.slice(11, 19)}Z`;
-    const paidAtIso = body.paidAt || defaultTimestampInYm;
 
-    store.db.exec('BEGIN IMMEDIATE;');
-    try {
-      // First reverse any previous paid occurrence balance & liability effect for this month
-      if (existingOcc && existingOcc.status === 'paid') {
-        if (existingOcc.account_id && existingOcc.actual_paid_minor) {
+    // Sinking-Fund ("Preserve") Set-Aside for a future multi-month goal
+    if (!metrics.isDueThisMonth && (body.preserveDepositMinor || !body.amountMinor)) {
+      const existingOcc = store.db
+        .prepare(
+          `SELECT id, status, actual_paid_minor, currency, account_id, paid_at, recorded_at, balance_applied FROM payment_occurrences WHERE obligation_id = ? AND year_month = ?`
+        )
+        .get(ob.id, ym) as
+        | {
+            id: string;
+            status: string;
+            actual_paid_minor: number | null;
+            currency: CurrencyCode;
+            account_id: string | null;
+            paid_at: string | null;
+            recorded_at: string | null;
+            balance_applied: number;
+          }
+        | undefined;
+      const nowIso = new Date().toISOString();
+      const defaultDay = String(Math.min(28, Math.max(1, ob.dueDay || 1))).padStart(2, '0');
+      const dueInYm = `${ym}-${defaultDay}`;
+      const defaultTimestampInYm = nowIso.slice(0, 7) === ym ? nowIso : `${dueInYm}T${nowIso.slice(11, 19)}Z`;
+      const paidAtIso = body.bankDate || body.paidAt || defaultTimestampInYm;
+
+      store.db.exec('BEGIN IMMEDIATE;');
+      try {
+        if (existingOcc && existingOcc.status === 'paid' && existingOcc.account_id && existingOcc.actual_paid_minor) {
           adjustAccountBalance(store, existingOcc.account_id, +existingOcc.actual_paid_minor, existingOcc.currency);
         }
-        if (existingOcc.liability_id && existingOcc.liability_delta_minor > 0) {
-          reverseLiabilityPaydown(store, existingOcc.liability_id, existingOcc.liability_delta_minor);
-        }
-      }
-
-      if (markPaid) {
-        if (body.accountId !== undefined) {
-          store.db.prepare(`UPDATE obligations SET account_id = ? WHERE id = ?`).run(targetAccountId, ob.id);
-        }
-
-        if (!metrics.isDueThisMonth) {
-          // Monthly Sinking-Fund ("Preserve") Set-Aside for a future/multi-month goal
+        if (markPaid) {
           const sliceMinor =
             body.preserveDepositMinor && body.preserveDepositMinor > 0
               ? Math.round(body.preserveDepositMinor)
               : existingOcc?.actual_paid_minor || metrics.monthlyPreserveNativeMinor || ob.amountMinor;
-
           store.db
             .prepare(
-              `INSERT INTO payment_occurrences (id, obligation_id, account_id, liability_id, liability_delta_minor, year_month, due_date, expected_minor, actual_paid_minor, currency, status, paid_at, notes)
-               VALUES (?, ?, ?, NULL, 0, ?, ?, ?, ?, ?, 'paid', ?, 'Monthly sinking set-aside')
+              `INSERT INTO payment_occurrences (id, obligation_id, account_id, liability_id, liability_delta_minor, year_month, due_date, expected_minor, actual_paid_minor, currency, status, paid_at, bank_date, recorded_at, balance_applied, notes)
+               VALUES (?, ?, ?, NULL, 0, ?, ?, ?, ?, ?, 'paid', ?, ?, ?, 1, 'Monthly sinking set-aside')
                ON CONFLICT(obligation_id, year_month) DO UPDATE SET
-                 account_id=excluded.account_id, liability_id=NULL, liability_delta_minor=0, status='paid', actual_paid_minor=excluded.actual_paid_minor, paid_at=excluded.paid_at, notes=excluded.notes`
+                 account_id=excluded.account_id, status='paid', actual_paid_minor=excluded.actual_paid_minor, paid_at=excluded.paid_at, bank_date=excluded.bank_date, balance_applied=1`
             )
             .run(
-              `occ-${crypto.randomUUID().slice(0, 8)}`,
+              existingOcc?.id || `occ-${crypto.randomUUID().slice(0, 8)}`,
               ob.id,
               targetAccountId,
               ym,
@@ -2770,84 +3186,58 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
               sliceMinor,
               sliceMinor,
               ob.currency,
-              paidAtIso
+              paidAtIso,
+              paidAtIso.slice(0, 10),
+              existingOcc?.recorded_at || nowIso
             );
-
           if (!existingOcc || existingOcc.status !== 'paid') {
             const nextPreserved = Math.min(ob.amountMinor, ob.preservedMinor + sliceMinor);
             store.db.prepare(`UPDATE obligations SET preserved_minor = ? WHERE id = ?`).run(nextPreserved, ob.id);
           }
-
           if (targetAccountId) {
             adjustAccountBalance(store, targetAccountId, -sliceMinor, ob.currency);
           }
         } else {
-          // Scheduled Bill due this month (also reduces linked Mortgage / Loan / Credit Card balance!)
-          const liabDeltaMinor = applyLiabilityPaydown(
-            store,
-            targetLiabilityId,
-            ob.amountMinor,
-            ob.currency,
-            true
-          );
-
-          store.db
-            .prepare(
-              `INSERT INTO payment_occurrences (id, obligation_id, account_id, liability_id, liability_delta_minor, year_month, due_date, expected_minor, actual_paid_minor, currency, status, paid_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'paid', ?)
-               ON CONFLICT(obligation_id, year_month) DO UPDATE SET
-                 account_id=excluded.account_id, liability_id=excluded.liability_id, liability_delta_minor=excluded.liability_delta_minor, status='paid', actual_paid_minor=excluded.actual_paid_minor, paid_at=excluded.paid_at`
-            )
-            .run(
-              `occ-${crypto.randomUUID().slice(0, 8)}`,
-              ob.id,
-              targetAccountId,
-              targetLiabilityId,
-              liabDeltaMinor,
-              ym,
-              dueInYm,
-              ob.amountMinor,
-              ob.amountMinor,
-              ob.currency,
-              paidAtIso
-            );
-
-          if (targetAccountId) {
-            adjustAccountBalance(store, targetAccountId, -ob.amountMinor, ob.currency);
+          if (existingOcc && existingOcc.status === 'paid') {
+            const reversedPreserved = Math.max(0, ob.preservedMinor - (existingOcc.actual_paid_minor || 0));
+            store.db.prepare(`UPDATE obligations SET preserved_minor = ? WHERE id = ?`).run(reversedPreserved, ob.id);
           }
-
-          // If this was a multi-month or one-off obligation due this month, advance nextDueDate & reset Preserve counter!
-          if (ob.cadence !== 'monthly' && ob.nextDueDate.slice(0, 7) <= ym) {
-            const reset = applyObligationPaymentReset(ob);
-            store.db
-              .prepare(`UPDATE obligations SET next_due_date = ?, preserved_minor = ?, is_active = ? WHERE id = ?`)
-              .run(reset.nextDueDate, reset.preservedMinor, reset.isActive ? 1 : 0, ob.id);
-          }
+          store.db.prepare(`DELETE FROM payment_occurrences WHERE obligation_id = ? AND year_month = ?`).run(ob.id, ym);
         }
-      } else {
-        // Unticking [✓] or clicking Undo in the Timeline table
-        if (existingOcc && existingOcc.status === 'paid' && !metrics.isDueThisMonth) {
-          const reversedPreserved = Math.max(0, ob.preservedMinor - (existingOcc.actual_paid_minor || 0));
-          store.db.prepare(`UPDATE obligations SET preserved_minor = ? WHERE id = ?`).run(reversedPreserved, ob.id);
-        }
-
-        store.db
-          .prepare(`DELETE FROM payment_occurrences WHERE obligation_id = ? AND year_month = ?`)
-          .run(ob.id, ym);
-
-        if (ob.cadence !== 'monthly' && ob.cadence !== 'once' && ob.nextDueDate.slice(0, 7) > ym) {
-          const rolledBack = addMonthsToDate(ob.nextDueDate, -cadenceIntervalMonths(ob.cadence, ob.intervalMonths));
-          if (rolledBack.slice(0, 7) === ym) {
-            store.db.prepare(`UPDATE obligations SET next_due_date = ?, is_active = 1 WHERE id = ?`).run(rolledBack, ob.id);
-          }
-        }
+        store.db.exec('COMMIT;');
+      } catch (err) {
+        store.db.exec('ROLLBACK;');
+        throw err;
       }
-      store.db.exec('COMMIT;');
-    } catch (err) {
-      store.db.exec('ROLLBACK;');
-      throw err;
+      return { ok: true, accountId: targetAccountId };
     }
-    return { ok: true, accountId: targetAccountId };
+
+    if (body.accountId !== undefined && markPaid) {
+      store.db.prepare(`UPDATE obligations SET account_id = ? WHERE id = ?`).run(targetAccountId, ob.id);
+    }
+
+    const res = store.recordObligationPayment({
+      obligationId: ob.id,
+      yearMonth: ym,
+      paid: markPaid,
+      amountMinor: body.amountMinor,
+      bankDate: body.bankDate || body.paidAt,
+      accountId: targetAccountId,
+      linkedTransactionId: body.linkedTransactionId,
+      evidence: body.evidence,
+      notes: body.notes,
+      idempotencyKey: body.idempotencyKey,
+      balanceEffect: body.balanceEffect,
+    });
+    return {
+      ok: true,
+      accountId: targetAccountId,
+      occurrence: res.occurrence,
+      obligation: res.obligation,
+      accountBeforeBalanceMinor: res.accountBeforeBalanceMinor,
+      accountAfterBalanceMinor: res.accountAfterBalanceMinor,
+      idempotentReplay: res.idempotentReplay,
+    };
   });
 
   app.delete('/api/obligations/:id', async (req, reply) => {
@@ -2860,181 +3250,417 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     return { ok: true };
   });
 
-  // --- CRUD: Expenses, Deposits & Itemized Receipts (with Live Bank Account Balance Sync) ---
+  // --- CRUD: Queryable Transaction Ledger & Expenses / Deposits ---
+  app.get('/api/transactions', async (req, reply) => {
+    const user = requireUser(req, reply, store, cfg);
+    if (!user) return;
+    const q = (req.query || {}) as {
+      scope?: string;
+      accountId?: string;
+      potId?: string;
+      fromDate?: string;
+      toDate?: string;
+      yearMonth?: string;
+      status?: string;
+      kind?: string;
+      flowDirection?: 'outflow' | 'inflow';
+      merchantQuery?: string;
+      amountMinor?: string;
+      transferId?: string;
+      limit?: string;
+      offset?: string;
+    };
+    const wsIds = store.readableWorkspaceIds(user.id, q.scope || 'all');
+    const statuses = q.status
+      ? (q.status.split(',').filter(Boolean) as Array<'pending' | 'posted' | 'reversed' | 'refunded'>)
+      : undefined;
+    const kinds = q.kind
+      ? (q.kind.split(',').filter(Boolean) as Array<'expense' | 'deposit' | 'transfer'>)
+      : undefined;
+
+    return store.listTransactions({
+      workspaceIds: wsIds,
+      accountId: q.accountId,
+      potId: q.potId,
+      fromDate: q.fromDate,
+      toDate: q.toDate,
+      yearMonth: q.yearMonth,
+      status: statuses,
+      kind: kinds,
+      flowDirection: q.flowDirection,
+      merchantQuery: q.merchantQuery,
+      amountMinor: q.amountMinor !== undefined ? Number(q.amountMinor) : undefined,
+      transferId: q.transferId,
+      limit: q.limit !== undefined ? Number(q.limit) : undefined,
+      offset: q.offset !== undefined ? Number(q.offset) : undefined,
+    });
+  });
+
+  app.get('/api/transactions/:id', async (req, reply) => {
+    const user = requireUser(req, reply, store, cfg);
+    if (!user) return;
+    const { id } = req.params as { id: string };
+    const tx = store.getExpenseById(id);
+    if (!tx || !store.canReadWorkspaceItems(user.id, tx.workspaceId)) {
+      return reply.code(404).send({ error: 'Transaction not found' });
+    }
+    return {
+      transaction: tx,
+      attachments: store.listAttachments([tx.workspaceId], 'expense', tx.id),
+    };
+  });
+
   app.post('/api/expenses', async (req, reply) => {
     const user = requireUser(req, reply, store, cfg);
     if (!user) return;
     const b = (req.body || {}) as Record<string, unknown>;
-    const wsId = String(b.workspaceId || 'ws-home');
+    const existingExp = b.id ? store.getExpenseById(String(b.id)) : null;
+    const wsId = String(b.workspaceId || existingExp?.workspaceId || 'ws-home');
     if (!store.canWriteWorkspace(user.id, wsId)) return reply.code(403).send({ error: 'Write denied' });
-    const id = b.id ? String(b.id) : `exp-${crypto.randomUUID().slice(0, 8)}`;
-    const spentDate = String(b.spentDate || new Date().toISOString().slice(0, 10));
-    const currency = String(b.currency || user.defaultCurrency) as CurrencyCode;
-    const amountMinor = Math.round(Number(b.amountMinor ?? 0));
 
-    const existingExp = b.id
-      ? (store.db
-          .prepare(
-            `SELECT id, account_id, liability_id, flow_direction, amount_minor, currency, created_at FROM expenses WHERE id = ?`
-          )
-          .get(id) as
-          | {
-              id: string;
-              account_id: string | null;
-              liability_id: string | null;
-              flow_direction: string;
-              amount_minor: number;
-              currency: CurrencyCode;
-              created_at: string;
-            }
-          | undefined)
-      : undefined;
-
-    const flowDirection: 'outflow' | 'inflow' =
-      b.flowDirection === 'inflow'
-        ? 'inflow'
-        : b.flowDirection === 'outflow'
-        ? 'outflow'
-        : existingExp?.flow_direction === 'inflow'
-        ? 'inflow'
-        : 'outflow';
-
+    const currency = String(b.currency || existingExp?.currency || user.defaultCurrency) as CurrencyCode;
     const accountId =
       b.accountId !== undefined
         ? b.accountId
           ? String(b.accountId)
           : null
-        : existingExp !== undefined
-        ? existingExp.account_id
-        : defaultAccountForWorkspace(store, wsId, currency);
-    const liabilityId =
-      b.liabilityId !== undefined
-        ? b.liabilityId
-          ? String(b.liabilityId)
-          : null
-        : existingExp !== undefined
-        ? existingExp.liability_id
-        : null;
+        : existingExp !== null
+          ? existingExp.accountId
+          : defaultAccountForWorkspace(store, wsId, currency);
 
-    const nowIso = new Date().toISOString();
-    let createdAt = existingExp?.created_at || `${spentDate}T${nowIso.slice(11, 19)}Z`;
-    if (b.spentTime && /^\d{2}:\d{2}/.test(String(b.spentTime))) {
-      createdAt = `${spentDate}T${String(b.spentTime).slice(0, 5)}:00Z`;
-    } else if (b.createdAt) {
-      createdAt = String(b.createdAt);
+    let spentDate = b.spentDate !== undefined ? String(b.spentDate) : existingExp?.spentDate;
+    let bankTimestamp =
+      b.bankTimestamp !== undefined ? (b.bankTimestamp ? String(b.bankTimestamp) : null) : undefined;
+    if (b.spentTime && /^\d{2}:\d{2}/.test(String(b.spentTime)) && spentDate) {
+      const datePart = spentDate.slice(0, 10);
+      bankTimestamp = `${datePart}T${String(b.spentTime).slice(0, 5)}:00Z`;
+      spentDate = `${datePart}T${String(b.spentTime).slice(0, 5)}`;
     }
 
-    store.db.exec('BEGIN IMMEDIATE;');
     try {
-      // 1. If editing an existing expense, reverse its previous bank account & liability balance impact
-      if (existingExp && existingExp.amount_minor > 0) {
-        if (existingExp.account_id) {
-          const reverseDelta =
-            existingExp.flow_direction === 'inflow' ? -existingExp.amount_minor : +existingExp.amount_minor;
-          adjustAccountBalance(store, existingExp.account_id, reverseDelta, existingExp.currency);
-        }
-        if (existingExp.liability_id && existingExp.flow_direction !== 'inflow') {
-          const rateMap = buildRateMap(store.getFxRates());
-          const oldLiab = store.db
-            .prepare(`SELECT currency FROM liabilities WHERE id = ?`)
-            .get(existingExp.liability_id) as { currency: CurrencyCode } | undefined;
-          if (oldLiab) {
-            const revLiabMinor = convertMinor(existingExp.amount_minor, existingExp.currency, oldLiab.currency, rateMap);
-            reverseLiabilityPaydown(store, existingExp.liability_id, revLiabMinor);
-          }
-        }
-      }
+      const res = store.upsertTransaction({
+        id: b.id ? String(b.id) : undefined,
+        workspaceId: wsId,
+        potId: b.potId !== undefined ? (b.potId ? String(b.potId) : null) : undefined,
+        accountId,
+        liabilityId: b.liabilityId !== undefined ? (b.liabilityId ? String(b.liabilityId) : null) : undefined,
+        flowDirection:
+          b.flowDirection === 'inflow' || b.flowDirection === 'outflow' ? b.flowDirection : undefined,
+        kind:
+          b.kind === 'expense' || b.kind === 'deposit' || b.kind === 'transfer' ? b.kind : undefined,
+        status:
+          b.status === 'pending' || b.status === 'posted' || b.status === 'reversed' || b.status === 'refunded'
+            ? b.status
+            : undefined,
+        merchant: b.merchant !== undefined ? String(b.merchant) : undefined,
+        description: b.description !== undefined ? String(b.description) : undefined,
+        amountMinor: b.amountMinor !== undefined ? Math.round(Number(b.amountMinor)) : undefined,
+        currency,
+        originalAmountMinor:
+          b.originalAmountMinor !== undefined
+            ? b.originalAmountMinor != null
+              ? Math.round(Number(b.originalAmountMinor))
+              : null
+            : undefined,
+        originalCurrency:
+          b.originalCurrency !== undefined
+            ? b.originalCurrency
+              ? (String(b.originalCurrency) as CurrencyCode)
+              : null
+            : undefined,
+        fxRate: b.fxRate !== undefined ? (b.fxRate != null ? Number(b.fxRate) : null) : undefined,
+        feeMinor: b.feeMinor !== undefined ? (b.feeMinor != null ? Math.round(Number(b.feeMinor)) : null) : undefined,
+        spentDate,
+        bankTimestamp,
+        dateOnly: b.dateOnly === true,
+        observedAt: b.observedAt !== undefined ? (b.observedAt ? String(b.observedAt) : null) : undefined,
+        reference: b.reference !== undefined ? (b.reference ? String(b.reference) : null) : undefined,
+        evidence: b.evidence !== undefined ? (b.evidence ? String(b.evidence) : null) : undefined,
+        providerTxId: b.providerTxId !== undefined ? (b.providerTxId ? String(b.providerTxId) : null) : undefined,
+        idempotencyKey:
+          b.idempotencyKey !== undefined ? (b.idempotencyKey ? String(b.idempotencyKey) : null) : undefined,
+        tags: Array.isArray(b.tags) ? (b.tags as string[]) : undefined,
+        portalUrl: b.portalUrl !== undefined ? (b.portalUrl ? String(b.portalUrl) : null) : undefined,
+        source: b.source ? (String(b.source) as ExpenseEntryRecord['source']) : undefined,
+        items: Array.isArray(b.items) ? (b.items as ExpenseEntryRecord['items']) : undefined,
+        balanceEffect:
+          b.balanceEffect === 'auto' || b.balanceEffect === 'apply' || b.balanceEffect === 'none'
+            ? b.balanceEffect
+            : undefined,
+        alreadyReflectedInSnapshot: b.alreadyReflectedInSnapshot === true,
+      });
 
-      // 2. Upsert the expense / deposit row
-      store.db
-        .prepare(
-          `INSERT INTO expenses (id, workspace_id, pot_id, account_id, liability_id, flow_direction, merchant, description, amount_minor, currency, spent_date, tags_json, portal_url, source, items_json, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(id) DO UPDATE SET
-             workspace_id=excluded.workspace_id, pot_id=excluded.pot_id, account_id=excluded.account_id,
-             liability_id=excluded.liability_id, flow_direction=excluded.flow_direction, merchant=excluded.merchant,
-             description=excluded.description, amount_minor=excluded.amount_minor, currency=excluded.currency,
-             spent_date=excluded.spent_date, tags_json=excluded.tags_json, portal_url=excluded.portal_url,
-             items_json=excluded.items_json, created_at=excluded.created_at`
-        )
-        .run(
-          id,
-          wsId,
-          b.potId ? String(b.potId) : null,
-          accountId,
-          liabilityId,
-          flowDirection,
-          String(b.merchant || 'Expense'),
-          String(b.description || ''),
-          amountMinor,
-          currency,
-          spentDate,
-          JSON.stringify(Array.isArray(b.tags) ? b.tags : []),
-          b.portalUrl ? String(b.portalUrl) : null,
-          String(b.source || 'manual'),
-          JSON.stringify(Array.isArray(b.items) ? b.items : []),
-          createdAt
-        );
-
-      // 3. Apply the new bank account & liability balance impact
-      if (accountId && amountMinor > 0) {
-        const applyDelta = flowDirection === 'inflow' ? +amountMinor : -amountMinor;
-        adjustAccountBalance(store, accountId, applyDelta, currency);
-      }
-      if (liabilityId && amountMinor > 0 && flowDirection !== 'inflow') {
-        applyLiabilityPaydown(store, liabilityId, amountMinor, currency, false);
-      }
-
-      store.db.exec('COMMIT;');
+      return {
+        ok: true,
+        id: res.transaction.id,
+        accountId: res.transaction.accountId,
+        flowDirection: res.transaction.flowDirection,
+        transaction: res.transaction,
+        created: res.created,
+        idempotentReplay: res.idempotentReplay,
+        availableDeltaMinor: res.availableDeltaMinor,
+        bookedDeltaMinor: res.bookedDeltaMinor,
+        accountBeforeBalanceMinor: res.accountBeforeBalanceMinor,
+        accountAfterBalanceMinor: res.accountAfterBalanceMinor,
+      };
     } catch (err) {
-      store.db.exec('ROLLBACK;');
-      throw err;
+      return reply.code(400).send({ error: err instanceof Error ? err.message : 'Transaction upsert failed' });
     }
-
-    return { ok: true, id, accountId, flowDirection };
   });
 
   app.delete('/api/expenses/:id', async (req, reply) => {
     const user = requireUser(req, reply, store, cfg);
     if (!user) return;
     const { id } = req.params as { id: string };
-    const row = store.db
-      .prepare(`SELECT workspace_id, account_id, liability_id, flow_direction, amount_minor, currency FROM expenses WHERE id = ?`)
-      .get(id) as
-      | {
-          workspace_id: string;
-          account_id: string | null;
-          liability_id: string | null;
-          flow_direction: string;
-          amount_minor: number;
-          currency: CurrencyCode;
-        }
-      | undefined;
-    if (!row || !store.canWriteWorkspace(user.id, row.workspace_id)) return reply.code(403).send({ error: 'Denied' });
-
-    store.db.exec('BEGIN IMMEDIATE;');
-    try {
-      if (row.account_id && row.amount_minor > 0) {
-        const reverseDelta = row.flow_direction === 'inflow' ? -row.amount_minor : +row.amount_minor;
-        adjustAccountBalance(store, row.account_id, reverseDelta, row.currency);
-      }
-      if (row.liability_id && row.amount_minor > 0 && row.flow_direction !== 'inflow') {
-        const rateMap = buildRateMap(store.getFxRates());
-        const oldLiab = store.db
-          .prepare(`SELECT currency FROM liabilities WHERE id = ?`)
-          .get(row.liability_id) as { currency: CurrencyCode } | undefined;
-        if (oldLiab) {
-          const revLiabMinor = convertMinor(row.amount_minor, row.currency, oldLiab.currency, rateMap);
-          reverseLiabilityPaydown(store, row.liability_id, revLiabMinor);
-        }
-      }
-      store.db.prepare(`DELETE FROM expenses WHERE id = ?`).run(id);
-      store.db.exec('COMMIT;');
-    } catch (err) {
-      store.db.exec('ROLLBACK;');
-      throw err;
+    const existing = store.getExpenseById(id);
+    if (!existing || !store.canWriteWorkspace(user.id, existing.workspaceId)) {
+      return reply.code(403).send({ error: 'Denied' });
     }
+    store.deleteTransaction(id);
     return { ok: true };
+  });
+
+  // --- CRUD: Atomic Internal Transfers (Single & Multi-Account Salary Distribution) ---
+  app.get('/api/transfers', async (req, reply) => {
+    const user = requireUser(req, reply, store, cfg);
+    if (!user) return;
+    const q = (req.query || {}) as {
+      scope?: string;
+      accountId?: string;
+      fromDate?: string;
+      toDate?: string;
+      yearMonth?: string;
+    };
+    const wsIds = store.readableWorkspaceIds(user.id, q.scope || 'all');
+    return {
+      transfers: store.listTransfers(wsIds, {
+        accountId: q.accountId,
+        fromDate: q.fromDate,
+        toDate: q.toDate,
+        yearMonth: q.yearMonth,
+      }),
+    };
+  });
+
+  app.post('/api/transfers', async (req, reply) => {
+    const user = requireUser(req, reply, store, cfg);
+    if (!user) return;
+    const b = (req.body || {}) as Record<string, unknown>;
+    const fromAccId = String(b.fromAccountId || b.sourceAccountId || '');
+    const toAccId = String(b.toAccountId || b.destinationAccountId || '');
+    const fromAcc = store.getAccountById(fromAccId);
+    const toAcc = store.getAccountById(toAccId);
+    if (!fromAcc || !toAcc) {
+      return reply.code(400).send({ error: 'Both source and destination accounts must exist' });
+    }
+    if (!store.canWriteWorkspace(user.id, fromAcc.workspaceId) || !store.canWriteWorkspace(user.id, toAcc.workspaceId)) {
+      return reply.code(403).send({ error: 'Write denied on source or destination workspace' });
+    }
+    const rawAmountMinor =
+      b.amountMinor !== undefined
+        ? Number(b.amountMinor)
+        : b.amountMajor !== undefined
+          ? Math.round(Number(b.amountMajor) * 100)
+          : undefined;
+    const rawFromMinor =
+      b.fromAmountMinor !== undefined
+        ? Number(b.fromAmountMinor)
+        : b.sourceAmountMinor !== undefined
+          ? Number(b.sourceAmountMinor)
+          : rawAmountMinor;
+    const rawToMinor =
+      b.toAmountMinor !== undefined
+        ? Number(b.toAmountMinor)
+        : b.destinationAmountMinor !== undefined
+          ? Number(b.destinationAmountMinor)
+          : b.destinationAmountMajor !== undefined
+            ? Math.round(Number(b.destinationAmountMajor) * 100)
+            : undefined;
+    try {
+      const res = store.createTransfer({
+        id: b.id ? String(b.id) : undefined,
+        fromAccountId: fromAccId,
+        toAccountId: toAccId,
+        amountMinor: rawAmountMinor,
+        fromAmountMinor: rawFromMinor,
+        toAmountMinor: rawToMinor,
+        feeMinor: b.feeMinor !== undefined ? Number(b.feeMinor) : undefined,
+        fxRate: b.fxRate !== undefined ? (b.fxRate != null ? Number(b.fxRate) : null) : undefined,
+        transferDate: b.transferDate ? String(b.transferDate) : undefined,
+        bankTimestamp:
+          b.bankTimestamp
+            ? String(b.bankTimestamp)
+            : b.transferDate && b.transferTime
+              ? `${String(b.transferDate).slice(0, 10)}T${String(b.transferTime).slice(0, 5)}:00Z`
+              : undefined,
+        status:
+          b.status === 'pending' || b.status === 'posted' || b.status === 'reversed' || b.status === 'refunded'
+            ? b.status
+            : undefined,
+        description: b.description ? String(b.description) : undefined,
+        reference: (b.reference || b.referenceNumber) ? String(b.reference || b.referenceNumber) : undefined,
+        evidence: b.evidence ? String(b.evidence) : undefined,
+        idempotencyKey: b.idempotencyKey ? String(b.idempotencyKey) : undefined,
+        balanceEffect: b.balanceEffect as Parameters<typeof store.createTransfer>[0]['balanceEffect'],
+        reconcileExistingOutflowTxId: b.reconcileExistingOutflowTxId
+          ? String(b.reconcileExistingOutflowTxId)
+          : undefined,
+        reconcileExistingInflowTxId: b.reconcileExistingInflowTxId
+          ? String(b.reconcileExistingInflowTxId)
+          : undefined,
+      });
+      return { ok: true, ...res };
+    } catch (err) {
+      return reply.code(400).send({ error: err instanceof Error ? err.message : 'Transfer failed' });
+    }
+  });
+
+  app.post('/api/transfers/batch', async (req, reply) => {
+    const user = requireUser(req, reply, store, cfg);
+    if (!user) return;
+    const b = (req.body || {}) as {
+      fromAccountId?: string;
+      sourceAccountId?: string;
+      transferDate?: string;
+      transferTime?: string;
+      bankTimestamp?: string;
+      status?: 'pending' | 'posted';
+      description?: string;
+      reference?: string;
+      idempotencyKey?: string;
+      legs?: Array<{
+        toAccountId?: string;
+        destinationAccountId?: string;
+        amountMinor?: number;
+        amountMajor?: number;
+        toAmountMinor?: number;
+        feeMinor?: number;
+        fxRate?: number | null;
+        description?: string;
+        reference?: string | null;
+      }>;
+      allocations?: Array<{
+        toAccountId?: string;
+        destinationAccountId?: string;
+        amountMinor?: number;
+        amountMajor?: number;
+        toAmountMinor?: number;
+        feeMinor?: number;
+        fxRate?: number | null;
+        description?: string;
+        reference?: string | null;
+        referenceNumber?: string | null;
+      }>;
+    };
+    const srcId = b.fromAccountId || b.sourceAccountId;
+    const fromAcc = srcId ? store.getAccountById(srcId) : null;
+    if (!fromAcc || !store.canWriteWorkspace(user.id, fromAcc.workspaceId)) {
+      return reply.code(403).send({ error: 'Source account not found or write denied' });
+    }
+    const rawItems = b.legs ?? b.allocations ?? [];
+    const normalizedLegs = rawItems.map((leg) => ({
+      toAccountId: String(leg.toAccountId || leg.destinationAccountId || ''),
+      amountMinor:
+        leg.amountMinor !== undefined
+          ? Math.round(Number(leg.amountMinor))
+          : Math.round(Number(leg.amountMajor ?? 0) * 100),
+      toAmountMinor: leg.toAmountMinor,
+      feeMinor: leg.feeMinor,
+      fxRate: leg.fxRate,
+      description: leg.description,
+      reference: (leg.reference ?? ('referenceNumber' in leg ? leg.referenceNumber : null)) as string | null,
+    }));
+    try {
+      const res = store.createTransferBatch({
+        fromAccountId: fromAcc.id,
+        transferDate: b.transferDate,
+        bankTimestamp:
+          b.bankTimestamp ||
+          (b.transferDate && b.transferTime
+            ? `${String(b.transferDate).slice(0, 10)}T${String(b.transferTime).slice(0, 5)}:00Z`
+            : undefined),
+        status: b.status,
+        description: b.description,
+        reference: b.reference,
+        idempotencyKey: b.idempotencyKey,
+        legs: normalizedLegs,
+      });
+      return { ok: true, ...res };
+    } catch (err) {
+      return reply.code(400).send({ error: err instanceof Error ? err.message : 'Batch transfer failed' });
+    }
+  });
+
+  app.patch('/api/transfers/:id', async (req, reply) => {
+    const user = requireUser(req, reply, store, cfg);
+    if (!user) return;
+    const { id } = req.params as { id: string };
+    const existing = store.getTransferById(id);
+    if (!existing || !store.canWriteWorkspace(user.id, existing.workspaceId)) {
+      return reply.code(403).send({ error: 'Transfer not found or write denied' });
+    }
+    const b = (req.body || {}) as Record<string, unknown>;
+    try {
+      const res = store.updateTransfer(id, {
+        fromAccountId: b.fromAccountId ? String(b.fromAccountId) : undefined,
+        toAccountId: b.toAccountId ? String(b.toAccountId) : undefined,
+        amountMinor: b.amountMinor !== undefined ? Number(b.amountMinor) : undefined,
+        fromAmountMinor: b.fromAmountMinor !== undefined ? Number(b.fromAmountMinor) : undefined,
+        toAmountMinor: b.toAmountMinor !== undefined ? Number(b.toAmountMinor) : undefined,
+        feeMinor: b.feeMinor !== undefined ? Number(b.feeMinor) : undefined,
+        fxRate: b.fxRate !== undefined ? (b.fxRate != null ? Number(b.fxRate) : null) : undefined,
+        transferDate: b.transferDate ? String(b.transferDate) : undefined,
+        bankTimestamp: b.bankTimestamp !== undefined ? (b.bankTimestamp ? String(b.bankTimestamp) : null) : undefined,
+        status:
+          b.status === 'pending' || b.status === 'posted' || b.status === 'reversed' || b.status === 'refunded'
+            ? b.status
+            : undefined,
+        description: b.description !== undefined ? String(b.description) : undefined,
+        reference: b.reference !== undefined ? (b.reference ? String(b.reference) : null) : undefined,
+        evidence: b.evidence !== undefined ? (b.evidence ? String(b.evidence) : null) : undefined,
+      });
+      return { ok: true, ...res };
+    } catch (err) {
+      return reply.code(400).send({ error: err instanceof Error ? err.message : 'Transfer update failed' });
+    }
+  });
+
+  app.delete('/api/transfers/:id', async (req, reply) => {
+    const user = requireUser(req, reply, store, cfg);
+    if (!user) return;
+    const { id } = req.params as { id: string };
+    const existing = store.getTransferById(id);
+    if (!existing || !store.canWriteWorkspace(user.id, existing.workspaceId)) {
+      return reply.code(403).send({ error: 'Transfer not found or write denied' });
+    }
+    const res = store.deleteTransfer(id);
+    return { ok: true, ...res };
+  });
+
+  // --- Safe Reconciliation Batch (Dry-Run Preview, Atomic Execution & Reversal) ---
+  app.post('/api/reconcile/batch', async (req, reply) => {
+    const user = requireUser(req, reply, store, cfg);
+    if (!user) return;
+    const body = (req.body || {}) as Parameters<typeof store.reconcileBatch>[1];
+    try {
+      const result = store.reconcileBatch(user.id, body);
+      return { ok: true, ...result };
+    } catch (err) {
+      return reply.code(400).send({ error: err instanceof Error ? err.message : 'Reconciliation batch failed' });
+    }
+  });
+
+  app.post('/api/reconcile/reverse', async (req, reply) => {
+    const user = requireUser(req, reply, store, cfg);
+    if (!user) return;
+    const body = (req.body || {}) as { batchId?: string };
+    if (!body.batchId) return reply.code(400).send({ error: 'batchId is required' });
+    try {
+      const result = store.reverseReconciliationBatch(user.id, body.batchId);
+      return { ok: true, ...result };
+    } catch (err) {
+      return reply.code(400).send({ error: err instanceof Error ? err.message : 'Batch reversal failed' });
+    }
   });
 
   // --- CRUD: Wealth Assets & Belongings ---
@@ -3226,5 +3852,3 @@ export function registerApiRoutes(app: FastifyInstance, store: FinanceStore, cfg
     return { ok: true };
   });
 }
-
-import type { ObligationRecord } from '../shared/types.js';

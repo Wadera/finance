@@ -1,4 +1,5 @@
 import type {
+  AccountTransferRecord,
   AssetBelongingRecord,
   AttachmentRecord,
   AuthProviderKind,
@@ -101,9 +102,12 @@ export interface AccountAnalyticsItem {
   currency: CurrencyCode;
   isPrimaryRunway: boolean;
   balanceMinor: number;
+  bookedBalanceMinor?: number;
   displayBalanceMinor: number;
   lockedPreserveMinor: number;
   lockedPreserveDisplayMinor: number;
+  fundedPreserveMinor?: number;
+  fundedPreserveDisplayMinor?: number;
   trueAvailableMinor: number;
   trueAvailableDisplayMinor: number;
   unfundedPreserveShortfallMinor: number;
@@ -138,6 +142,12 @@ export interface AccountAnalyticsItem {
   pocketMoneyTargetDisplayMinor: number;
   pocketMoneyRemainingMinor: number;
   pocketMoneyRemainingDisplayMinor: number;
+  spendablePocketMoneyMinor?: number;
+  spendablePocketMoneyDisplayMinor?: number;
+  pendingDebitMinor?: number;
+  pendingCreditMinor?: number;
+  observedAt?: string | null;
+  lastReconciledAt?: string | null;
   netPrePaydayNativeMinor: number;
   netPrePaydayDisplayMinor: number;
   isPrePaydaySufficient: boolean;
@@ -185,6 +195,7 @@ export interface CashflowBridgeData {
   nextYearMonth: string;
   primaryPaydayDay: number;
   overflowInMinor: number;
+  activeOverflowInMinor?: number;
   thisMonthSpendingMinor: number;
   thisMonthBufferMinor: number;
   thisMonthShortfallMinor: number;
@@ -276,15 +287,22 @@ export interface BudgetMonthResponse {
   allObligations?: EnrichedObligation[];
   expenses: EnrichedExpense[];
   allExpenses?: EnrichedExpense[];
+  transfers?: AccountTransferRecord[];
   timelineLedger: TimelineLedgerEntry[];
   kpis: {
     totalIncomeMinor: number;
     potPlannedTotalMinor: number;
+    postedSpendMinor?: number;
+    pendingSpendMinor?: number;
     totalPreserveSliceMinor: number;
+    totalLockedPreserveMinor?: number;
+    totalFundedPreserveMinor?: number;
+    totalUnfundedPreserveShortfallMinor?: number;
     netMonthlySurplusMinor: number;
     savingsRatePct: number;
   };
   runway: {
+    openingBalanceMinor?: number;
     runwayCashMinor: number;
     remainingPaydaysIncomeMinor: number;
     unpaidBillsMinor: number;
@@ -390,4 +408,58 @@ export async function listAttachmentsApi(entityType: string, entityId: string): 
   return data.attachments;
 }
 
-export type { PartnerVisibility, SplitMode, WorkspaceKind, WorkspaceRole };
+export async function createTransferApi(payload: {
+  sourceAccountId: string;
+  destinationAccountId: string;
+  amountMajor?: number;
+  amountMinor?: number;
+  currency?: CurrencyCode;
+  destinationAmountMajor?: number;
+  destinationAmountMinor?: number;
+  destinationCurrency?: CurrencyCode;
+  transferDate?: string;
+  transferTime?: string;
+  description?: string;
+  referenceNumber?: string | null;
+}) {
+  return apiFetch<{
+    ok: boolean;
+    transfer: AccountTransferRecord;
+    sourceAccount: BankAccountRecord;
+    destinationAccount: BankAccountRecord;
+  }>('/api/transfers', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function createTransferBatchApi(payload: {
+  sourceAccountId: string;
+  transferDate?: string;
+  transferTime?: string;
+  description?: string;
+  allocations: Array<{
+    destinationAccountId: string;
+    amountMajor?: number;
+    amountMinor?: number;
+    description?: string;
+    referenceNumber?: string | null;
+  }>;
+}) {
+  return apiFetch<{
+    ok: boolean;
+    transfers: AccountTransferRecord[];
+    sourceAccount: BankAccountRecord | null;
+  }>('/api/transfers/batch', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function deleteTransferApi(transferId: string) {
+  return apiFetch<{ ok: boolean }>(`/api/transfers/${encodeURIComponent(transferId)}`, {
+    method: 'DELETE',
+  });
+}
+
+export type { AccountTransferRecord, PartnerVisibility, SplitMode, WorkspaceKind, WorkspaceRole };

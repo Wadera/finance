@@ -12,7 +12,9 @@
     "build": "npm run build:web && npm run build:api",
     "start": "node dist/server/server/index.js",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "check:privacy": "node scripts/check-private-data.mjs",
+    "push:all": "node scripts/sync-remotes.mjs"
   },
   "dependencies": {
     "@fastify/cookie": "^11.0.2",

@@ -1,6 +1,17 @@
-import { ChevronDown, ChevronRight, Pencil, Plus } from 'lucide-react';
+import {
+  ChevronDown,
+  ChevronRight,
+  Maximize2,
+  Minimize2,
+  Move,
+  Pencil,
+  Plus,
+  RotateCcw,
+  ZoomIn,
+  ZoomOut,
+} from 'lucide-react';
 import { sankey, sankeyLeft, sankeyLinkHorizontal } from 'd3-sankey';
-import React, { useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { formatDisplayValue, formatIndexedWealth } from '../shared/currency.js';
 import { buildPotBreadcrumbs } from '../shared/financeEngine.js';
 import type {
@@ -21,6 +32,19 @@ import type {
   QuickAddTarget,
 } from './api.js';
 import type { TranslationDict } from './i18n.js';
+
+const SHORT_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+function formatShortDayMonth(dateOrTs: string | null | undefined): string {
+  if (!dateOrTs) return '';
+  const iso = dateOrTs.slice(0, 10);
+  const parts = iso.split('-');
+  if (parts.length < 3) return iso;
+  const mo = Number(parts[1]);
+  const day = Number(parts[2]);
+  if (!mo || !day || mo < 1 || mo > 12) return iso;
+  return `${day} ${SHORT_MONTHS[mo - 1]}`;
+}
 
 interface SankeyNodeDatum {
   id: string;
@@ -48,6 +72,12 @@ interface SankeyNodeDatum {
   obRef?: EnrichedObligation;
   expRef?: EnrichedExpense;
   dashed?: boolean;
+  spentPaidMinor?: number;
+  plannedUpcomingMinor?: number;
+  statusBadge?: {
+    text: string;
+    tone: 'paid' | 'planned' | 'pending' | 'mixed';
+  };
 }
 
 interface SankeyLinkDatum {
@@ -82,6 +112,8 @@ export const CashflowSankeyChart: React.FC<{
   expandedExpenseIds: Set<string>;
   onTogglePot: (potId: string) => void;
   onToggleExpense: (expId: string) => void;
+  onSetExpandedPots?: (ids: Set<string>) => void;
+  onSetExpandedExpenses?: (ids: Set<string>) => void;
   onQuickAdd: (target: QuickAddTarget) => void;
   onInspectItem?: (kind: 'pot' | 'obligation' | 'expense' | 'account', id: string) => void;
   t: TranslationDict;
@@ -103,10 +135,60 @@ export const CashflowSankeyChart: React.FC<{
   expandedExpenseIds,
   onTogglePot,
   onToggleExpense,
+  onSetExpandedPots,
+  onSetExpandedExpenses,
   onQuickAdd,
   onInspectItem,
   t,
 }) => {
+  // Universal folding state for nodes that start expanded by default:
+  // - Central Monthly Pool ('pool-budget')
+  // - Bank Accounts ('acc-node-${aid}')
+  // - Workspaces ('ws-node-${wsId}')
+  const [collapsedNodeIds, setCollapsedNodeIds] = useState<Set<string>>(() => new Set());
+  const [hideZeroPots, setHideZeroPots] = useState<boolean>(false);
+
+  // 2D Interactive Pan & Zoom Viewport state (with multi-touch pinch-to-zoom support on mobile)
+  const [zoom, setZoom] = useState<number>(1);
+  const [pan, setPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [isDragging, setIsDragging] = useState<boolean>(false);
+  const [wheelZoomEnabled, setWheelZoomEnabled] = useState<boolean>(true);
+  const [viewportMode, setViewportMode] = useState<'normal' | 'tall' | 'fullscreen'>('normal');
+  const viewportRef = useRef<HTMLDivElement | null>(null);
+  const zoomRef = useRef<number>(1);
+  const panRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  zoomRef.current = zoom;
+  panRef.current = pan;
+
+  const activePointersRef = useRef<Map<number, { x: number; y: number }>>(new Map());
+  const pinchRef = useRef<{
+    startDist: number;
+    startZoom: number;
+    midX: number;
+    midY: number;
+    origPanX: number;
+    origPanY: number;
+  } | null>(null);
+  const dragRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    origPanX: number;
+    origPanY: number;
+  } | null>(null);
+
+  const toggleCollapsedNode = useCallback((nodeId: string) => {
+    setCollapsedNodeIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(nodeId)) {
+        next.delete(nodeId);
+      } else {
+        next.add(nodeId);
+      }
+      return next;
+    });
+  }, []);
+
   const model = useMemo(() => {
     const nodes: SankeyNodeDatum[] = [];
     const links: SankeyLinkDatum[] = [];
@@ -117,7 +199,7 @@ export const CashflowSankeyChart: React.FC<{
 
     const obsByPot = new Map<string | null, EnrichedObligation[]>();
     for (const ob of obligations) {
-      if (!ob.isActive) continue;
+      if (ob.effectiveDisplayMinor <= 0 && !ob.isPaidThisMonth && ob.preservedDisplayMinor <= 0) continue;
       const k = ob.potId ?? null;
       const list = obsByPot.get(k) ?? [];
       list.push(ob);
@@ -126,6 +208,10 @@ export const CashflowSankeyChart: React.FC<{
 
     const expsByPot = new Map<string | null, EnrichedExpense[]>();
     for (const exp of expenses) {
+      if (exp.flowDirection === 'inflow') continue;
+      if ((exp.kind ?? 'expense') === 'transfer') continue;
+      if ((exp.status ?? 'posted') === 'reversed' || (exp.status ?? 'posted') === 'refunded') continue;
+      if (/^transfer (to|from) /i.test(exp.merchant.trim())) continue;
       const k = exp.potId ?? null;
       const list = expsByPot.get(k) ?? [];
       list.push(exp);
@@ -137,19 +223,22 @@ export const CashflowSankeyChart: React.FC<{
     //   1. Previous Month Overflow (Solid Green)
     //   2. Upcoming Salary (Dashed Green until ticked received on Timeline; Solid Green once ticked)
     // Middle:
-    //   Single Monthly Pool
+    //   Single Monthly Pool (foldable!)
     // Right (Spreading out from Monthly Pool):
-    //   1. This Month Spending Pots (Solid, click-to-unfoldable to unlimited depth)
+    //   1. Bank Accounts (foldable!) -> Workspaces (foldable!) -> This Month Spending Pots (click-to-unfoldable to unlimited depth)
     //   2. Next Month Needed Before Salary (Dashed Red, click-to-unfoldable into next month's pre-salary pots)
     //   3. Unallocated Savings / Buffer (what remains after BOTH this month's spending AND next month's pre-salary reserve)
     const poolId = 'pool-budget';
-    const overflowMinor = cashflowBridge ? cashflowBridge.overflowInMinor : 0;
+    const overflowMinor = cashflowBridge
+      ? (cashflowBridge.activeOverflowInMinor ?? cashflowBridge.overflowInMinor)
+      : 0;
     const upcomingMinor = cashflowBridge ? cashflowBridge.upcomingSalaryTotalMinor : totalIncomeMinor;
     const nextNeededMinor = cashflowBridge ? cashflowBridge.nextMonthPreSalaryMinor : 0;
 
     const totalInflowMinor = overflowMinor + upcomingMinor;
     const totalOutflowCommitmentsMinor = potPlannedTotalMinor + nextNeededMinor;
     const poolMinor = Math.max(totalInflowMinor, totalOutflowCommitmentsMinor);
+    const isPoolCollapsed = collapsedNodeIds.has(poolId);
 
     nodes.push({
       id: poolId,
@@ -157,8 +246,11 @@ export const CashflowSankeyChart: React.FC<{
       color: '#1E293B',
       displayMinor: poolMinor,
       nodeKind: 'pool',
-      canUnfold: false,
-      isExpanded: false,
+      canUnfold: true,
+      isExpanded: !isPoolCollapsed,
+      statusBadge: isPoolCollapsed
+        ? { text: '📁 Folded', tone: 'mixed' }
+        : undefined,
     });
 
     if (overflowMinor > 0) {
@@ -232,21 +324,95 @@ export const CashflowSankeyChart: React.FC<{
     }
 
     const visitedPots = new Set<string>();
+    const activeYm =
+      cashflowBridge?.prevYearMonth
+        ? (() => {
+            const [y, m] = cashflowBridge.prevYearMonth.split('-').map(Number);
+            const nm = m === 12 ? 1 : m + 1;
+            const ny = m === 12 ? y + 1 : y;
+            return `${ny}-${String(nm).padStart(2, '0')}`;
+          })()
+        : new Date().toISOString().slice(0, 7);
 
-    const emitPotSubtree = (potNode: PotRollupNode, parentSourceId: string) => {
+    const computeSubtreeStatus = (
+      pn: PotRollupNode
+    ): { spentPaidMinor: number; plannedUpcomingMinor: number; nextDueIso: string | null } => {
+      let spentPaidMinor = 0;
+      let plannedUpcomingMinor = pn.unallocatedEnvelopeDisplayMinor;
+      let nextDueIso: string | null = null;
+
+      for (const exp of expsByPot.get(pn.pot.id) ?? []) {
+        if ((exp.status ?? 'posted') === 'pending') {
+          plannedUpcomingMinor += exp.displayAmountMinor;
+        } else {
+          spentPaidMinor += exp.displayAmountMinor;
+        }
+      }
+      for (const ob of obsByPot.get(pn.pot.id) ?? []) {
+        if (ob.effectiveDisplayMinor <= 0) continue;
+        if (ob.isPaidThisMonth) {
+          spentPaidMinor += ob.effectiveDisplayMinor;
+        } else {
+          plannedUpcomingMinor += ob.effectiveDisplayMinor;
+          const dueIso = ob.metrics.isDueThisMonth
+            ? `${activeYm}-${String(Math.max(1, Math.min(31, ob.dueDay || 1))).padStart(2, '0')}`
+            : ob.nextDueDate;
+          if (!nextDueIso || dueIso < nextDueIso) {
+            nextDueIso = dueIso;
+          }
+        }
+      }
+      for (const ch of pn.children) {
+        const sub = computeSubtreeStatus(ch);
+        spentPaidMinor += sub.spentPaidMinor;
+        plannedUpcomingMinor += sub.plannedUpcomingMinor;
+        if (sub.nextDueIso && (!nextDueIso || sub.nextDueIso < nextDueIso)) {
+          nextDueIso = sub.nextDueIso;
+        }
+      }
+      return { spentPaidMinor, plannedUpcomingMinor, nextDueIso };
+    };
+
+    const emitPotSubtree = (potNode: PotRollupNode, parentSourceId: string, scaleRatio = 1) => {
       const pid = potNode.pot.id;
       if (visitedPots.has(pid)) return;
+      if (hideZeroPots && potNode.effectiveTotalDisplayMinor <= 0) return;
       visitedPots.add(pid);
 
       const directObs = (obsByPot.get(pid) ?? []).filter((o) => o.effectiveDisplayMinor > 0);
       const directExps = (expsByPot.get(pid) ?? []).filter((e) => e.displayAmountMinor > 0);
+      const visibleChildren = hideZeroPots
+        ? potNode.children.filter((c) => c.effectiveTotalDisplayMinor > 0)
+        : potNode.children;
       const hasChildrenToUnfold =
-        potNode.children.length > 0 || directObs.length > 0 || directExps.length > 0;
+        visibleChildren.length > 0 || directObs.length > 0 || directExps.length > 0;
       const isExpanded = hasChildrenToUnfold && expandedPotIds.has(pid);
 
       const nodeId = `pot-${pid}`;
-      const valMinor = potNode.effectiveTotalDisplayMinor;
+      const valMinor = Math.round(potNode.effectiveTotalDisplayMinor * scaleRatio);
       const isZeroContainer = valMinor <= 0;
+      const potStatus = computeSubtreeStatus(potNode);
+
+      let potBadge: SankeyNodeDatum['statusBadge'];
+      if (valMinor > 0 && !privacyMode) {
+        const dueSuffix = potStatus.nextDueIso ? ` · Due ${formatShortDayMonth(potStatus.nextDueIso)}` : '';
+        if (potStatus.spentPaidMinor > 0 && potStatus.plannedUpcomingMinor > 0) {
+          potBadge = {
+            text: `✓ ${formatDisplayValue(potStatus.spentPaidMinor, { currency, privacyMode: false, compact: true })} spent · ⏳ ${formatDisplayValue(potStatus.plannedUpcomingMinor, { currency, privacyMode: false, compact: true })} planned${dueSuffix}`,
+            tone: 'mixed',
+          };
+        } else if (potStatus.spentPaidMinor > 0 && potStatus.plannedUpcomingMinor === 0) {
+          potBadge = {
+            text: `✓ ${formatDisplayValue(potStatus.spentPaidMinor, { currency, privacyMode: false, compact: true })} spent`,
+            tone: 'paid',
+          };
+        } else if (potStatus.plannedUpcomingMinor > 0) {
+          potBadge = {
+            text: `⏳ ${formatDisplayValue(potStatus.plannedUpcomingMinor, { currency, privacyMode: false, compact: true })} planned${dueSuffix}`,
+            tone: 'planned',
+          };
+        }
+      }
 
       nodes.push({
         id: nodeId,
@@ -257,26 +423,42 @@ export const CashflowSankeyChart: React.FC<{
         canUnfold: hasChildrenToUnfold,
         isExpanded,
         potRef: potNode,
-        dashed: isZeroContainer,
+        dashed: isZeroContainer || (potStatus.spentPaidMinor === 0 && potStatus.plannedUpcomingMinor > 0),
+        spentPaidMinor: potStatus.spentPaidMinor,
+        plannedUpcomingMinor: potStatus.plannedUpcomingMinor,
+        statusBadge: potBadge,
       });
 
       links.push({
         source: parentSourceId,
         target: nodeId,
         value: Math.max(1, valMinor),
-        dashed: isZeroContainer,
+        dashed: isZeroContainer || (potStatus.spentPaidMinor === 0 && potStatus.plannedUpcomingMinor > 0 && !isExpanded),
       });
 
       if (!isExpanded) return;
 
       // 1. Recursive Child Sub-Pots (unlimited depth)
-      for (const childNode of potNode.children) {
-        emitPotSubtree(childNode, nodeId);
+      for (const childNode of visibleChildren) {
+        emitPotSubtree(childNode, nodeId, 1);
       }
 
       // 2. Direct Scheduled Obligations on this pot (each can be promoted into a Pot via '+')
       for (const ob of directObs) {
         const obNodeId = `ob-${ob.id}`;
+        const isPaid = ob.isPaidThisMonth;
+        const paidDateStr = ob.occurrence?.bankDate || ob.occurrence?.paidAt || null;
+        const dueDateIso = ob.metrics.isDueThisMonth
+          ? `${activeYm}-${String(Math.max(1, Math.min(31, ob.dueDay || 1))).padStart(2, '0')}`
+          : ob.nextDueDate;
+        const badgeText = isPaid
+          ? paidDateStr
+            ? `✓ Paid ${formatShortDayMonth(paidDateStr)}`
+            : '✓ Paid'
+          : ob.metrics.isDueThisMonth
+            ? `⏳ Due ${formatShortDayMonth(dueDateIso)}`
+            : `⏳ Preserve · ${formatShortDayMonth(ob.nextDueDate)}`;
+
         nodes.push({
           id: obNodeId,
           name: ob.name,
@@ -286,11 +468,19 @@ export const CashflowSankeyChart: React.FC<{
           canUnfold: false,
           isExpanded: false,
           obRef: ob,
+          dashed: !isPaid,
+          spentPaidMinor: isPaid ? ob.effectiveDisplayMinor : 0,
+          plannedUpcomingMinor: isPaid ? 0 : ob.effectiveDisplayMinor,
+          statusBadge: {
+            text: badgeText,
+            tone: isPaid ? 'paid' : 'planned',
+          },
         });
         links.push({
           source: nodeId,
           target: obNodeId,
           value: Math.max(1, ob.effectiveDisplayMinor),
+          dashed: !isPaid,
         });
       }
 
@@ -299,6 +489,8 @@ export const CashflowSankeyChart: React.FC<{
         const expNodeId = `exp-${exp.id}`;
         const canExpUnfold = exp.items.length > 0;
         const expExpanded = canExpUnfold && expandedExpenseIds.has(exp.id);
+        const isPendingExp = (exp.status ?? 'posted') === 'pending';
+        const expDateLabel = formatShortDayMonth(exp.bankTimestamp || exp.spentDate);
         nodes.push({
           id: expNodeId,
           name: exp.merchant,
@@ -308,11 +500,21 @@ export const CashflowSankeyChart: React.FC<{
           canUnfold: canExpUnfold,
           isExpanded: expExpanded,
           expRef: exp,
+          dashed: isPendingExp,
+          spentPaidMinor: isPendingExp ? 0 : exp.displayAmountMinor,
+          plannedUpcomingMinor: isPendingExp ? exp.displayAmountMinor : 0,
+          statusBadge: {
+            text: isPendingExp
+              ? `⏳ Pending${expDateLabel ? ` · ${expDateLabel}` : ''}`
+              : `✓ Spent${expDateLabel ? ` · ${expDateLabel}` : ''}`,
+            tone: isPendingExp ? 'pending' : 'paid',
+          },
         });
         links.push({
           source: nodeId,
           target: expNodeId,
           value: Math.max(1, exp.displayAmountMinor),
+          dashed: isPendingExp,
         });
 
         if (expExpanded) {
@@ -363,305 +565,364 @@ export const CashflowSankeyChart: React.FC<{
     const unassignedObs = (obsByPot.get(null) ?? []).filter((o) => o.effectiveDisplayMinor > 0);
     const unassignedExps = (expsByPot.get(null) ?? []).filter((e) => e.displayAmountMinor > 0);
 
-    if (showRoutingLayers && accounts.length > 0) {
-      // --- MULTI-LAYER ARCHITECTURE:
-      // Inflows -> Monthly Pool -> Bank Accounts -> Workspace Scopes (Shared Household / Private / Polish Flat) -> Top-Level Pots -> Sub-Pots & Items
-      const accMap = new Map(accounts.map((a) => [a.id, a]));
-      const wsMap = new Map(workspaces.map((w) => [w.id, w]));
+    const activeAccountNodeIds: string[] = [];
+    const activeWorkspaceNodeIds: string[] = [];
 
-      const defaultAccForWs = (wsId: string): string => {
-        const match =
-          accounts.find((a) => a.workspaceId === wsId && a.isPrimaryRunway) ||
-          accounts.find((a) => a.workspaceId === wsId) ||
-          accounts[0];
-        return match ? match.id : 'acc-unassigned';
-      };
+    if (!isPoolCollapsed) {
+      if (showRoutingLayers && accounts.length > 0) {
+        // --- MULTI-LAYER ARCHITECTURE:
+        // Inflows -> Monthly Pool -> Bank Accounts (foldable) -> Workspace Scopes (foldable) -> Top-Level Pots -> Sub-Pots & Items
+        const accMap = new Map(accounts.map((a) => [a.id, a]));
+        const wsMap = new Map(workspaces.map((w) => [w.id, w]));
 
-      // Collect all pot IDs inside a rootPot subtree
-      const collectSubtreeIds = (pn: PotRollupNode): string[] => [
-        pn.pot.id,
-        ...pn.children.flatMap((c) => collectSubtreeIds(c)),
-      ];
+        const defaultAccForWs = (wsId: string): string => {
+          const match =
+            accounts.find((a) => a.workspaceId === wsId && a.isPrimaryRunway) ||
+            accounts.find((a) => a.workspaceId === wsId) ||
+            accounts[0];
+          return match ? match.id : 'acc-unassigned';
+        };
 
-      // Compute how each rootPot is funded by Bank Accounts
-      const accTotals = new Map<string, number>();
-      const accToWsTotals = new Map<string, number>(); // `${accId}|${wsId}` -> minor
-      const wsTotals = new Map<string, number>();
+        // Collect all pot IDs inside a rootPot subtree
+        const collectSubtreeIds = (pn: PotRollupNode): string[] => [
+          pn.pot.id,
+          ...pn.children.flatMap((c) => collectSubtreeIds(c)),
+        ];
 
-      for (const rootPot of potTree) {
-        const wsId = rootPot.pot.workspaceId;
-        const val = rootPot.effectiveTotalDisplayMinor;
-        if (val <= 0) continue;
-        wsTotals.set(wsId, (wsTotals.get(wsId) ?? 0) + val);
+        // Compute how each rootPot is funded by Bank Accounts (and which flows remain unfolded when an Account is folded)
+        const accTotals = new Map<string, number>();
+        const accToWsTotals = new Map<string, number>(); // `${accId}|${wsId}` -> minor (only for unfolded accounts)
+        const wsTotals = new Map<string, number>(); // only from unfolded accounts
+        const wsHasUnfoldedZeroPots = new Set<string>();
+        const rootPotScale = new Map<string, number>();
+        const rootPotVisibleFromAccounts = new Set<string>();
 
-        const subtreeIds = collectSubtreeIds(rootPot);
-        const byAcc = new Map<string, number>();
-        let itemizedSum = 0;
-        for (const pid of subtreeIds) {
-          for (const ob of obsByPot.get(pid) ?? []) {
-            if (ob.effectiveDisplayMinor <= 0) continue;
-            const aid = ob.accountId && accMap.has(ob.accountId) ? ob.accountId : defaultAccForWs(wsId);
-            byAcc.set(aid, (byAcc.get(aid) ?? 0) + ob.effectiveDisplayMinor);
-            itemizedSum += ob.effectiveDisplayMinor;
+        for (const rootPot of potTree) {
+          const wsId = rootPot.pot.workspaceId;
+          const val = rootPot.effectiveTotalDisplayMinor;
+          if (val <= 0) {
+            const defAccId = defaultAccForWs(wsId);
+            if (!collapsedNodeIds.has(`acc-node-${defAccId}`) && !hideZeroPots) {
+              rootPotVisibleFromAccounts.add(rootPot.pot.id);
+              rootPotScale.set(rootPot.pot.id, 1);
+              wsHasUnfoldedZeroPots.add(wsId);
+            }
+            continue;
           }
-          for (const exp of expsByPot.get(pid) ?? []) {
-            if (exp.displayAmountMinor <= 0) continue;
-            const aid = exp.accountId && accMap.has(exp.accountId) ? exp.accountId : defaultAccForWs(wsId);
-            byAcc.set(aid, (byAcc.get(aid) ?? 0) + exp.displayAmountMinor);
-            itemizedSum += exp.displayAmountMinor;
+
+          const subtreeIds = collectSubtreeIds(rootPot);
+          const byAcc = new Map<string, number>();
+          let itemizedSum = 0;
+          for (const pid of subtreeIds) {
+            for (const ob of obsByPot.get(pid) ?? []) {
+              if (ob.effectiveDisplayMinor <= 0) continue;
+              const aid = ob.accountId && accMap.has(ob.accountId) ? ob.accountId : defaultAccForWs(wsId);
+              byAcc.set(aid, (byAcc.get(aid) ?? 0) + ob.effectiveDisplayMinor);
+              itemizedSum += ob.effectiveDisplayMinor;
+            }
+            for (const exp of expsByPot.get(pid) ?? []) {
+              if (exp.displayAmountMinor <= 0) continue;
+              const aid = exp.accountId && accMap.has(exp.accountId) ? exp.accountId : defaultAccForWs(wsId);
+              byAcc.set(aid, (byAcc.get(aid) ?? 0) + exp.displayAmountMinor);
+              itemizedSum += exp.displayAmountMinor;
+            }
+          }
+
+          if (itemizedSum < val) {
+            const rem = val - itemizedSum;
+            const aid = defaultAccForWs(wsId);
+            byAcc.set(aid, (byAcc.get(aid) ?? 0) + rem);
+          }
+
+          let unfoldedPotAmt = 0;
+          for (const [aid, amt] of byAcc.entries()) {
+            // Bank Account bar always shows its full total inflow from the Monthly Pool
+            accTotals.set(aid, (accTotals.get(aid) ?? 0) + amt);
+            // Downstream Workspace & Pot flows only emit if this Bank Account is NOT folded
+            if (!collapsedNodeIds.has(`acc-node-${aid}`)) {
+              unfoldedPotAmt += amt;
+              wsTotals.set(wsId, (wsTotals.get(wsId) ?? 0) + amt);
+              const pairKey = `${aid}|${wsId}`;
+              accToWsTotals.set(pairKey, (accToWsTotals.get(pairKey) ?? 0) + amt);
+            }
+          }
+
+          if (unfoldedPotAmt > 0) {
+            rootPotVisibleFromAccounts.add(rootPot.pot.id);
+            rootPotScale.set(rootPot.pot.id, Math.min(1, unfoldedPotAmt / val));
           }
         }
 
-        if (itemizedSum < val) {
-          const rem = val - itemizedSum;
-          const aid = defaultAccForWs(wsId);
-          byAcc.set(aid, (byAcc.get(aid) ?? 0) + rem);
+        // Include unassigned obligations/expenses in Account -> Workspace routing
+        for (const ob of unassignedObs) {
+          const wsId = ob.workspaceId;
+          const aid = ob.accountId && accMap.has(ob.accountId) ? ob.accountId : defaultAccForWs(wsId);
+          accTotals.set(aid, (accTotals.get(aid) ?? 0) + ob.effectiveDisplayMinor);
+          if (!collapsedNodeIds.has(`acc-node-${aid}`)) {
+            wsTotals.set(wsId, (wsTotals.get(wsId) ?? 0) + ob.effectiveDisplayMinor);
+            const pairKey = `${aid}|${wsId}`;
+            accToWsTotals.set(pairKey, (accToWsTotals.get(pairKey) ?? 0) + ob.effectiveDisplayMinor);
+          }
+        }
+        for (const exp of unassignedExps) {
+          const wsId = exp.workspaceId;
+          const aid = exp.accountId && accMap.has(exp.accountId) ? exp.accountId : defaultAccForWs(wsId);
+          accTotals.set(aid, (accTotals.get(aid) ?? 0) + exp.displayAmountMinor);
+          if (!collapsedNodeIds.has(`acc-node-${aid}`)) {
+            wsTotals.set(wsId, (wsTotals.get(wsId) ?? 0) + exp.displayAmountMinor);
+            const pairKey = `${aid}|${wsId}`;
+            accToWsTotals.set(pairKey, (accToWsTotals.get(pairKey) ?? 0) + exp.displayAmountMinor);
+          }
         }
 
-        for (const [aid, amt] of byAcc.entries()) {
-          accTotals.set(aid, (accTotals.get(aid) ?? 0) + amt);
-          const pairKey = `${aid}|${wsId}`;
-          accToWsTotals.set(pairKey, (accToWsTotals.get(pairKey) ?? 0) + amt);
+        const accPalette: Record<string, string> = {
+          'acc-club-lloyds': '#1D4ED8',
+          'acc-lloyds-classic': '#0F766E',
+          'acc-revolut-joint': '#7C3AED',
+          'acc-revolut-personal': '#2563EB',
+          'acc-alior-pln': '#B45309',
+          'acc-standard-saver': '#059669',
+        };
+
+        // Emit Stage 2: Bank Account Nodes (interactive click-to-fold/unfold!)
+        for (const [aid, totalAmt] of Array.from(accTotals.entries()).sort((a, b) => b[1] - a[1])) {
+          if (totalAmt <= 0) continue;
+          const acc = accMap.get(aid);
+          const accNodeId = `acc-node-${aid}`;
+          activeAccountNodeIds.push(accNodeId);
+          const isAccCollapsed = collapsedNodeIds.has(accNodeId);
+          const shortName = acc
+            ? acc.name.replace(/\s*\([^)]*\)/g, '')
+            : 'Unassigned Account';
+          nodes.push({
+            id: accNodeId,
+            name: `🏦 ${shortName}`,
+            color: accPalette[aid] || '#0284C7',
+            displayMinor: totalAmt,
+            nodeKind: 'account',
+            accountId: aid,
+            canUnfold: true,
+            isExpanded: !isAccCollapsed,
+            statusBadge: isAccCollapsed
+              ? { text: '📁 Folded', tone: 'mixed' }
+              : undefined,
+          });
+          links.push({
+            source: poolId,
+            target: accNodeId,
+            value: Math.max(1, totalAmt),
+            strokeColorOverride: accPalette[aid] || '#0284C7',
+          });
+        }
+
+        // Emit Stage 3: Workspace Mixing Nodes (Shared Household vs. Wadera Personal vs. Polish Flat)
+        const wsMeta = (wsId: string): { label: string; color: string } => {
+          const w = wsMap.get(wsId);
+          if (wsId === 'ws-home' || w?.kind === 'shared') {
+            return { label: `🏠 ${w?.name || 'Shared Household'}`, color: '#0F766E' };
+          }
+          if (wsId === 'ws-wadera') {
+            return { label: `👤 ${w?.name || 'Wadera Personal'}`, color: '#3B82F6' };
+          }
+          if (wsId.includes('polish') || w?.kind === 'company') {
+            return { label: `🇵🇱 ${w?.name || 'Polish Flat'}`, color: '#D97706' };
+          }
+          return { label: `📁 ${w?.name || wsId}`, color: '#475569' };
+        };
+
+        for (const [wsId, wsAmt] of Array.from(wsTotals.entries()).sort((a, b) => b[1] - a[1])) {
+          if (wsAmt <= 0 && !wsHasUnfoldedZeroPots.has(wsId)) continue;
+          const wsNodeId = `ws-node-${wsId}`;
+          activeWorkspaceNodeIds.push(wsNodeId);
+          const isWsCollapsed = collapsedNodeIds.has(wsNodeId);
+          const meta = wsMeta(wsId);
+          const wsPotCount = potTree.filter(
+            (rp) =>
+              rp.pot.workspaceId === wsId &&
+              rootPotVisibleFromAccounts.has(rp.pot.id) &&
+              (!hideZeroPots || rp.effectiveTotalDisplayMinor > 0)
+          ).length;
+          nodes.push({
+            id: wsNodeId,
+            name: meta.label,
+            color: meta.color,
+            displayMinor: wsAmt,
+            nodeKind: 'workspace',
+            workspaceId: wsId,
+            canUnfold: true,
+            isExpanded: !isWsCollapsed,
+            statusBadge: isWsCollapsed
+              ? { text: `📁 Folded · ${wsPotCount}`, tone: 'mixed' }
+              : undefined,
+          });
+        }
+
+        // Connect Stage 2 (Bank Accounts) -> Stage 3 (Workspace Scopes) for unfolded accounts
+        for (const [pairKey, pairAmt] of accToWsTotals.entries()) {
+          if (pairAmt <= 0) continue;
+          const [aid, wsId] = pairKey.split('|');
+          if (collapsedNodeIds.has(`acc-node-${aid}`)) continue;
+          const meta = wsMeta(wsId);
+          links.push({
+            source: `acc-node-${aid}`,
+            target: `ws-node-${wsId}`,
+            value: Math.max(1, pairAmt),
+            strokeColorOverride: meta.color,
+          });
+        }
+
+        // Connect Stage 3 (Workspace Scopes) -> Stage 4+ (Top-Level Pots & Unassigned Items) when Workspace is NOT folded
+        for (const rootPot of potTree) {
+          const wsId = rootPot.pot.workspaceId;
+          const wsNodeId = `ws-node-${wsId}`;
+          if (!wsTotals.has(wsId) && !wsHasUnfoldedZeroPots.has(wsId)) continue;
+          if (collapsedNodeIds.has(wsNodeId)) continue;
+          if (!rootPotVisibleFromAccounts.has(rootPot.pot.id)) continue;
+          emitPotSubtree(rootPot, wsNodeId, rootPotScale.get(rootPot.pot.id) ?? 1);
+        }
+
+        for (const ob of unassignedObs) {
+          const wsId = ob.workspaceId;
+          const aid = ob.accountId && accMap.has(ob.accountId) ? ob.accountId : defaultAccForWs(wsId);
+          if (collapsedNodeIds.has(`acc-node-${aid}`)) continue;
+          if (collapsedNodeIds.has(`ws-node-${wsId}`)) continue;
+          const obNodeId = `ob-${ob.id}`;
+          const parentWsNode = wsTotals.has(wsId) ? `ws-node-${wsId}` : poolId;
+          nodes.push({
+            id: obNodeId,
+            name: ob.name,
+            color: '#64748B',
+            displayMinor: ob.effectiveDisplayMinor,
+            nodeKind: 'obligation',
+            canUnfold: false,
+            isExpanded: false,
+            obRef: ob,
+          });
+          links.push({ source: parentWsNode, target: obNodeId, value: Math.max(1, ob.effectiveDisplayMinor) });
+        }
+        for (const exp of unassignedExps) {
+          const wsId = exp.workspaceId;
+          const aid = exp.accountId && accMap.has(exp.accountId) ? exp.accountId : defaultAccForWs(wsId);
+          if (collapsedNodeIds.has(`acc-node-${aid}`)) continue;
+          if (collapsedNodeIds.has(`ws-node-${wsId}`)) continue;
+          const expNodeId = `exp-${exp.id}`;
+          const parentWsNode = wsTotals.has(wsId) ? `ws-node-${wsId}` : poolId;
+          nodes.push({
+            id: expNodeId,
+            name: exp.merchant,
+            color: '#64748B',
+            displayMinor: exp.displayAmountMinor,
+            nodeKind: 'expense',
+            canUnfold: exp.items.length > 0,
+            isExpanded: false,
+            expRef: exp,
+          });
+          links.push({ source: parentWsNode, target: expNodeId, value: Math.max(1, exp.displayAmountMinor) });
+        }
+      } else {
+        for (const rootPot of potTree) {
+          emitPotSubtree(rootPot, poolId, 1);
+        }
+
+        for (const ob of unassignedObs) {
+          const obNodeId = `ob-${ob.id}`;
+          nodes.push({
+            id: obNodeId,
+            name: ob.name,
+            color: '#64748B',
+            displayMinor: ob.effectiveDisplayMinor,
+            nodeKind: 'obligation',
+            canUnfold: false,
+            isExpanded: false,
+            obRef: ob,
+          });
+          links.push({ source: poolId, target: obNodeId, value: Math.max(1, ob.effectiveDisplayMinor) });
+        }
+        for (const exp of unassignedExps) {
+          const expNodeId = `exp-${exp.id}`;
+          nodes.push({
+            id: expNodeId,
+            name: exp.merchant,
+            color: '#64748B',
+            displayMinor: exp.displayAmountMinor,
+            nodeKind: 'expense',
+            canUnfold: exp.items.length > 0,
+            isExpanded: false,
+            expRef: exp,
+          });
+          links.push({ source: poolId, target: expNodeId, value: Math.max(1, exp.displayAmountMinor) });
         }
       }
 
-      // Include unassigned obligations/expenses in Account -> Workspace routing
-      for (const ob of unassignedObs) {
-        const wsId = ob.workspaceId;
-        const aid = ob.accountId && accMap.has(ob.accountId) ? ob.accountId : defaultAccForWs(wsId);
-        accTotals.set(aid, (accTotals.get(aid) ?? 0) + ob.effectiveDisplayMinor);
-        wsTotals.set(wsId, (wsTotals.get(wsId) ?? 0) + ob.effectiveDisplayMinor);
-        const pairKey = `${aid}|${wsId}`;
-        accToWsTotals.set(pairKey, (accToWsTotals.get(pairKey) ?? 0) + ob.effectiveDisplayMinor);
-      }
-      for (const exp of unassignedExps) {
-        const wsId = exp.workspaceId;
-        const aid = exp.accountId && accMap.has(exp.accountId) ? exp.accountId : defaultAccForWs(wsId);
-        accTotals.set(aid, (accTotals.get(aid) ?? 0) + exp.displayAmountMinor);
-        wsTotals.set(wsId, (wsTotals.get(wsId) ?? 0) + exp.displayAmountMinor);
-        const pairKey = `${aid}|${wsId}`;
-        accToWsTotals.set(pairKey, (accToWsTotals.get(pairKey) ?? 0) + exp.displayAmountMinor);
-      }
+      // Next Month Needed Before Salary (Dashed Red outflow from the same unified central pool, click-to-unfoldable!)
+      if (cashflowBridge && cashflowBridge.nextMonthPreSalaryMinor > 0) {
+        const nextNeedId = 'out-next-month-needed';
+        const canUnfoldNext = cashflowBridge.nextMonthBreakdown.length > 0;
+        const isNextExpanded = canUnfoldNext && expandedPotIds.has('__next_month_needed__');
 
-      const accPalette: Record<string, string> = {
-        'acc-club-lloyds': '#1D4ED8',
-        'acc-lloyds-classic': '#0F766E',
-        'acc-revolut-joint': '#7C3AED',
-        'acc-revolut-personal': '#2563EB',
-        'acc-alior-pln': '#B45309',
-        'acc-standard-saver': '#059669',
-      };
-
-      // Emit Stage 2: Bank Account Nodes
-      for (const [aid, totalAmt] of Array.from(accTotals.entries()).sort((a, b) => b[1] - a[1])) {
-        if (totalAmt <= 0) continue;
-        const acc = accMap.get(aid);
-        const accNodeId = `acc-node-${aid}`;
-        const shortName = acc
-          ? acc.name.replace(/\s*\([^)]*\)/g, '')
-          : 'Unassigned Account';
         nodes.push({
-          id: accNodeId,
-          name: `🏦 ${shortName}`,
-          color: accPalette[aid] || '#0284C7',
-          displayMinor: totalAmt,
-          nodeKind: 'account',
-          accountId: aid,
-          canUnfold: false,
-          isExpanded: false,
+          id: nextNeedId,
+          name: `${t.sankeyNextMonthNeeded} (1–${Math.max(1, cashflowBridge.primaryPaydayDay - 1)}.)`,
+          color: '#DC2626',
+          displayMinor: cashflowBridge.nextMonthPreSalaryMinor,
+          nodeKind: 'next_needed',
+          canUnfold: canUnfoldNext,
+          isExpanded: isNextExpanded,
+          dashed: true,
         });
         links.push({
           source: poolId,
-          target: accNodeId,
-          value: Math.max(1, totalAmt),
-          strokeColorOverride: accPalette[aid] || '#0284C7',
+          target: nextNeedId,
+          value: Math.max(1, cashflowBridge.nextMonthPreSalaryMinor),
+          dashed: true,
+          strokeColorOverride: '#DC2626',
         });
+
+        if (isNextExpanded) {
+          for (const item of cashflowBridge.nextMonthBreakdown) {
+            nodes.push({
+              id: item.id,
+              name: item.name,
+              color: item.color || '#DC2626',
+              displayMinor: item.displayMinor,
+              nodeKind: 'other',
+              canUnfold: false,
+              isExpanded: false,
+              dashed: true,
+            });
+            links.push({
+              source: nextNeedId,
+              target: item.id,
+              value: Math.max(1, item.displayMinor),
+              dashed: true,
+              strokeColorOverride: '#DC2626',
+            });
+          }
+        }
       }
 
-      // Emit Stage 3: Workspace Mixing Nodes (Shared Household vs. Wadera Personal vs. Polish Flat)
-      const wsMeta = (wsId: string): { label: string; color: string } => {
-        const w = wsMap.get(wsId);
-        if (wsId === 'ws-home' || w?.kind === 'shared') {
-          return { label: `🏠 ${w?.name || 'Shared Household'}`, color: '#0F766E' };
-        }
-        if (wsId === 'ws-wadera') {
-          return { label: `👤 ${w?.name || 'Wadera Personal'}`, color: '#3B82F6' };
-        }
-        if (wsId.includes('polish') || w?.kind === 'company') {
-          return { label: `🇵🇱 ${w?.name || 'Polish Flat'}`, color: '#D97706' };
-        }
-        return { label: `📁 ${w?.name || wsId}`, color: '#475569' };
-      };
-
-      for (const [wsId, wsAmt] of Array.from(wsTotals.entries()).sort((a, b) => b[1] - a[1])) {
-        if (wsAmt <= 0) continue;
-        const wsNodeId = `ws-node-${wsId}`;
-        const meta = wsMeta(wsId);
+      // True Remaining Buffer / Unallocated Savings (after BOTH this month's spending AND next month's pre-salary reserve)
+      const combinedFreeBufferMinor = Math.max(0, totalInflowMinor - totalOutflowCommitmentsMinor);
+      if (combinedFreeBufferMinor > 0) {
+        const anyPending = cashflowBridge ? cashflowBridge.upcomingSalaryPendingMinor > 0 : false;
         nodes.push({
-          id: wsNodeId,
-          name: meta.label,
-          color: meta.color,
-          displayMinor: wsAmt,
-          nodeKind: 'workspace',
-          workspaceId: wsId,
+          id: 'out-surplus',
+          name: t.sankeySurplus,
+          color: '#10B981',
+          displayMinor: combinedFreeBufferMinor,
+          nodeKind: 'surplus',
           canUnfold: false,
           isExpanded: false,
+          dashed: anyPending,
         });
-      }
-
-      // Connect Stage 2 (Bank Accounts) -> Stage 3 (Workspace Scopes)
-      for (const [pairKey, pairAmt] of accToWsTotals.entries()) {
-        if (pairAmt <= 0) continue;
-        const [aid, wsId] = pairKey.split('|');
-        const meta = wsMeta(wsId);
         links.push({
-          source: `acc-node-${aid}`,
-          target: `ws-node-${wsId}`,
-          value: Math.max(1, pairAmt),
-          strokeColorOverride: meta.color,
+          source: poolId,
+          target: 'out-surplus',
+          value: Math.max(1, combinedFreeBufferMinor),
+          dashed: anyPending,
+          strokeColorOverride: '#10B981',
         });
       }
-
-      // Connect Stage 3 (Workspace Scopes) -> Stage 4+ (Top-Level Pots & Unassigned Items)
-      for (const rootPot of potTree) {
-        const wsNodeId = `ws-node-${rootPot.pot.workspaceId}`;
-        if (!wsTotals.has(rootPot.pot.workspaceId)) continue;
-        emitPotSubtree(rootPot, wsNodeId);
-      }
-
-      for (const ob of unassignedObs) {
-        const obNodeId = `ob-${ob.id}`;
-        const parentWsNode = wsTotals.has(ob.workspaceId) ? `ws-node-${ob.workspaceId}` : poolId;
-        nodes.push({
-          id: obNodeId,
-          name: ob.name,
-          color: '#64748B',
-          displayMinor: ob.effectiveDisplayMinor,
-          nodeKind: 'obligation',
-          canUnfold: false,
-          isExpanded: false,
-          obRef: ob,
-        });
-        links.push({ source: parentWsNode, target: obNodeId, value: Math.max(1, ob.effectiveDisplayMinor) });
-      }
-      for (const exp of unassignedExps) {
-        const expNodeId = `exp-${exp.id}`;
-        const parentWsNode = wsTotals.has(exp.workspaceId) ? `ws-node-${exp.workspaceId}` : poolId;
-        nodes.push({
-          id: expNodeId,
-          name: exp.merchant,
-          color: '#64748B',
-          displayMinor: exp.displayAmountMinor,
-          nodeKind: 'expense',
-          canUnfold: exp.items.length > 0,
-          isExpanded: false,
-          expRef: exp,
-        });
-        links.push({ source: parentWsNode, target: expNodeId, value: Math.max(1, exp.displayAmountMinor) });
-      }
-    } else {
-      for (const rootPot of potTree) {
-        emitPotSubtree(rootPot, poolId);
-      }
-
-      for (const ob of unassignedObs) {
-        const obNodeId = `ob-${ob.id}`;
-        nodes.push({
-          id: obNodeId,
-          name: ob.name,
-          color: '#64748B',
-          displayMinor: ob.effectiveDisplayMinor,
-          nodeKind: 'obligation',
-          canUnfold: false,
-          isExpanded: false,
-          obRef: ob,
-        });
-        links.push({ source: poolId, target: obNodeId, value: Math.max(1, ob.effectiveDisplayMinor) });
-      }
-      for (const exp of unassignedExps) {
-        const expNodeId = `exp-${exp.id}`;
-        nodes.push({
-          id: expNodeId,
-          name: exp.merchant,
-          color: '#64748B',
-          displayMinor: exp.displayAmountMinor,
-          nodeKind: 'expense',
-          canUnfold: exp.items.length > 0,
-          isExpanded: false,
-          expRef: exp,
-        });
-        links.push({ source: poolId, target: expNodeId, value: Math.max(1, exp.displayAmountMinor) });
-      }
-    }
-
-    // Next Month Needed Before Salary (Dashed Red outflow from the same unified central pool, click-to-unfoldable!)
-    if (cashflowBridge && cashflowBridge.nextMonthPreSalaryMinor > 0) {
-      const nextNeedId = 'out-next-month-needed';
-      const canUnfoldNext = cashflowBridge.nextMonthBreakdown.length > 0;
-      const isNextExpanded = canUnfoldNext && expandedPotIds.has('__next_month_needed__');
-
-      nodes.push({
-        id: nextNeedId,
-        name: `${t.sankeyNextMonthNeeded} (1–${Math.max(1, cashflowBridge.primaryPaydayDay - 1)}.)`,
-        color: '#DC2626',
-        displayMinor: cashflowBridge.nextMonthPreSalaryMinor,
-        nodeKind: 'next_needed',
-        canUnfold: canUnfoldNext,
-        isExpanded: isNextExpanded,
-        dashed: true,
-      });
-      links.push({
-        source: poolId,
-        target: nextNeedId,
-        value: Math.max(1, cashflowBridge.nextMonthPreSalaryMinor),
-        dashed: true,
-        strokeColorOverride: '#DC2626',
-      });
-
-      if (isNextExpanded) {
-        for (const item of cashflowBridge.nextMonthBreakdown) {
-          nodes.push({
-            id: item.id,
-            name: item.name,
-            color: item.color || '#DC2626',
-            displayMinor: item.displayMinor,
-            nodeKind: 'other',
-            canUnfold: false,
-            isExpanded: false,
-            dashed: true,
-          });
-          links.push({
-            source: nextNeedId,
-            target: item.id,
-            value: Math.max(1, item.displayMinor),
-            dashed: true,
-            strokeColorOverride: '#DC2626',
-          });
-        }
-      }
-    }
-
-    // True Remaining Buffer / Unallocated Savings (after BOTH this month's spending AND next month's pre-salary reserve)
-    const combinedFreeBufferMinor = Math.max(0, totalInflowMinor - totalOutflowCommitmentsMinor);
-    if (combinedFreeBufferMinor > 0) {
-      const anyPending = cashflowBridge ? cashflowBridge.upcomingSalaryPendingMinor > 0 : false;
-      nodes.push({
-        id: 'out-surplus',
-        name: t.sankeySurplus,
-        color: '#10B981',
-        displayMinor: combinedFreeBufferMinor,
-        nodeKind: 'surplus',
-        canUnfold: false,
-        isExpanded: false,
-        dashed: anyPending,
-      });
-      links.push({
-        source: poolId,
-        target: 'out-surplus',
-        value: Math.max(1, combinedFreeBufferMinor),
-        dashed: anyPending,
-        strokeColorOverride: '#10B981',
-      });
     }
 
     if (nodes.length < 2 || links.length === 0) return null;
@@ -692,18 +953,18 @@ export const CashflowSankeyChart: React.FC<{
     const maxNodesInCol = Math.max(3, ...Array.from(colCounts.values()));
     const numCols = maxDepth + 1;
 
-    const width = numCols <= 3 ? 900 : Math.max(900, numCols * 265 + 130);
-    const height = Math.max(320, maxNodesInCol * 46 + 40);
-    const rightMargin = 245;
+    const width = numCols <= 3 ? 920 : Math.max(920, numCols * 280 + 140);
+    const baseHeight = Math.max(400, maxNodesInCol * 74 + 120);
+    const rightMargin = 255;
 
     const finalLayout = sankey<SankeyNodeDatum, SankeyLinkDatum>()
       .nodeId((d) => d.id)
       .nodeAlign(sankeyLeft)
       .nodeWidth(10)
-      .nodePadding(28)
+      .nodePadding(44)
       .extent([
-        [12, 18],
-        [width - rightMargin, height - 18],
+        [12, 22],
+        [width - rightMargin, baseHeight - 22],
       ]);
 
     const graph = finalLayout({
@@ -711,7 +972,73 @@ export const CashflowSankeyChart: React.FC<{
       links: links.map((l) => ({ ...l })),
     });
 
-    return { graph, width, height, numCols, maxDepth, poolMinor };
+    // Deterministic per-column vertical label anti-collision pass:
+    // Ensures two adjacent node labels in the same column can never overlap even when bars are 1px thin.
+    const MIN_LABEL_GAP = 38;
+    const nodesByCol = new Map<number, typeof graph.nodes>();
+    for (const nd of graph.nodes) {
+      const colKey = nd.depth ?? Math.round((nd.x0 ?? 0) / 50);
+      const list = nodesByCol.get(colKey) ?? [];
+      list.push(nd);
+      nodesByCol.set(colKey, list);
+    }
+
+    const labelYById = new Map<string, number>();
+    let maxLabelBottom = baseHeight;
+
+    for (const colNodes of nodesByCol.values()) {
+      colNodes.sort((a, b) => {
+        const cyA = ((a.y0 ?? 0) + (a.y1 ?? 0)) / 2;
+        const cyB = ((b.y0 ?? 0) + (b.y1 ?? 0)) / 2;
+        return cyA - cyB;
+      });
+
+      const ys = colNodes.map((n) => Math.max(20, ((n.y0 ?? 0) + (n.y1 ?? 0)) / 2));
+      // Forward pass: push overlapping labels down
+      for (let i = 1; i < ys.length; i++) {
+        if (ys[i] < ys[i - 1] + MIN_LABEL_GAP) {
+          ys[i] = ys[i - 1] + MIN_LABEL_GAP;
+        }
+      }
+      // If the bottom label went past baseHeight - 22, try pulling up into any top slack first
+      const overflow = ys[ys.length - 1] - (baseHeight - 22);
+      if (overflow > 0) {
+        ys[ys.length - 1] -= overflow;
+        for (let i = ys.length - 2; i >= 0; i--) {
+          if (ys[i] > ys[i + 1] - MIN_LABEL_GAP) {
+            ys[i] = ys[i + 1] - MIN_LABEL_GAP;
+          }
+        }
+        // Re-clamp top and push down if column is genuinely packed
+        if (ys[0] < 20) {
+          ys[0] = 20;
+          for (let i = 1; i < ys.length; i++) {
+            if (ys[i] < ys[i - 1] + MIN_LABEL_GAP) {
+              ys[i] = ys[i - 1] + MIN_LABEL_GAP;
+            }
+          }
+        }
+      }
+
+      colNodes.forEach((n, idx) => {
+        labelYById.set(n.id, ys[idx]);
+        maxLabelBottom = Math.max(maxLabelBottom, ys[idx] + 24);
+      });
+    }
+
+    const height = Math.max(baseHeight, Math.ceil(maxLabelBottom));
+
+    return {
+      graph,
+      width,
+      height,
+      numCols,
+      maxDepth,
+      poolMinor,
+      activeAccountNodeIds,
+      activeWorkspaceNodeIds,
+      labelYById,
+    };
   }, [
     incomes,
     accounts,
@@ -726,8 +1053,127 @@ export const CashflowSankeyChart: React.FC<{
     netMonthlySurplusMinor,
     expandedPotIds,
     expandedExpenseIds,
+    collapsedNodeIds,
+    hideZeroPots,
+    currency,
+    privacyMode,
     t,
   ]);
+
+  const applyZoomAround = useCallback(
+    (targetZoom: number, originClientX?: number, originClientY?: number) => {
+      const clamped = Math.max(0.3, Math.min(2.75, Math.round(targetZoom * 100) / 100));
+      const vp = viewportRef.current;
+      if (!vp) {
+        setZoom(clamped);
+        return;
+      }
+      const rect = vp.getBoundingClientRect();
+      const cx = originClientX !== undefined ? originClientX - rect.left : rect.width / 2;
+      const cy = originClientY !== undefined ? originClientY - rect.top : rect.height / 2;
+      setPan((prevPan) => {
+        const graphX = (cx - prevPan.x) / zoom;
+        const graphY = (cy - prevPan.y) / zoom;
+        return {
+          x: Math.round(cx - graphX * clamped),
+          y: Math.round(cy - graphY * clamped),
+        };
+      });
+      setZoom(clamped);
+    },
+    [zoom]
+  );
+
+  // Passive-false wheel & touch listeners for smooth cursor-anchored wheel zoom and mobile two-finger pinch-to-zoom
+  useEffect(() => {
+    const vp = viewportRef.current;
+    if (!vp) return;
+    const onWheel = (e: WheelEvent) => {
+      if (!wheelZoomEnabled && !e.ctrlKey && !e.metaKey) return;
+      e.preventDefault();
+      const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+      applyZoomAround(zoomRef.current * factor, e.clientX, e.clientY);
+    };
+
+    const onTouchStart = (e: TouchEvent) => {
+      if (e.touches.length === 2) {
+        e.preventDefault();
+        const t1 = e.touches[0];
+        const t2 = e.touches[1];
+        const rect = vp.getBoundingClientRect();
+        const dist = Math.max(12, Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY));
+        const midX = (t1.clientX + t2.clientX) / 2 - rect.left;
+        const midY = (t1.clientY + t2.clientY) / 2 - rect.top;
+        pinchRef.current = {
+          startDist: dist,
+          startZoom: zoomRef.current,
+          midX,
+          midY,
+          origPanX: panRef.current.x,
+          origPanY: panRef.current.y,
+        };
+        dragRef.current = null;
+        setIsDragging(true);
+      }
+    };
+
+    const onTouchMove = (e: TouchEvent) => {
+      if (e.touches.length === 2 && pinchRef.current) {
+        e.preventDefault();
+        const pinch = pinchRef.current;
+        const t1 = e.touches[0];
+        const t2 = e.touches[1];
+        const rect = vp.getBoundingClientRect();
+        const curDist = Math.max(12, Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY));
+        const curMidX = (t1.clientX + t2.clientX) / 2 - rect.left;
+        const curMidY = (t1.clientY + t2.clientY) / 2 - rect.top;
+        const nextZoom = Math.max(
+          0.3,
+          Math.min(2.75, Math.round(pinch.startZoom * (curDist / pinch.startDist) * 100) / 100)
+        );
+        const graphX = (pinch.midX - pinch.origPanX) / pinch.startZoom;
+        const graphY = (pinch.midY - pinch.origPanY) / pinch.startZoom;
+        const nextPan = {
+          x: Math.round(curMidX - graphX * nextZoom),
+          y: Math.round(curMidY - graphY * nextZoom),
+        };
+        zoomRef.current = nextZoom;
+        panRef.current = nextPan;
+        setZoom(nextZoom);
+        setPan(nextPan);
+      }
+    };
+
+    const onTouchEnd = (e: TouchEvent) => {
+      if (e.touches.length < 2 && pinchRef.current) {
+        pinchRef.current = null;
+        if (e.touches.length === 1) {
+          const t1 = e.touches[0];
+          if (dragRef.current) {
+            dragRef.current.startX = t1.clientX;
+            dragRef.current.startY = t1.clientY;
+            dragRef.current.origPanX = panRef.current.x;
+            dragRef.current.origPanY = panRef.current.y;
+          }
+        } else {
+          setIsDragging(false);
+        }
+      }
+    };
+
+    vp.addEventListener('wheel', onWheel, { passive: false });
+    vp.addEventListener('touchstart', onTouchStart, { passive: false });
+    vp.addEventListener('touchmove', onTouchMove, { passive: false });
+    vp.addEventListener('touchend', onTouchEnd);
+    vp.addEventListener('touchcancel', onTouchEnd);
+    return () => {
+      vp.removeEventListener('wheel', onWheel);
+      vp.removeEventListener('touchstart', onTouchStart);
+      vp.removeEventListener('touchmove', onTouchMove);
+      vp.removeEventListener('touchend', onTouchEnd);
+      vp.removeEventListener('touchcancel', onTouchEnd);
+    };
+  }, [wheelZoomEnabled, applyZoomAround]);
 
   if (!model) {
     return (
@@ -737,9 +1183,109 @@ export const CashflowSankeyChart: React.FC<{
     );
   }
 
-  const { graph, width, height, numCols, maxDepth, poolMinor } = model;
+  const {
+    graph,
+    width,
+    height,
+    maxDepth,
+    poolMinor,
+    activeAccountNodeIds,
+    activeWorkspaceNodeIds,
+    labelYById,
+  } = model;
   const pathGen = sankeyLinkHorizontal();
   const denom = Math.max(1, poolMinor);
+
+  const handleFitToScreen = () => {
+    const vp = viewportRef.current;
+    if (!vp) {
+      setZoom(1);
+      setPan({ x: 0, y: 0 });
+      return;
+    }
+    const availW = Math.max(320, vp.clientWidth - 24);
+    const availH = Math.max(260, vp.clientHeight - 24);
+    const scaleW = availW / width;
+    const scaleH = availH / height;
+    const bestScale = Math.max(0.35, Math.min(1.25, Math.round(Math.min(scaleW, scaleH) * 100) / 100));
+    const offsetX = Math.max(8, Math.round(( vp.clientWidth - width * bestScale) / 2));
+    const offsetY = Math.max(8, Math.round((vp.clientHeight - height * bestScale) / 2));
+    setZoom(bestScale);
+    setPan({ x: offsetX, y: offsetY });
+  };
+
+  const handleResetView = () => {
+    setZoom(1);
+    setPan({ x: 0, y: 0 });
+  };
+
+  const allPotIdsInTree = (() => {
+    const ids: string[] = [];
+    const walk = (pn: PotRollupNode) => {
+      ids.push(pn.pot.id);
+      pn.children.forEach(walk);
+    };
+    potTree.forEach(walk);
+    return ids;
+  })();
+
+  const allAccountsFolded =
+    activeAccountNodeIds.length > 0 && activeAccountNodeIds.every((id) => collapsedNodeIds.has(id));
+  const allWorkspacesFolded =
+    activeWorkspaceNodeIds.length > 0 && activeWorkspaceNodeIds.every((id) => collapsedNodeIds.has(id));
+
+  const handleToggleAllAccounts = () => {
+    setCollapsedNodeIds((prev) => {
+      const next = new Set(prev);
+      if (allAccountsFolded) {
+        activeAccountNodeIds.forEach((id) => next.delete(id));
+      } else {
+        activeAccountNodeIds.forEach((id) => next.add(id));
+      }
+      return next;
+    });
+  };
+
+  const handleToggleAllWorkspaces = () => {
+    setCollapsedNodeIds((prev) => {
+      const next = new Set(prev);
+      if (allWorkspacesFolded) {
+        activeWorkspaceNodeIds.forEach((id) => next.delete(id));
+      } else {
+        activeWorkspaceNodeIds.forEach((id) => next.add(id));
+      }
+      return next;
+    });
+  };
+
+  const handleUnfoldAllEverything = () => {
+    setCollapsedNodeIds(new Set());
+    if (onSetExpandedPots) {
+      onSetExpandedPots(new Set([...allPotIdsInTree, '__next_month_needed__']));
+    } else {
+      for (const pid of allPotIdsInTree) {
+        if (!expandedPotIds.has(pid)) onTogglePot(pid);
+      }
+    }
+  };
+
+  const handleFoldAllEverything = () => {
+    setCollapsedNodeIds(new Set());
+    if (onSetExpandedPots) {
+      onSetExpandedPots(new Set());
+    } else {
+      for (const pid of Array.from(expandedPotIds)) {
+        onTogglePot(pid);
+      }
+    }
+    if (onSetExpandedExpenses) {
+      onSetExpandedExpenses(new Set());
+    } else {
+      for (const eid of Array.from(expandedExpenseIds)) {
+        onToggleExpense(eid);
+      }
+    }
+  };
 
   const triggerQuickAddForNode = (node: SankeyNodeDatum) => {
     if (node.nodeKind === 'pot' && node.potRef) {
@@ -775,10 +1321,10 @@ export const CashflowSankeyChart: React.FC<{
   };
 
   const handleNodeLabelClick = (node: SankeyNodeDatum) => {
-    if (node.nodeKind === 'next_needed' && node.canUnfold) {
+    if (node.nodeKind === 'pool' || node.nodeKind === 'account' || node.nodeKind === 'workspace') {
+      toggleCollapsedNode(node.id);
+    } else if (node.nodeKind === 'next_needed' && node.canUnfold) {
       onTogglePot('__next_month_needed__');
-    } else if (node.nodeKind === 'account' && node.accountId && onInspectItem) {
-      onInspectItem('account', node.accountId);
     } else if (node.nodeKind === 'pot' && node.potRef) {
       if (node.canUnfold) {
         onTogglePot(node.potRef.pot.id);
@@ -797,210 +1343,667 @@ export const CashflowSankeyChart: React.FC<{
     }
   };
 
+  const initPinchFromActivePointers = () => {
+    const vp = viewportRef.current;
+    if (!vp || activePointersRef.current.size < 2) return;
+    const pts = Array.from(activePointersRef.current.values());
+    const p1 = pts[0];
+    const p2 = pts[1];
+    const rect = vp.getBoundingClientRect();
+    const dist = Math.max(12, Math.hypot(p2.x - p1.x, p2.y - p1.y));
+    const midX = (p1.x + p2.x) / 2 - rect.left;
+    const midY = (p1.y + p2.y) / 2 - rect.top;
+    pinchRef.current = {
+      startDist: dist,
+      startZoom: zoomRef.current,
+      midX,
+      midY,
+      origPanX: panRef.current.x,
+      origPanY: panRef.current.y,
+    };
+    dragRef.current = null;
+    setIsDragging(true);
+  };
+
+  const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0 && e.pointerType === 'mouse') return;
+    const target = e.target as HTMLElement | null;
+    if (target?.closest('button, a, input')) {
+      return;
+    }
+
+    activePointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+    // Two-finger pinch gesture on touchscreen: start pinch-to-zoom immediately even if a finger is over a node label
+    if (activePointersRef.current.size >= 2) {
+      try {
+        e.currentTarget.setPointerCapture(e.pointerId);
+      } catch {
+        // Ignore pointer capture errors on synthetic touch events
+      }
+      initPinchFromActivePointers();
+      return;
+    }
+
+    if (target?.closest('[data-node-interactive="true"]')) {
+      return;
+    }
+
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // Ignore pointer capture errors
+    }
+    dragRef.current = {
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      origPanX: panRef.current.x,
+      origPanY: panRef.current.y,
+    };
+    setIsDragging(true);
+  };
+
+  const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (activePointersRef.current.has(e.pointerId)) {
+      activePointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    }
+
+    // Two-finger pinch-to-zoom + midpoint pan
+    if (activePointersRef.current.size >= 2) {
+      if (!pinchRef.current) {
+        initPinchFromActivePointers();
+      }
+      const pinch = pinchRef.current;
+      const vp = viewportRef.current;
+      if (pinch && vp) {
+        const pts = Array.from(activePointersRef.current.values());
+        const p1 = pts[0];
+        const p2 = pts[1];
+        const rect = vp.getBoundingClientRect();
+        const curDist = Math.max(12, Math.hypot(p2.x - p1.x, p2.y - p1.y));
+        const curMidX = (p1.x + p2.x) / 2 - rect.left;
+        const curMidY = (p1.y + p2.y) / 2 - rect.top;
+        const nextZoom = Math.max(
+          0.3,
+          Math.min(2.75, Math.round(pinch.startZoom * (curDist / pinch.startDist) * 100) / 100)
+        );
+        const graphX = (pinch.midX - pinch.origPanX) / pinch.startZoom;
+        const graphY = (pinch.midY - pinch.origPanY) / pinch.startZoom;
+        const nextPan = {
+          x: Math.round(curMidX - graphX * nextZoom),
+          y: Math.round(curMidY - graphY * nextZoom),
+        };
+        zoomRef.current = nextZoom;
+        panRef.current = nextPan;
+        setZoom(nextZoom);
+        setPan(nextPan);
+      }
+      return;
+    }
+
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== e.pointerId) return;
+    const dx = e.clientX - drag.startX;
+    const dy = e.clientY - drag.startY;
+    const nextPan = {
+      x: Math.round(drag.origPanX + dx),
+      y: Math.round(drag.origPanY + dy),
+    };
+    panRef.current = nextPan;
+    setPan(nextPan);
+  };
+
+  const handlePointerUpOrCancel = (e: React.PointerEvent<HTMLDivElement>) => {
+    activePointersRef.current.delete(e.pointerId);
+
+    if (activePointersRef.current.size < 2 && pinchRef.current) {
+      pinchRef.current = null;
+      // Re-baseline single-finger drag if one finger remains on the screen
+      if (activePointersRef.current.size === 1) {
+        const [remId, remPt] = Array.from(activePointersRef.current.entries())[0];
+        dragRef.current = {
+          pointerId: remId,
+          startX: remPt.x,
+          startY: remPt.y,
+          origPanX: panRef.current.x,
+          origPanY: panRef.current.y,
+        };
+        return;
+      }
+    }
+
+    if (dragRef.current && dragRef.current.pointerId === e.pointerId) {
+      dragRef.current = null;
+    }
+    if (activePointersRef.current.size === 0) {
+      setIsDragging(false);
+    }
+  };
+
+  const viewportHeightStyle: React.CSSProperties =
+    viewportMode === 'fullscreen'
+      ? { height: 'calc(100vh - 150px)' }
+      : viewportMode === 'tall'
+        ? { height: '78vh', minHeight: '520px' }
+        : { height: `${Math.min(720, Math.max(380, height + 28))}px` };
+
   return (
-    <div className="w-full overflow-x-auto pb-1">
+    <div
+      className={
+        viewportMode === 'fullscreen'
+          ? 'fixed inset-0 z-50 bg-white/98 p-4 md:p-6 flex flex-col gap-2 overflow-hidden shadow-2xl'
+          : 'w-full pb-1 space-y-2'
+      }
+    >
+      {/* Interactive Folding + 2D Zoom & Pan Control Bar */}
+      <div className="flex flex-wrap items-center justify-between gap-2 bg-slate-50/90 border border-slate-200/80 rounded-lg px-2.5 py-1.5 text-[11px] font-mono-num">
+        {/* Left: Universal Folding Quick Controls */}
+        <div className="flex flex-wrap items-center gap-1.5">
+          <span className="text-[10px] uppercase tracking-wider text-slate-400 font-semibold mr-0.5">
+            Fold / Unfold:
+          </span>
+          {showRoutingLayers && activeAccountNodeIds.length > 0 && (
+            <button
+              type="button"
+              onClick={handleToggleAllAccounts}
+              className={`px-2 py-1 rounded border transition ${
+                allAccountsFolded
+                  ? 'border-amber-400 bg-amber-50 text-amber-900 font-semibold'
+                  : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-100'
+              }`}
+              title="Fold or unfold all Bank Account branches (or click any individual 🏦 Bank Account node directly)"
+            >
+              {allAccountsFolded ? '▶ Unfold Accounts' : '▼ Fold Accounts'}
+            </button>
+          )}
+          {showRoutingLayers && activeWorkspaceNodeIds.length > 0 && (
+            <button
+              type="button"
+              onClick={handleToggleAllWorkspaces}
+              className={`px-2 py-1 rounded border transition ${
+                allWorkspacesFolded
+                  ? 'border-amber-400 bg-amber-50 text-amber-900 font-semibold'
+                  : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-100'
+              }`}
+              title="Fold or unfold all Workspace scopes like Shared Household, Polish Flat & Wadera Personal (or click any Workspace node directly)"
+            >
+              {allWorkspacesFolded ? '▶ Unfold Workspaces' : '▼ Fold Workspaces'}
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={handleUnfoldAllEverything}
+            className="px-2 py-1 rounded border border-slate-200 bg-white text-slate-700 hover:bg-slate-100 transition"
+            title="Unfold all accounts, workspaces, and pots to view the full tree"
+          >
+            Unfold All Pots
+          </button>
+          {(expandedPotIds.size > 0 || expandedExpenseIds.size > 0 || collapsedNodeIds.size > 0) && (
+            <button
+              type="button"
+              onClick={handleFoldAllEverything}
+              className="px-2 py-1 rounded border border-teal-300 bg-teal-50 text-teal-900 font-medium hover:bg-teal-100 transition"
+              title="Reset to default top-level view (Accounts -> Workspaces -> Top-Level Pots)"
+            >
+              Reset / Fold Pots
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => setHideZeroPots((prev) => !prev)}
+            className={`px-2 py-1 rounded border transition ${
+              hideZeroPots
+                ? 'border-teal-700 bg-teal-700 text-white font-semibold'
+                : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-100'
+            }`}
+            title="Hide or show empty £0.00 pots so they don't draw zero-value dashed lines"
+          >
+            {hideZeroPots ? '✓ £0 Pots Hidden' : 'Hide £0 Pots'}
+          </button>
+        </div>
+
+        {/* Right: 2D Zoom & Pan Controls */}
+        <div className="flex flex-wrap items-center gap-1.5">
+          <span className="inline-flex items-center gap-1 text-[10px] text-slate-500 mr-1">
+            <Move className="w-3 h-3 text-teal-700" />
+            Drag to pan · Pinch to zoom
+          </span>
+          <button
+            type="button"
+            onClick={() => applyZoomAround(zoom - 0.15)}
+            className="inline-flex items-center justify-center w-6 h-6 rounded border border-slate-200 bg-white text-slate-700 hover:bg-slate-100 transition"
+            title="Zoom Out (-)"
+          >
+            <ZoomOut className="w-3.5 h-3.5" />
+          </button>
+          <input
+            type="range"
+            min={35}
+            max={225}
+            step={5}
+            value={Math.round(zoom * 100)}
+            onChange={(e) => applyZoomAround(Number(e.target.value) / 100)}
+            className="w-20 accent-teal-700 cursor-pointer"
+            title="Slide to zoom in or out"
+          />
+          <button
+            type="button"
+            onClick={handleResetView}
+            className="px-1.5 py-0.5 rounded border border-slate-200 bg-white text-slate-700 hover:bg-slate-100 text-[10px] font-semibold min-w-[44px] text-center"
+            title="Click to reset zoom to 100% and center pan"
+          >
+            {Math.round(zoom * 100)}%
+          </button>
+          <button
+            type="button"
+            onClick={() => applyZoomAround(zoom + 0.15)}
+            className="inline-flex items-center justify-center w-6 h-6 rounded border border-slate-200 bg-white text-slate-700 hover:bg-slate-100 transition"
+            title="Zoom In (+)"
+          >
+            <ZoomIn className="w-3.5 h-3.5" />
+          </button>
+          <button
+            type="button"
+            onClick={handleFitToScreen}
+            className="px-2 py-1 rounded border border-slate-200 bg-white text-slate-700 hover:bg-slate-100 transition text-[10px] font-medium"
+            title="Scale and center the entire graph to fit inside your screen"
+          >
+            Fit Screen
+          </button>
+          {(pan.x !== 0 || pan.y !== 0 || zoom !== 1) && (
+            <button
+              type="button"
+              onClick={handleResetView}
+              className="inline-flex items-center gap-0.5 px-1.5 py-1 rounded border border-slate-200 bg-white text-slate-600 hover:bg-slate-100 transition text-[10px]"
+              title="Reset pan & zoom"
+            >
+              <RotateCcw className="w-3 h-3" /> Reset
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => setWheelZoomEnabled((prev) => !prev)}
+            className={`px-2 py-1 rounded border text-[10px] transition ${
+              wheelZoomEnabled
+                ? 'border-teal-600/40 bg-teal-50/80 text-teal-900 font-medium'
+                : 'border-slate-200 bg-white text-slate-500 hover:bg-slate-100'
+            }`}
+            title="When enabled, scrolling the mouse wheel inside the diagram zooms in/out around your cursor"
+          >
+            Wheel Zoom: {wheelZoomEnabled ? 'On' : 'Off'}
+          </button>
+          <button
+            type="button"
+            onClick={() =>
+              setViewportMode((prev) =>
+                prev === 'normal' ? 'tall' : prev === 'tall' ? 'fullscreen' : 'normal'
+              )
+            }
+            className={`inline-flex items-center gap-1 px-2 py-1 rounded border text-[10px] transition ${
+              viewportMode !== 'normal'
+                ? 'border-slate-900 bg-slate-900 text-white font-semibold'
+                : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-100'
+            }`}
+            title="Cycle canvas height: Standard -> Tall (78vh) -> Fullscreen"
+          >
+            {viewportMode === 'fullscreen' ? (
+              <>
+                <Minimize2 className="w-3 h-3" /> Exit Fullscreen
+              </>
+            ) : (
+              <>
+                <Maximize2 className="w-3 h-3" /> {viewportMode === 'tall' ? 'Fullscreen' : 'Expand View'}
+              </>
+            )}
+          </button>
+        </div>
+      </div>
+
+      {/* Visual Legend for Spent/Paid vs. Planned/Upcoming Deadlines & Interactive Folding */}
+      <div className="flex flex-wrap items-center gap-4 text-[11px] font-mono-num text-slate-600 px-1">
+        <span className="inline-flex items-center gap-1.5">
+          <span className="inline-block w-3.5 h-2 rounded-sm bg-teal-700" />
+          <span className="px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-800 border border-emerald-200 text-[10px] font-semibold">
+            ✓ Spent / Paid
+          </span>
+          <span className="text-slate-500">Solid ribbon &amp; bar (already paid this month)</span>
+        </span>
+        <span className="inline-flex items-center gap-1.5">
+          <span className="inline-block w-3.5 h-2 rounded-sm border border-dashed border-amber-600 bg-amber-500/20" />
+          <span className="px-1.5 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-300 text-[10px] font-semibold">
+            ⏳ Planned · Due Date
+          </span>
+          <span className="text-slate-500">Dashed ribbon &amp; bar (upcoming scheduled bill or envelope)</span>
+        </span>
+        <span className="text-slate-400">
+          💡 Click any <strong className="text-slate-600">🏦 Bank Account</strong>,{' '}
+          <strong className="text-slate-600">🏠 Workspace</strong>, or{' '}
+          <strong className="text-slate-600">Pot</strong> to fold/unfold its branches
+        </span>
+      </div>
+
+      {/* Interactive 2D Pan & Zoom Viewport */}
       <div
-        className="relative select-none"
+        ref={viewportRef}
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUpOrCancel}
+        onPointerCancel={handlePointerUpOrCancel}
         style={{
-          minWidth: numCols > 3 ? `${width}px` : undefined,
+          ...viewportHeightStyle,
+          touchAction: 'none',
         }}
+        className={`relative w-full overflow-hidden rounded-lg border border-slate-200/80 bg-[#FAF9F6]/50 select-none ${
+          isDragging ? 'cursor-grabbing' : 'cursor-grab'
+        }`}
       >
-        <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-auto block overflow-visible">
-          <g fill="none">
-            {graph.links.map((link, idx) => {
-              const d = pathGen(link as never) || '';
-              const srcNode = link.source as SankeyNodeDatum;
-              const tgtNode = link.target as SankeyNodeDatum;
-              const customStroke = (link as SankeyLinkDatum).strokeColorOverride;
-              const strokeColor =
-                customStroke ||
-                (tgtNode.color && tgtNode.color !== '#334155' && tgtNode.color !== '#1E293B'
-                  ? tgtNode.color
-                  : srcNode.color || '#64748B');
-              const isDashed = Boolean((link as SankeyLinkDatum).dashed);
-              const linkWidth = Math.max(2, link.width || 2);
+        <div
+          style={{
+            width: `${width}px`,
+            height: `${height}px`,
+            transform: `translate3d(${pan.x}px, ${pan.y}px, 0) scale(${zoom})`,
+            transformOrigin: '0 0',
+          }}
+          className="relative"
+        >
+          <svg
+            viewBox={`0 0 ${width} ${height}`}
+            width={width}
+            height={height}
+            className="block overflow-visible"
+          >
+            <g fill="none">
+              {graph.links.map((link, idx) => {
+                const d = pathGen(link as never) || '';
+                const srcNode = link.source as SankeyNodeDatum;
+                const tgtNode = link.target as SankeyNodeDatum;
+                const customStroke = (link as SankeyLinkDatum).strokeColorOverride;
+                const strokeColor =
+                  customStroke ||
+                  (tgtNode.color && tgtNode.color !== '#334155' && tgtNode.color !== '#1E293B'
+                    ? tgtNode.color
+                    : srcNode.color || '#64748B');
+                const isDashed = Boolean((link as SankeyLinkDatum).dashed);
+                const linkWidth = Math.max(2, link.width || 2);
 
-              if (!isDashed) {
-                return (
-                  <path
-                    key={idx}
-                    d={d}
-                    stroke={strokeColor}
-                    strokeOpacity={0.26}
-                    strokeLinecap="butt"
-                    strokeWidth={linkWidth}
-                    className="transition-opacity hover:stroke-opacity-50"
-                  />
-                );
-              }
-
-              // Solid, brighter background ribbon + crisp dotted top & bottom border curves
-              const x0 = (srcNode as { x1?: number }).x1 ?? 0;
-              const x1 = (tgtNode as { x0?: number }).x0 ?? 0;
-              const xi = (x0 + x1) / 2;
-              const y0 = link.y0 ?? 0;
-              const y1 = link.y1 ?? 0;
-              const halfW = linkWidth / 2;
-              const topEdgeD = `M ${x0.toFixed(1)},${(y0 - halfW).toFixed(1)} C ${xi.toFixed(1)},${(y0 - halfW).toFixed(1)} ${xi.toFixed(1)},${(y1 - halfW).toFixed(1)} ${x1.toFixed(1)},${(y1 - halfW).toFixed(1)}`;
-              const botEdgeD = `M ${x0.toFixed(1)},${(y0 + halfW).toFixed(1)} C ${xi.toFixed(1)},${(y0 + halfW).toFixed(1)} ${xi.toFixed(1)},${(y1 + halfW).toFixed(1)} ${x1.toFixed(1)},${(y1 + halfW).toFixed(1)}`;
-
-              return (
-                <g key={idx}>
-                  <path
-                    d={d}
-                    stroke={strokeColor}
-                    strokeOpacity={0.14}
-                    strokeLinecap="butt"
-                    strokeWidth={linkWidth}
-                    className="transition-opacity hover:stroke-opacity-30"
-                  />
-                  <path
-                    d={topEdgeD}
-                    stroke={strokeColor}
-                    strokeOpacity={0.78}
-                    strokeWidth={1.6}
-                    strokeDasharray="4 4"
-                    strokeLinecap="round"
-                  />
-                  {linkWidth >= 5 && (
+                if (!isDashed) {
+                  return (
                     <path
-                      d={botEdgeD}
+                      key={idx}
+                      d={d}
+                      stroke={strokeColor}
+                      strokeOpacity={0.26}
+                      strokeLinecap="butt"
+                      strokeWidth={linkWidth}
+                      className="transition-opacity hover:stroke-opacity-50"
+                    />
+                  );
+                }
+
+                // Solid, brighter background ribbon + crisp dotted top & bottom border curves
+                const x0 = (srcNode as { x1?: number }).x1 ?? 0;
+                const x1 = (tgtNode as { x0?: number }).x0 ?? 0;
+                const xi = (x0 + x1) / 2;
+                const y0 = link.y0 ?? 0;
+                const y1 = link.y1 ?? 0;
+                const halfW = linkWidth / 2;
+                const topEdgeD = `M ${x0.toFixed(1)},${(y0 - halfW).toFixed(1)} C ${xi.toFixed(1)},${(y0 - halfW).toFixed(1)} ${xi.toFixed(1)},${(y1 - halfW).toFixed(1)} ${x1.toFixed(1)},${(y1 - halfW).toFixed(1)}`;
+                const botEdgeD = `M ${x0.toFixed(1)},${(y0 + halfW).toFixed(1)} C ${xi.toFixed(1)},${(y0 + halfW).toFixed(1)} ${xi.toFixed(1)},${(y1 + halfW).toFixed(1)} ${x1.toFixed(1)},${(y1 + halfW).toFixed(1)}`;
+
+                return (
+                  <g key={idx}>
+                    <path
+                      d={d}
+                      stroke={strokeColor}
+                      strokeOpacity={0.14}
+                      strokeLinecap="butt"
+                      strokeWidth={linkWidth}
+                      className="transition-opacity hover:stroke-opacity-30"
+                    />
+                    <path
+                      d={topEdgeD}
                       stroke={strokeColor}
                       strokeOpacity={0.78}
                       strokeWidth={1.6}
                       strokeDasharray="4 4"
                       strokeLinecap="round"
                     />
-                  )}
-                </g>
-              );
-            })}
-          </g>
-          <g>
+                    {linkWidth >= 5 && (
+                      <path
+                        d={botEdgeD}
+                        stroke={strokeColor}
+                        strokeOpacity={0.78}
+                        strokeWidth={1.6}
+                        strokeDasharray="4 4"
+                        strokeLinecap="round"
+                      />
+                    )}
+                  </g>
+                );
+              })}
+            </g>
+            <g>
+              {graph.nodes.map((node) => {
+                const x0 = node.x0 ?? 0;
+                const x1 = node.x1 ?? 0;
+                const y0 = node.y0 ?? 0;
+                const y1 = node.y1 ?? 0;
+                const w = Math.max(7, x1 - x0);
+                const h = Math.max(5, y1 - y0);
+                const interactive =
+                  node.nodeKind === 'pool' ||
+                  node.nodeKind === 'account' ||
+                  node.nodeKind === 'workspace' ||
+                  node.nodeKind === 'pot' ||
+                  node.nodeKind === 'obligation' ||
+                  node.nodeKind === 'expense' ||
+                  node.nodeKind === 'next_needed';
+
+                // For pot nodes that have BOTH spent/paid AND planned/upcoming portions, render a split two-tone bar
+                const spentPaid = node.spentPaidMinor ?? 0;
+                const plannedUp = node.plannedUpcomingMinor ?? 0;
+                if (node.nodeKind === 'pot' && spentPaid > 0 && plannedUp > 0 && spentPaid + plannedUp > 0) {
+                  const paidRatio = Math.min(1, Math.max(0, spentPaid / (spentPaid + plannedUp)));
+                  const paidH = Math.max(2, h * paidRatio);
+                  const planH = Math.max(2, h - paidH);
+                  return (
+                    <g
+                      key={node.id}
+                      data-node-interactive={interactive ? 'true' : undefined}
+                      onClick={() => interactive && handleNodeLabelClick(node)}
+                      className={interactive ? 'cursor-pointer hover:opacity-80 transition-opacity' : ''}
+                    >
+                      <rect
+                        x={x0}
+                        y={y0}
+                        width={w}
+                        height={paidH}
+                        rx={1.5}
+                        fill={node.color || '#334155'}
+                        fillOpacity={1}
+                      />
+                      <rect
+                        x={x0}
+                        y={y0 + paidH}
+                        width={w}
+                        height={planH}
+                        rx={1.5}
+                        fill={node.color || '#334155'}
+                        fillOpacity={0.22}
+                        stroke={node.color || '#334155'}
+                        strokeWidth={1.3}
+                        strokeDasharray="3 2"
+                      />
+                    </g>
+                  );
+                }
+
+                return (
+                  <rect
+                    key={node.id}
+                    data-node-interactive={interactive ? 'true' : undefined}
+                    x={x0}
+                    y={y0}
+                    width={w}
+                    height={h}
+                    rx={2}
+                    fill={node.color || '#334155'}
+                    fillOpacity={node.dashed ? 0.25 : 1}
+                    stroke={node.dashed ? node.color || '#334155' : undefined}
+                    strokeWidth={node.dashed ? 1.5 : undefined}
+                    strokeDasharray={node.dashed ? '3 2' : undefined}
+                    onClick={() => interactive && handleNodeLabelClick(node)}
+                    className={interactive ? 'cursor-pointer hover:opacity-80 transition-opacity' : ''}
+                  />
+                );
+              })}
+            </g>
+            {/* Subtle connector ticks when anti-collision shifts a label away from a thin bar */}
+            <g fill="none">
+              {graph.nodes.map((node) => {
+                const x1 = node.x1 ?? 0;
+                const cy = ((node.y0 ?? 0) + (node.y1 ?? 0)) / 2;
+                const labelY = labelYById.get(node.id) ?? cy;
+                if (Math.abs(labelY - cy) < 3) return null;
+                return (
+                  <path
+                    key={`leader-${node.id}`}
+                    d={`M ${x1.toFixed(1)},${cy.toFixed(1)} L ${(x1 + 6).toFixed(1)},${labelY.toFixed(1)}`}
+                    stroke={node.color || '#64748B'}
+                    strokeOpacity={0.55}
+                    strokeWidth={1.2}
+                    strokeDasharray="2 2"
+                  />
+                );
+              })}
+            </g>
+          </svg>
+
+          {/* Precision HTML Label + Unfold Chevron + Quick '+' Overlay anchored to exact viewBox % */}
+          <div className="pointer-events-none absolute inset-0">
             {graph.nodes.map((node) => {
-              const x0 = node.x0 ?? 0;
               const x1 = node.x1 ?? 0;
               const y0 = node.y0 ?? 0;
               const y1 = node.y1 ?? 0;
-              const interactive =
-                node.nodeKind === 'pot' ||
-                node.nodeKind === 'obligation' ||
-                node.nodeKind === 'expense' ||
-                node.nodeKind === 'next_needed';
+              const cy = (y0 + y1) / 2;
+              const labelY = labelYById.get(node.id) ?? cy;
+              const depth = node.depth ?? 0;
+              const pctVal = denom > 0 ? ((node.displayMinor / denom) * 100).toFixed(0) : '0';
+              const valueText = privacyMode
+                ? `${pctVal}%`
+                : `${formatDisplayValue(node.displayMinor, { currency, privacyMode: false, compact: true })} · ${pctVal}%`;
+
+              const canAddInside =
+                node.nodeKind === 'pot' || node.nodeKind === 'obligation' || node.nodeKind === 'expense';
+              const canInspect =
+                canAddInside || (node.nodeKind === 'account' && Boolean(node.accountId));
+              const isClickableLabel =
+                canAddInside ||
+                node.nodeKind === 'pool' ||
+                node.nodeKind === 'account' ||
+                node.nodeKind === 'workspace' ||
+                node.nodeKind === 'next_needed' ||
+                (node.nodeKind === 'expense' && node.canUnfold);
+
+              const colMaxWidthPx = depth >= maxDepth ? 245 : 215;
+
               return (
-                <rect
-                  key={node.id}
-                  x={x0}
-                  y={y0}
-                  width={Math.max(7, x1 - x0)}
-                  height={Math.max(5, y1 - y0)}
-                  rx={2}
-                  fill={node.color || '#334155'}
-                  fillOpacity={node.dashed ? 0.28 : 1}
-                  stroke={node.dashed ? node.color || '#334155' : undefined}
-                  strokeWidth={node.dashed ? 1.5 : undefined}
-                  strokeDasharray={node.dashed ? '3 2' : undefined}
-                  onClick={() => interactive && handleNodeLabelClick(node)}
-                  className={interactive ? 'cursor-pointer hover:opacity-80 transition-opacity' : ''}
-                />
+                <div
+                  key={`lbl-${node.id}`}
+                  style={{
+                    left: `${((x1 + 7) / width) * 100}%`,
+                    top: `${(labelY / height) * 100}%`,
+                    maxWidth: `${colMaxWidthPx}px`,
+                  }}
+                  className="pointer-events-auto absolute -translate-y-1/2 flex flex-col leading-tight group rounded px-1 py-0.5 bg-[#FAF9F6]/88 backdrop-blur-[1.5px]"
+                >
+                  <div className="flex items-center gap-1 whitespace-nowrap">
+                    <button
+                      type="button"
+                      onClick={() => handleNodeLabelClick(node)}
+                      className={`inline-flex items-center gap-0.5 text-left text-[11px] font-medium text-slate-800 truncate ${
+                        isClickableLabel ? 'cursor-pointer hover:text-teal-800' : 'cursor-default'
+                      }`}
+                      title={
+                        node.canUnfold
+                          ? `${node.name} — Click to ${node.isExpanded ? 'fold' : 'unfold'}`
+                          : node.name
+                      }
+                    >
+                      {node.canUnfold &&
+                        (node.isExpanded ? (
+                          <ChevronDown className="w-3 h-3 shrink-0 text-teal-700" />
+                        ) : (
+                          <ChevronRight className="w-3 h-3 shrink-0 text-slate-400 group-hover:text-teal-700" />
+                        ))}
+                      <span className="truncate">{node.name}</span>
+                    </button>
+
+                    {canInspect && onInspectItem && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (node.nodeKind === 'account' && node.accountId) {
+                            onInspectItem('account', node.accountId);
+                          } else if (node.nodeKind === 'pot' && node.potRef) {
+                            onInspectItem('pot', node.potRef.pot.id);
+                          } else if (node.nodeKind === 'obligation' && node.obRef) {
+                            onInspectItem('obligation', node.obRef.id);
+                          } else if (node.nodeKind === 'expense' && node.expRef) {
+                            onInspectItem('expense', node.expRef.id);
+                          }
+                        }}
+                        title={t.editBtn}
+                        className="shrink-0 inline-flex items-center justify-center w-4 h-4 rounded border border-slate-300/80 bg-white/90 text-slate-500 opacity-75 group-hover:opacity-100 hover:bg-slate-900 hover:text-white hover:border-slate-900 transition"
+                      >
+                        <Pencil className="w-2.5 h-2.5" />
+                      </button>
+                    )}
+
+                    {canAddInside && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          triggerQuickAddForNode(node);
+                        }}
+                        title={node.nodeKind === 'pot' ? t.qaTooltipPot : t.qaTooltipPromote}
+                        className={`shrink-0 inline-flex items-center justify-center w-4 h-4 rounded border transition ${
+                          node.nodeKind === 'pot'
+                            ? 'border-teal-600/40 bg-white/90 text-teal-700 hover:bg-teal-700 hover:text-white hover:border-teal-700'
+                            : 'border-slate-300/80 bg-white/85 text-slate-500 opacity-75 group-hover:opacity-100 hover:bg-teal-700 hover:text-white hover:border-teal-700'
+                        }`}
+                      >
+                        <Plus className="w-2.5 h-2.5 stroke-[2.5]" />
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="flex items-center gap-1.5 pl-0.5 whitespace-nowrap overflow-hidden">
+                    <span className="text-[10px] font-mono-num text-slate-500 shrink-0">{valueText}</span>
+                    {node.statusBadge && (
+                      <span
+                        className={`text-[9.5px] font-mono-num px-1.5 py-0.2 rounded border truncate max-w-[155px] ${
+                          node.statusBadge.tone === 'paid'
+                            ? 'bg-emerald-50/95 text-emerald-800 border-emerald-200 font-medium'
+                            : node.statusBadge.tone === 'planned'
+                              ? 'bg-amber-50/95 text-amber-900 border-amber-300 font-semibold'
+                              : node.statusBadge.tone === 'pending'
+                                ? 'bg-amber-50/95 text-amber-800 border-amber-300'
+                                : 'bg-slate-100/95 text-slate-700 border-slate-300'
+                        }`}
+                        title={node.statusBadge.text}
+                      >
+                        {node.statusBadge.text}
+                      </span>
+                    )}
+                  </div>
+                </div>
               );
             })}
-          </g>
-        </svg>
-
-        {/* Precision HTML Label + Unfold Chevron + Quick '+' Overlay anchored to exact viewBox % */}
-        <div className="pointer-events-none absolute inset-0">
-          {graph.nodes.map((node) => {
-            const x1 = node.x1 ?? 0;
-            const y0 = node.y0 ?? 0;
-            const y1 = node.y1 ?? 0;
-            const cy = (y0 + y1) / 2;
-            const depth = node.depth ?? 0;
-            const pctVal = denom > 0 ? ((node.displayMinor / denom) * 100).toFixed(0) : '0';
-            const valueText = privacyMode
-              ? `${pctVal}%`
-              : `${formatDisplayValue(node.displayMinor, { currency, privacyMode: false, compact: true })} · ${pctVal}%`;
-
-            const canAddInside =
-              node.nodeKind === 'pot' || node.nodeKind === 'obligation' || node.nodeKind === 'expense';
-            const isClickableLabel =
-              canAddInside ||
-              node.nodeKind === 'next_needed' ||
-              (node.nodeKind === 'expense' && node.canUnfold);
-
-            const colMaxWidthPx = depth >= maxDepth ? 230 : 195;
-
-            return (
-              <div
-                key={`lbl-${node.id}`}
-                style={{
-                  left: `${((x1 + 7) / width) * 100}%`,
-                  top: `${(cy / height) * 100}%`,
-                  maxWidth: `${colMaxWidthPx}px`,
-                }}
-                className="pointer-events-auto absolute -translate-y-1/2 flex flex-col leading-tight group"
-              >
-                <div className="flex items-center gap-1">
-                  <button
-                    type="button"
-                    onClick={() => handleNodeLabelClick(node)}
-                    className={`inline-flex items-center gap-0.5 text-left text-[11px] font-medium text-slate-800 truncate ${
-                      isClickableLabel ? 'cursor-pointer hover:text-teal-800' : 'cursor-default'
-                    }`}
-                    title={node.name}
-                  >
-                    {node.canUnfold &&
-                      (node.isExpanded ? (
-                        <ChevronDown className="w-3 h-3 shrink-0 text-teal-700" />
-                      ) : (
-                        <ChevronRight className="w-3 h-3 shrink-0 text-slate-400 group-hover:text-teal-700" />
-                      ))}
-                    <span className="truncate">{node.name}</span>
-                  </button>
-
-                  {canAddInside && onInspectItem && (
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        if (node.nodeKind === 'pot' && node.potRef) {
-                          onInspectItem('pot', node.potRef.pot.id);
-                        } else if (node.nodeKind === 'obligation' && node.obRef) {
-                          onInspectItem('obligation', node.obRef.id);
-                        } else if (node.nodeKind === 'expense' && node.expRef) {
-                          onInspectItem('expense', node.expRef.id);
-                        }
-                      }}
-                      title={t.editBtn}
-                      className="shrink-0 inline-flex items-center justify-center w-4 h-4 rounded border border-slate-300/80 bg-white/90 text-slate-500 opacity-75 group-hover:opacity-100 hover:bg-slate-900 hover:text-white hover:border-slate-900 transition"
-                    >
-                      <Pencil className="w-2.5 h-2.5" />
-                    </button>
-                  )}
-
-                  {canAddInside && (
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        triggerQuickAddForNode(node);
-                      }}
-                      title={node.nodeKind === 'pot' ? t.qaTooltipPot : t.qaTooltipPromote}
-                      className={`shrink-0 inline-flex items-center justify-center w-4 h-4 rounded border transition ${
-                        node.nodeKind === 'pot'
-                          ? 'border-teal-600/40 bg-white/90 text-teal-700 hover:bg-teal-700 hover:text-white hover:border-teal-700'
-                          : 'border-slate-300/80 bg-white/85 text-slate-500 opacity-75 group-hover:opacity-100 hover:bg-teal-700 hover:text-white hover:border-teal-700'
-                      }`}
-                    >
-                      <Plus className="w-2.5 h-2.5 stroke-[2.5]" />
-                    </button>
-                  )}
-                </div>
-
-                <span className="text-[10px] font-mono-num text-slate-500 truncate pl-0.5">{valueText}</span>
-              </div>
-            );
-          })}
+          </div>
         </div>
       </div>
     </div>
@@ -1258,11 +2261,23 @@ export const SixMonthTrendChart: React.FC<{
  */
 export const DailyRunwayChart: React.FC<{
   curve: DailyCurvePoint[];
+  openingBalanceMinor?: number;
+  unallocatedAfterNextMonthMinor?: number;
+  nextMonthReserveMinor?: number;
   currency: CurrencyCode;
   privacyMode: boolean;
   t: TranslationDict;
   onSelectDay?: (day: number) => void;
-}> = ({ curve, currency, privacyMode, t, onSelectDay }) => {
+}> = ({
+  curve,
+  openingBalanceMinor,
+  unallocatedAfterNextMonthMinor,
+  nextMonthReserveMinor,
+  currency,
+  privacyMode,
+  t,
+  onSelectDay,
+}) => {
   const [activeDay, setActiveDay] = useState<number | null>(null);
   if (!curve.length) return null;
   const width = 760;
@@ -1270,23 +2285,79 @@ export const DailyRunwayChart: React.FC<{
   const padX = 28;
   const padY = 22;
 
-  const vals = curve.map((c) => c.balanceMinor);
-  const minV = Math.min(0, ...vals);
-  const maxV = Math.max(100, ...vals);
-  const span = Math.max(1, maxV - minV);
-
-  const toX = (idx: number) => padX + (idx / Math.max(1, curve.length - 1)) * (width - padX * 2);
-  const toY = (v: number) => height - padY - ((v - minV) / span) * (height - padY * 2);
-  const zeroY = toY(0);
-
-  const linePoints = curve.map((pt, i) => `${toX(i).toFixed(1)},${toY(pt.balanceMinor).toFixed(1)}`).join(' ');
-  const areaPoints = `${toX(0).toFixed(1)},${zeroY.toFixed(1)} ${linePoints} ${toX(curve.length - 1).toFixed(1)},${zeroY.toFixed(1)}`;
-  const startRef = Math.max(1, Math.abs(curve[0]?.balanceMinor || maxV));
-
   const firstDateStr = curve[0]?.date || '';
   const lastDateStr = curve[curve.length - 1]?.date || '';
   const isMultiPeriod =
     curve.length > 1 && firstDateStr.slice(0, 7) !== lastDateStr.slice(0, 7);
+
+  // If Day 1 has immediate bills/inflows (e.g. Dec 1st bills deducting from Nov 30th's ending balance),
+  // prepend Day 0 (Start of Month opening balance) so the left edge of the curve connects seamlessly from the prior month!
+  const hasDistinctOpening =
+    !isMultiPeriod &&
+    openingBalanceMinor != null &&
+    Math.abs(openingBalanceMinor - (curve[0]?.balanceMinor ?? 0)) >= 50;
+
+  const plotCurve: DailyCurvePoint[] = hasDistinctOpening
+    ? [
+        {
+          day: 0,
+          date: firstDateStr,
+          balanceMinor: openingBalanceMinor!,
+          events: [],
+        },
+        ...curve,
+      ]
+    : curve;
+
+  const vals = plotCurve.map((c) => c.balanceMinor);
+  const minV = Math.min(0, ...vals);
+  const maxV = Math.max(100, ...vals);
+  const span = Math.max(1, maxV - minV);
+
+  const toX = (idx: number) => padX + (idx / Math.max(1, plotCurve.length - 1)) * (width - padX * 2);
+  const toY = (v: number) => height - padY - ((v - minV) / span) * (height - padY * 2);
+  const zeroY = toY(0);
+
+  const todayIso = new Date().toISOString().slice(0, 10);
+  // Find the last index in plotCurve that represents recorded status (date <= todayIso on a real day > 0)
+  let lastRecordedIdx = -1;
+  if (isMultiPeriod) {
+    for (let i = 0; i < plotCurve.length; i++) {
+      const dStr = (plotCurve[i].date || '').slice(0, 10);
+      if (dStr && dStr <= todayIso) lastRecordedIdx = i;
+    }
+  } else {
+    for (let i = 0; i < plotCurve.length; i++) {
+      if (plotCurve[i].day > 0 && (plotCurve[i].date || '') <= todayIso) {
+        lastRecordedIdx = i;
+      }
+    }
+  }
+
+  const hasRecordedSegment = lastRecordedIdx >= 0;
+  const hasPredictedSegment = lastRecordedIdx < plotCurve.length - 1;
+  const predStartIdx = Math.max(0, lastRecordedIdx);
+
+  const recordedSlice = hasRecordedSegment ? plotCurve.slice(0, lastRecordedIdx + 1) : [];
+  const recordedLinePoints = recordedSlice
+    .map((pt, i) => `${toX(i).toFixed(1)},${toY(pt.balanceMinor).toFixed(1)}`)
+    .join(' ');
+  const recordedAreaPoints =
+    recordedSlice.length > 0
+      ? `${toX(0).toFixed(1)},${zeroY.toFixed(1)} ${recordedLinePoints} ${toX(lastRecordedIdx).toFixed(1)},${zeroY.toFixed(1)}`
+      : '';
+
+  const predictedSlice = hasPredictedSegment ? plotCurve.slice(predStartIdx) : [];
+  const predictedLinePoints = predictedSlice
+    .map((pt, i) => `${toX(predStartIdx + i).toFixed(1)},${toY(pt.balanceMinor).toFixed(1)}`)
+    .join(' ');
+  const predictedAreaPoints =
+    predictedSlice.length > 0
+      ? `${toX(predStartIdx).toFixed(1)},${zeroY.toFixed(1)} ${predictedLinePoints} ${toX(plotCurve.length - 1).toFixed(1)},${zeroY.toFixed(1)}`
+      : '';
+
+  const openingValMinor = openingBalanceMinor ?? curve[0]?.balanceMinor ?? 0;
+  const startRef = Math.max(1, Math.abs(openingValMinor || maxV));
 
   const inspectedPoint =
     curve.find((pt) => pt.day === activeDay) ||
@@ -1296,26 +2367,49 @@ export const DailyRunwayChart: React.FC<{
   return (
     <div className="space-y-2">
       {/* Event Marker Legend */}
-      <div className="flex flex-wrap items-center gap-3 text-[11px] font-mono-num text-slate-500">
-        <span className="inline-flex items-center gap-1.5">
-          <span className="w-2.5 h-2.5 rounded-full bg-rose-600 inline-block" />
-          {t.timelineLegendExpense}
-        </span>
-        <span className="inline-flex items-center gap-1.5">
-          <span className="w-2.5 h-2.5 rounded-full bg-emerald-600 inline-block" />
-          {t.timelineLegendPaidBill}
-        </span>
-        <span className="inline-flex items-center gap-1.5">
-          <span className="w-2.5 h-2.5 rounded-full border-2 border-amber-500 bg-white inline-block" />
-          {t.timelineLegendUnpaid}
-        </span>
-        <span className="inline-flex items-center gap-1.5">
-          <span className="w-2.5 h-2.5 rounded-full bg-teal-700 inline-block" />
-          {t.timelineLegendIncome}
-        </span>
+      <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono-num text-slate-500">
+        <div className="flex flex-wrap items-center gap-3">
+          <span className="inline-flex items-center gap-1.5">
+            <span className="w-2.5 h-2.5 rounded-full bg-rose-600 inline-block" />
+            {t.timelineLegendExpense}
+          </span>
+          <span className="inline-flex items-center gap-1.5">
+            <span className="w-2.5 h-2.5 rounded-full bg-emerald-600 inline-block" />
+            {t.timelineLegendPaidBill}
+          </span>
+          <span className="inline-flex items-center gap-1.5">
+            <span className="w-2.5 h-2.5 rounded-full border-2 border-amber-500 bg-white inline-block" />
+            {t.timelineLegendUnpaid}
+          </span>
+          <span className="inline-flex items-center gap-1.5">
+            <span className="w-2.5 h-2.5 rounded-full bg-teal-700 inline-block" />
+            {t.timelineLegendIncome}
+          </span>
+        </div>
+        <div className="flex flex-wrap items-center gap-3 text-[10.5px]">
+          <span className="inline-flex items-center gap-1.5 text-slate-600">
+            <span className="w-4 h-0.5 bg-teal-700 inline-block rounded" />
+            <span>Recorded</span>
+          </span>
+          <span className="inline-flex items-center gap-1.5 text-teal-800">
+            <span className="w-4 h-2 rounded-xs bg-teal-200/75 border-t-2 border-dashed border-teal-700 inline-block" />
+            <span>Predicted Forecast</span>
+          </span>
+        </div>
       </div>
 
       <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-auto select-none">
+        <defs>
+          <linearGradient id="runwayRecordedGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="#0F766E" stopOpacity={0.14} />
+            <stop offset="100%" stopColor="#0F766E" stopOpacity={0.07} />
+          </linearGradient>
+          <linearGradient id="runwayPredictedGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="#2DD4BF" stopOpacity={0.32} />
+            <stop offset="100%" stopColor="#99F6E4" stopOpacity={0.16} />
+          </linearGradient>
+        </defs>
+
         <line
           x1={padX}
           x2={width - padX}
@@ -1325,10 +2419,64 @@ export const DailyRunwayChart: React.FC<{
           strokeDasharray="4 4"
           strokeOpacity={0.45}
         />
-        <polygon points={areaPoints} fill="#0F766E" fillOpacity={0.1} />
-        <polyline fill="none" stroke="#0F766E" strokeWidth={2} points={linePoints} />
 
-        {curve.map((pt, idx) => {
+        {/* Recorded Area & Solid Line (up to today) */}
+        {recordedAreaPoints && (
+          <polygon points={recordedAreaPoints} fill="url(#runwayRecordedGrad)" />
+        )}
+        {/* Predicted Area & Dashed Line (brighter mint/aqua background fill from today onwards) */}
+        {predictedAreaPoints && (
+          <polygon points={predictedAreaPoints} fill="url(#runwayPredictedGrad)" />
+        )}
+        {hasRecordedSegment && hasPredictedSegment && lastRecordedIdx > 0 && (
+          <line
+            x1={toX(lastRecordedIdx)}
+            x2={toX(lastRecordedIdx)}
+            y1={toY(plotCurve[lastRecordedIdx].balanceMinor)}
+            y2={zeroY}
+            stroke="#0D9488"
+            strokeDasharray="2 2"
+            strokeOpacity={0.35}
+          />
+        )}
+        {recordedLinePoints && (
+          <polyline
+            fill="none"
+            stroke="#0F766E"
+            strokeWidth={2.2}
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            points={recordedLinePoints}
+          />
+        )}
+        {predictedLinePoints && (
+          <polyline
+            fill="none"
+            stroke="#0F766E"
+            strokeWidth={2.2}
+            strokeDasharray="7 5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            points={predictedLinePoints}
+          />
+        )}
+
+        {plotCurve.map((pt, idx) => {
+          if (pt.day === 0) {
+            const cx0 = toX(idx);
+            const cy0 = toY(pt.balanceMinor);
+            return (
+              <circle
+                key="opening-pt"
+                cx={cx0}
+                cy={cy0}
+                r={3.5}
+                fill="#0F766E"
+                stroke="#FFFFFF"
+                strokeWidth={1.5}
+              />
+            );
+          }
           const evs = pt.events ?? [];
           if (!evs.length && !pt.label) return null;
           const cx = toX(idx);
@@ -1402,11 +2550,36 @@ export const DailyRunwayChart: React.FC<{
           );
         })}
 
-        <text x={padX} y={13} className="fill-slate-500 text-[10px] font-mono-num">
-          {isMultiPeriod ? firstDateStr.split(' ')[0] : t.day1}:{' '}
-          {privacyMode
-            ? '100%'
-            : formatDisplayValue(curve[0].balanceMinor, { currency, privacyMode: false, compact: true })}
+        <text x={padX} y={13} className="fill-slate-600 text-[10px] font-mono-num">
+          {isMultiPeriod ? (
+            <>
+              {firstDateStr.split(' ')[0]}:{' '}
+              {privacyMode
+                ? '100%'
+                : formatDisplayValue(curve[0].balanceMinor, { currency, privacyMode: false, compact: true })}
+            </>
+          ) : hasDistinctOpening ? (
+            <>
+              Start:{' '}
+              {privacyMode
+                ? '100%'
+                : formatDisplayValue(openingValMinor, { currency, privacyMode: false, compact: true })}{' '}
+              · {t.day1}:{' '}
+              {formatDisplayValue(curve[0].balanceMinor, {
+                currency,
+                privacyMode,
+                referenceTotalMinor: startRef,
+                compact: true,
+              })}
+            </>
+          ) : (
+            <>
+              {t.day1}:{' '}
+              {privacyMode
+                ? '100%'
+                : formatDisplayValue(openingValMinor, { currency, privacyMode: false, compact: true })}
+            </>
+          )}
         </text>
         <text x={width - padX} y={13} textAnchor="end" className="fill-slate-600 text-[10px] font-mono-num">
           {isMultiPeriod ? lastDateStr.split(' ').slice(-1)[0] : t.endOfMonth}:{' '}
@@ -1416,6 +2589,17 @@ export const DailyRunwayChart: React.FC<{
             referenceTotalMinor: startRef,
             compact: true,
           })}
+          {!isMultiPeriod && unallocatedAfterNextMonthMinor != null && nextMonthReserveMinor != null && nextMonthReserveMinor > 0 ? (
+            <tspan className="fill-teal-800 font-semibold">
+              {' · '}Unallocated:{' '}
+              {formatDisplayValue(unallocatedAfterNextMonthMinor, {
+                currency,
+                privacyMode,
+                referenceTotalMinor: startRef,
+                compact: true,
+              })}
+            </tspan>
+          ) : null}
         </text>
       </svg>
 
@@ -1542,11 +2726,11 @@ export const PotProportionStrip: React.FC<{
     }
 
     for (const ob of obligations) {
-      if (ob.isActive && ob.potId === focusedNode.pot.id && ob.effectiveDisplayMinor > 0) {
+      if (ob.potId === focusedNode.pot.id && ob.effectiveDisplayMinor > 0) {
         parts.push({
           id: `ob-${ob.id}`,
-          name: ob.name,
-          color: '#475569',
+          name: `${ob.isPaidThisMonth ? '✓' : '⏳'} ${ob.name}`,
+          color: ob.isPaidThisMonth ? '#059669' : '#D97706',
           valueMinor: ob.effectiveDisplayMinor,
           selectablePotId: null,
         });
@@ -1554,6 +2738,7 @@ export const PotProportionStrip: React.FC<{
     }
 
     for (const exp of expenses) {
+      if (exp.flowDirection === 'inflow' || (exp.kind ?? 'expense') === 'transfer') continue;
       if (exp.potId === focusedNode.pot.id && exp.displayAmountMinor > 0) {
         parts.push({
           id: `exp-${exp.id}`,
